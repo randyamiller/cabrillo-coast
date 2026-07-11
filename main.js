@@ -49,21 +49,19 @@
     form.addEventListener("submit", function (e) {
       e.preventDefault();
 
-      // Guard: form endpoint not configured yet.
-      if (form.action.indexOf("YOUR_FORM_ID") !== -1) {
-        setStatus(
-          "This form isn't connected yet. Set up a free endpoint at formspree.io and drop the ID into index.html — or email hello@cabrillocoast.com in the meantime.",
-          "err"
-        );
-        return;
-      }
+      // Post to FormSubmit's AJAX endpoint (keeps us on-page); the form's plain
+      // action stays the no-JS fallback. e.g. formsubmit.co/x -> formsubmit.co/ajax/x
+      var endpoint = form.getAttribute("action").replace(
+        "formsubmit.co/",
+        "formsubmit.co/ajax/"
+      );
 
       var btn = form.querySelector("button[type=submit]");
       var original = btn ? btn.textContent : "";
       if (btn) { btn.disabled = true; btn.textContent = "Sending…"; }
       setStatus("", "");
 
-      fetch(form.action, {
+      fetch(endpoint, {
         method: "POST",
         body: new FormData(form),
         headers: { Accept: "application/json" }
@@ -75,10 +73,12 @@
           } else {
             return res.json().then(function (data) {
               var msg =
-                data && data.errors && data.errors.length
-                  ? data.errors.map(function (x) { return x.message; }).join(", ")
-                  : "Something went wrong. Please try again, or email hello@cabrillocoast.com.";
+                (data && (data.message ||
+                  (data.errors && data.errors.map(function (x) { return x.message; }).join(", ")))) ||
+                "Something went wrong. Please try again, or email hello@cabrillocoast.com.";
               setStatus(msg, "err");
+            }).catch(function () {
+              setStatus("Something went wrong. Please try again in a moment.", "err");
             });
           }
         })

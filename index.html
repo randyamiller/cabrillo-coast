@@ -376,13 +376,19 @@
         </div>
 
         <!--
-          CONTACT FORM — powered by Formspree (works on static hosts like GitHub Pages).
-          SETUP: create a free form at https://formspree.io, then replace YOUR_FORM_ID below
-          with the id from your endpoint (e.g. action="https://formspree.io/f/xdorwqkz").
-          Until you do, the form shows a friendly "not configured yet" message.
+          CONTACT FORM — powered by FormSubmit (https://formsubmit.co): no backend, no account,
+          works on static hosts. Submissions are emailed to the address in the form "action".
+          The JS posts to the /ajax/ endpoint; this plain action is the no-JS fallback.
+          FIRST-TIME ACTIVATION: submit once, then click FormSubmit's confirmation email
+          (delivered to hello@cabrillocoast.com — set up email forwarding for that address first).
+          To keep the address out of page source, swap it for the random alias FormSubmit
+          issues after activation.
         -->
         <form class="contact-form" id="contact-form"
-              action="https://formspree.io/f/YOUR_FORM_ID" method="POST">
+              action="https://formsubmit.co/hello@cabrillocoast.com" method="POST">
+          <input type="hidden" name="_subject" value="New inquiry via cabrillocoast.com" />
+          <input type="hidden" name="_template" value="table" />
+          <input type="hidden" name="_captcha" value="false" />
           <div class="field">
             <label for="name">Name</label>
             <input id="name" name="name" type="text" autocomplete="name" required />
@@ -399,8 +405,8 @@
             <label for="message">How can we help?</label>
             <textarea id="message" name="message" rows="5" required></textarea>
           </div>
-          <!-- honeypot: bots fill this; humans never see it -->
-          <input type="text" name="_gotcha" tabindex="-1" autocomplete="off" aria-hidden="true" class="gotcha" />
+          <!-- honeypot: bots fill this; humans never see it (FormSubmit reads _honey) -->
+          <input type="text" name="_honey" tabindex="-1" autocomplete="off" aria-hidden="true" class="gotcha" />
           <button class="btn btn-primary btn-block" type="submit">Send message</button>
           <p class="form-status" id="form-status" role="status" aria-live="polite"></p>
         </form>
