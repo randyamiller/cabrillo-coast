@@ -190,6 +190,25 @@ p { margin: 0; }
 .card h3 { font-size: 1.24rem; margin-bottom: 10px; }
 .card p { color: var(--muted); font-size: .98rem; }
 
+/* ---------- Agentic AI spotlight band ---------- */
+.section-ai { background: linear-gradient(160deg, #0d3b4f 0%, #0a2c3b 68%, #071f2a 100%); color: #eaf6f4; }
+.section-ai h2 { color: #fff; }
+.kicker-light { color: #8fd3c9; }
+.lede-light { color: #cfe3e0; }
+.ai-head { max-width: 780px; margin: 0 auto 48px; text-align: center; }
+.ai-head .lede-light { margin-left: auto; margin-right: auto; }
+.ai-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; }
+.ai-item { background: rgba(255,255,255,.04); border: 1px solid rgba(143,211,201,.16); border-radius: var(--radius); padding: 30px 26px; }
+.ai-icon {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 52px; height: 52px; border-radius: 14px; margin-bottom: 20px;
+  background: rgba(42,157,143,.18); color: #7fded1;
+}
+.ai-icon svg { width: 26px; height: 26px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.ai-item h3 { font-size: 1.22rem; margin-bottom: 10px; color: #fff; }
+.ai-item p { color: #bcd6d2; font-size: .97rem; }
+@media (max-width: 900px) { .ai-grid { grid-template-columns: 1fr; } }
+
 /* ---------- Approach ---------- */
 .approach-grid { display: grid; grid-template-columns: 0.9fr 1.1fr; gap: 64px; align-items: start; }
 .approach-intro .lede { margin-bottom: 28px; }
