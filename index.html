@@ -37,6 +37,7 @@
       <nav class="nav-links" aria-label="Primary">
         <a href="#services">Services</a>
         <a href="#agentic">Agentic AI</a>
+        <a href="#topology">Topology</a>
         <a href="#approach">Approach</a>
         <a href="#about">About</a>
         <a class="btn btn-nav" href="#contact">Get in touch</a>
@@ -49,6 +50,7 @@
     <div class="mobile-menu" id="mobile-menu" hidden>
       <a href="#services">Services</a>
       <a href="#agentic">Agentic AI</a>
+      <a href="#topology">Topology</a>
       <a href="#approach">Approach</a>
       <a href="#about">About</a>
       <a href="#contact">Get in touch</a>
@@ -185,6 +187,92 @@
             <p>Custom eval, test, and simulation harnesses tuned to your domain — so agents and engineers alike get caught by the edge cases that generic tools sail right past.</p>
           </article>
         </div>
+      </div>
+    </section>
+
+    <!-- ============ HUMAN–AGENT TEAM TOPOLOGY ============ -->
+    <section class="section section-topology" id="topology">
+      <div class="container topo-grid">
+        <div class="topo-copy">
+          <p class="kicker">Signature practice</p>
+          <h2>Human–agent team topology</h2>
+          <p class="lede">
+            Adding AI agents to a team isn't an org-chart footnote — it's a redesign. We map who does
+            what, where judgment lives, and how work and authority flow between people and agents — so
+            AI makes your team faster and safer, not just louder.
+          </p>
+          <ul class="topo-points">
+            <li><strong>Deliberate roles</strong>People where judgment and accountability matter; agents where leverage and tireless throughput pay off.</li>
+            <li><strong>Explicit review gates &amp; escalation</strong>Every agent output has an owner and a path up — no unreviewed work reaching production, no ambiguous authority.</li>
+            <li><strong>Runnable, not theoretical</strong>The topology ships with the harnesses, guardrails, and evals that keep it honest as it scales.</li>
+          </ul>
+          <a class="btn btn-primary" href="#contact">Design your team topology</a>
+        </div>
+        <figure class="topo-figure">
+          <svg viewBox="0 0 560 400" role="img" aria-label="A human–agent team topology: an architect oversees two human reviewers, who each review the output of AI agents (coding, research, evaluation, operations) through explicit review gates and escalation paths.">
+            <defs>
+              <linearGradient id="g-topo" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0" stop-color="#123f52"/><stop offset="1" stop-color="#0a2734"/>
+              </linearGradient>
+              <symbol id="gp" viewBox="0 0 24 24">
+                <circle cx="12" cy="8.5" r="4.3" fill="currentColor"/>
+                <path d="M3.5 20.5a8.5 8.5 0 0 1 17 0z" fill="currentColor"/>
+              </symbol>
+              <symbol id="gc" viewBox="0 0 24 24">
+                <rect x="5.5" y="5.5" width="13" height="13" rx="2.4" fill="currentColor"/>
+                <path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+                <circle cx="12" cy="12" r="2.3" fill="#123f52"/>
+              </symbol>
+            </defs>
+
+            <rect width="560" height="400" rx="18" fill="url(#g-topo)"/>
+
+            <!-- legend -->
+            <g font-family="Inter, sans-serif" font-size="12" fill="#bcd6d2">
+              <circle cx="30" cy="28" r="6" fill="#eef4f2"/><text x="42" y="32">Human — judgment</text>
+              <rect x="24" y="44" width="12" height="12" rx="3" fill="#2a9d8f"/><text x="42" y="54">Agent — execution</text>
+              <line x1="24" y1="72" x2="36" y2="72" stroke="#8fd3c9" stroke-width="2"/><circle cx="30" cy="72" r="2.8" fill="#e2a76f"/><text x="42" y="76">Review gate</text>
+            </g>
+
+            <!-- edges -->
+            <g stroke="#8fd3c9" stroke-width="2" fill="none" opacity="0.5">
+              <line x1="280" y1="78" x2="150" y2="205"/>
+              <line x1="280" y1="78" x2="410" y2="205"/>
+              <line x1="150" y1="205" x2="78" y2="330"/>
+              <line x1="150" y1="205" x2="210" y2="330"/>
+              <line x1="410" y1="205" x2="350" y2="330"/>
+              <line x1="410" y1="205" x2="482" y2="330"/>
+            </g>
+            <!-- review-gate markers on agent→reviewer edges -->
+            <g fill="#e2a76f">
+              <circle cx="114" cy="267" r="4"/><circle cx="180" cy="267" r="4"/>
+              <circle cx="380" cy="267" r="4"/><circle cx="446" cy="267" r="4"/>
+            </g>
+
+            <!-- architect -->
+            <circle cx="280" cy="78" r="30" fill="#e6ac74"/>
+            <use href="#gp" x="266" y="64" width="28" height="28" style="color:#0a2734"/>
+            <text x="280" y="30" text-anchor="middle" font-family="Inter, sans-serif" font-size="13" font-weight="600" fill="#eaf6f4">Architect</text>
+
+            <!-- reviewers -->
+            <circle cx="150" cy="205" r="26" fill="#eef4f2"/>
+            <use href="#gp" x="138" y="193" width="24" height="24" style="color:#123f52"/>
+            <text x="150" y="250" text-anchor="middle" font-family="Inter, sans-serif" font-size="12.5" fill="#cfe3e0">Reviewer</text>
+
+            <circle cx="410" cy="205" r="26" fill="#eef4f2"/>
+            <use href="#gp" x="398" y="193" width="24" height="24" style="color:#123f52"/>
+            <text x="410" y="250" text-anchor="middle" font-family="Inter, sans-serif" font-size="12.5" fill="#cfe3e0">Domain lead</text>
+
+            <!-- agents -->
+            <g font-family="Inter, sans-serif" font-size="12" fill="#cfe3e0" text-anchor="middle">
+              <rect x="52"  y="304" width="52" height="52" rx="13" fill="#2a9d8f"/><use href="#gc" x="65"  y="317" width="26" height="26" style="color:#eafff9"/><text x="78"  y="376">Coding</text>
+              <rect x="184" y="304" width="52" height="52" rx="13" fill="#2a9d8f"/><use href="#gc" x="197" y="317" width="26" height="26" style="color:#eafff9"/><text x="210" y="376">Research</text>
+              <rect x="324" y="304" width="52" height="52" rx="13" fill="#2a9d8f"/><use href="#gc" x="337" y="317" width="26" height="26" style="color:#eafff9"/><text x="350" y="376">Eval</text>
+              <rect x="456" y="304" width="52" height="52" rx="13" fill="#2a9d8f"/><use href="#gc" x="469" y="317" width="26" height="26" style="color:#eafff9"/><text x="482" y="376">Ops</text>
+            </g>
+          </svg>
+          <figcaption class="topo-cap">A deliberate topology: human judgment on top, agent leverage at the base, explicit review gates between.</figcaption>
+        </figure>
       </div>
     </section>
 
