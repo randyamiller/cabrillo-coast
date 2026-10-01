@@ -1,0 +1,54 @@
+# Jekyll configuration for the Cabrillo Coast site (GitHub Pages legacy build, github-pages 232).
+# index.html has no front matter and is copied byte-for-byte; only blog pages are rendered.
+# GitHub Pages reads only this file. _config.preview.yml is a local overlay, read only when
+# passed on the command line (--config _config.yml,_config.preview.yml).
+
+title: Cabrillo Coast
+description: Technical articles on software architecture, technical leadership and agentic AI from Cabrillo Coast.
+
+# Host of the deployment, used by canonical and og:url (page.url | absolute_url).
+# Custom domain while CNAME exists. If CNAME is removed (project path), change to
+# "https://randyamiller.github.io" in the same commit. Never set a base path key here:
+# jekyll-github-metadata supplies it on Pages (empty for the custom domain,
+# /cabrillo-coast for the project path).
+url: "https://www.cabrillocoast.com"
+
+# Article filename dates are read as UTC everywhere (Pages, CI and author machines).
+timezone: Etc/UTC
+
+# No theme: the default jekyll-theme-primer would emit an unwanted assets/css/style.css.
+theme: null
+
+# Articles live at /blog/<slug>/; the date prefix of the filename is not part of the URL.
+permalink: /blog/:title/
+
+# Privacy control, not a restated default: never build future-dated posts. github-pages 232
+# lists this as true in its own defaults, so the explicit value removes any dependence on
+# configuration merge order. Future-dated posts would otherwise sit readable on GitHub.
+future: false
+
+# Setting exclude replaces Jekyll's default list, so every repository-internal path is listed.
+# Keep in step with _config.preview.yml, which restates this list without assets/drafts.
+# vendor covers vendor/bundle from ruby/setup-ruby in CI; assets/drafts keeps draft images
+# out of every normal build. Dot-paths (.githooks/, .github/, .ruby-version) and underscore
+# paths (_config.preview.yml, _templates/) are skipped by Jekyll automatically.
+exclude:
+  - README.md
+  - Gemfile
+  - Gemfile.lock
+  - package.json
+  - package-lock.json
+  - vendor
+  - node_modules
+  - tests
+  - scripts
+  - assets/drafts
+
+# Every article uses the post layout; the byline defaults to the founder named on the home page.
+defaults:
+  - scope:
+      path: ""
+      type: posts
+    values:
+      layout: post
+      author: "Randy Miller"

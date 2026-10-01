@@ -95,12 +95,12 @@ p { margin: 0; }
 }
 .site-header.scrolled { border-bottom-color: var(--line); box-shadow: var(--shadow-sm); }
 .nav { display: flex; align-items: center; justify-content: space-between; height: 72px; }
-.brand { display: inline-flex; align-items: center; gap: 10px; font-weight: 700; letter-spacing: .2px; color: var(--ink); }
+.brand { display: inline-flex; align-items: center; gap: 10px; font-weight: 700; letter-spacing: .2px; color: var(--ink); flex-shrink: 0; }
 .brand-mark { width: 30px; height: 30px; color: var(--deep); }
 @media (prefers-color-scheme: dark) { .brand-mark { color: var(--sea); } }
 .brand-text { font-family: var(--font-display); font-weight: 600; font-size: 1.18rem; }
 
-.nav-links { display: flex; align-items: center; gap: 30px; }
+.nav-links { display: flex; align-items: center; gap: 30px; white-space: nowrap; }
 .nav-links > a:not(.btn) { color: var(--muted); font-weight: 500; font-size: .96rem; transition: color .2s; }
 .nav-links > a:not(.btn):hover { color: var(--ink); }
 .btn-nav { padding: 9px 18px; background: var(--deep); color: #fff; font-size: .9rem; }
@@ -284,7 +284,7 @@ p { margin: 0; }
 .footer-inner { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 20px; }
 .footer-brand { display: inline-flex; align-items: center; gap: 10px; font-family: var(--font-display); font-weight: 600; color: #fff; }
 .footer-brand .brand-mark { color: var(--sea); width: 26px; height: 26px; }
-.footer-links { display: flex; gap: 24px; }
+.footer-links { display: flex; flex-wrap: wrap; gap: 10px 24px; }
 .footer-links a { color: #a9c7c2; font-size: .94rem; transition: color .2s; }
 .footer-links a:hover { color: #fff; }
 .footer-copy { color: #7fa39d; font-size: .88rem; width: 100%; margin-top: 6px; }
@@ -294,11 +294,11 @@ p { margin: 0; }
   .cards { grid-template-columns: repeat(2, 1fr); }
   .approach-grid, .about-grid, .contact-grid { grid-template-columns: 1fr; gap: 36px; }
   .about-facts { order: -1; }
-}
-@media (max-width: 720px) {
   .nav-links { display: none; }
   .nav-toggle { display: flex; }
   .mobile-menu[data-open="true"] { display: flex; }
+}
+@media (max-width: 720px) {
   .section { padding: 70px 0; }
   .hero { padding: 72px 0 120px; }
   .cards { grid-template-columns: 1fr; }

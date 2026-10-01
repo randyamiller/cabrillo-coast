@@ -7,3 +7,18 @@ Thumbs.db
 
 # Local notes
 *.local
+
+# Jekyll / blog
+_drafts/
+assets/drafts/
+_site/
+.jekyll-cache/
+.jekyll-metadata
+.sass-cache/
+vendor/
+.bundle/
+
+# Tooling
+node_modules/
+tests/visual/test-results/
+tests/visual/report/
