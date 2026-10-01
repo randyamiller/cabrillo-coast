@@ -1,0 +1,27 @@
+{% comment %}
+  Blog footer: a structural copy of the index.html footer.
+  Labels, order and section anchors must match index.html (site-chrome.test.mjs, AC-10).
+  Every URL goes through relative_url so links resolve at an empty base path and under a project path.
+  The Blog link carries no current-page marker: that marker belongs to the header lists only.
+  span#year is rendered at build time so it is right without JavaScript, and main.js refreshes it.
+{% endcomment %}
+<footer class="site-footer">
+  <div class="container footer-inner">
+    <div class="footer-brand">
+      <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+        <circle cx="16" cy="16" r="15" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.35"/>
+        <path d="M16 4 L19 16 L16 28 L13 16 Z" fill="currentColor"/>
+        <path d="M4 16 L16 13 L28 16 L16 19 Z" fill="currentColor" opacity="0.55"/>
+      </svg>
+      <span>Cabrillo Coast LLC</span>
+    </div>
+    <nav class="footer-links" aria-label="Footer">
+      <a href="{{ '/#services' | relative_url }}">Services</a>
+      <a href="{{ '/#approach' | relative_url }}">Approach</a>
+      <a href="{{ '/#about' | relative_url }}">About</a>
+      <a href="{{ '/blog/' | relative_url }}">Blog</a>
+      <a href="{{ '/#contact' | relative_url }}">Contact</a>
+    </nav>
+    <p class="footer-copy">© <span id="year">{{ site.time | date: '%Y' }}</span> Cabrillo Coast LLC. All rights reserved.</p>
+  </div>
+</footer>
