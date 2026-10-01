@@ -74,8 +74,24 @@ node scripts/verify.mjs
 ```
 
 Runs every automated check in order (the real build, the `node:test` suites, the
-fixture builds and the visual comparison) and stops at the first failure. Exit code 0
-means every check passed. CI runs the same script.
+fixture builds and the visual comparison) and stops at the first failure. CI runs the
+same script.
+
+The visual comparison renders the blog from a base commit and from your working tree.
+The base is the branch's upstream (`@{upstream}`, what is already pushed), or `HEAD`
+when the branch has none; the run prints it near the start as `verify: base: …`.
+Against `HEAD` only uncommitted changes are compared, so on a branch without an
+upstream name the base yourself (any branch, tag or commit):
+
+```bash
+node scripts/verify.mjs --base origin/main
+```
+
+Exit code 0 means every check passed, except that the visual comparison may have been
+skipped: when the base has no `_layouts/post.html` (it predates the blog), the run
+prints `Visual comparison skipped: base <commit> has no _layouts/post.html`, takes no
+screenshots and still exits 0. Look for that line before counting a pass as a visual
+comparison.
 
 Never set `JEKYLL_ENV=production` locally: without a Pages API token, a production
 build derives the wrong base path (`/pages/randyamiller/cabrillo-coast`).
@@ -109,7 +125,10 @@ Do the [one-time setup](#one-time-setup) first, including
   images.
 - Backing up drafts is your responsibility: they are not in git.
 - The repository is public. **Never commit drafts, draft images, `published:` or
-  future dates.** Each would be hidden from the site but readable on GitHub.
+  future dates.** Anything committed is readable on GitHub, even when the site omits
+  it: Jekyll leaves out drafts, future-dated posts and posts with `published: false`,
+  and `_config.yml` excludes draft images, but none of that hides them on GitHub.
+  `published: true` hides nothing at all. Every `published:` key is rejected.
 
 #### Write, preview, publish
 
@@ -127,13 +146,25 @@ Do the [one-time setup](#one-time-setup) first, including
    draft to `_posts/<UTC date>-<slug>.md`, moves its images to `assets/blog/<slug>/`
    and rewrites their paths. An empty image folder is deleted instead, so an article
    without images gets no image folder.
-5. **Verify.** `node scripts/verify.mjs`. Exit code 0 means every check passed.
-6. **Release.** `publish` prints these commands with the real names filled in:
+5. **Verify.** `node scripts/verify.mjs`. Exit code 0 means every check passed, but
+   the visual comparison may have been skipped; see [Checks](#checks).
+6. **Release.** Run the rest of the commands `publish` printed under `Next:`, from the
+   repository root (it prints a `cd` there first when you ran it elsewhere). They hold
+   the real file names and title. For the [front-matter](#front-matter) example below,
+   saved as slug `kubernetes-upgrades` and published with images on 2026-10-01, they
+   are:
 
    ```bash
-   git add _posts/YYYY-MM-DD-<slug>.md assets/blog/<slug>   # the folder only when it exists
-   git commit -m "Publish: <title>"
+   git add _posts/2026-10-01-kubernetes-upgrades.md assets/blog/kubernetes-upgrades
+   git commit -m "Publish: Upgrading Kubernetes without downtime"
    git push origin main
+   ```
+
+   For an article without images, `publish` prints the `git add` without the image
+   folder:
+
+   ```bash
+   git add _posts/2026-10-01-kubernetes-upgrades.md
    ```
 
    The hooks run `guard`, Pages rebuilds, and the article goes live (see
@@ -154,8 +185,8 @@ Every safeguard runs on your machine except the last, which only reports.
 |-----------|---------------|-------|
 | `.gitignore` (`_drafts/`, `assets/drafts/`) | `git add -A` and `git add .` skip drafts and draft images | `git add -f` overrides it |
 | `article.mjs check` and `publish` | A draft that fails the schema, date or image rules is not moved into `_posts/` | Runs only when you run it |
-| `.githooks/pre-commit` (`guard --staged`) | Refuses a commit when the staged tree holds a draft, a draft image, a `published:` key, a future date or an `assets/blog/<slug>/` folder without its post, when a staged article fails the schema or unsafe-markup checks, or when a staged hook is not executable | Needs `git config core.hooksPath .githooks` once per clone; skipped by `git commit --no-verify`; does not run for edits made on github.com or in a clone without the setting |
-| `.githooks/pre-push` (`guard --pre-push`) | The same rules for every commit in the pushed range, not only the tip, so a draft committed and later deleted still blocks the push | As for pre-commit; skipped by `git push --no-verify` |
+| `.githooks/pre-commit` (`guard --staged`) | Refuses a commit when the complete staged tree tracks a draft or draft image, a misnamed or duplicate-slug file in `_posts/`, an article whose filename date is in the future or an `assets/blog/<slug>/` folder without its post (the tree rules); when an article the commit adds or changes fails the schema (which rejects a `published:` key), image or unsafe-markup checks (the article checks); or when a staged `.githooks/` file lacks mode `100755` | Needs `git config core.hooksPath .githooks` once per clone; skipped by `git commit --no-verify`; does not run for edits made on github.com or in a clone without the setting |
+| `.githooks/pre-push` (`guard --pre-push`) | Refuses a push when the complete tree of any pushed commit, not only the tip, breaks the tree rules, or an article that commit adds or modifies fails the article checks. A draft committed and later deleted, or an image folder left behind when its post is deleted, therefore still blocks the push | As for pre-commit; skipped by `git push --no-verify`; does not check hook modes (only pre-commit does) |
 | `node scripts/verify.mjs` | Every automated check, before the push | Voluntary |
 | `blog-checks` workflow | Reports a violation after the push | Detection only: the content is already public |
 
@@ -238,14 +269,30 @@ in git history.
 #### Intended visual changes
 
 The visual comparison in `verify.mjs` fails on any pixel difference in the blog
-listing or an article. When a change is meant to look different, add a
-`Visual-Change: intended` trailer to a commit message in the pushed range, or set
-`VISUAL_CHANGE_INTENDED=1`. The differences are then reported without failing.
+listing or an article between the base commit and the working tree. Locally the base
+is the one `verify.mjs` prints (see [Checks](#checks)). In CI it is the pull
+request's base commit, or the previous tip of the pushed branch (`HEAD^` when that is
+unknown). When a change is meant to look different, declare it:
+
+- Add a `Visual-Change: intended` trailer to a commit message in `<base>..HEAD`, the
+  commits after the base (a pull request's merge commit included). Against base
+  `HEAD` that range is empty, so pass `--base`.
+- Or, for a local run only, set `VISUAL_CHANGE_INTENDED=1`. The `blog-checks`
+  workflow never sets it, so in CI only the trailer counts.
+
+The differences are then reported without failing. When the base commit has no
+`_layouts/post.html`, as for the commit that first adds the blog, there is nothing to
+compare: the comparison is skipped with a `Visual comparison skipped` notice and
+passes.
 
 #### Search index budget
 
-`verify.mjs` warns when `blog/search.json` grows above 300,000 bytes and fails above
-400,000 (roughly 45 articles of 2,000 words). To go further, raise the limit in
+`verify.mjs` measures the generated index: `_site/blog/search.json` in the real build
+(served at `/blog/search.json`), and the same file in the fixture project build.
+`blog/search.json` in the repository is only its Liquid template. It warns when the
+generated file grows above 300,000 uncompressed bytes and fails above 400,000
+(roughly 45 articles of 2,000 words). The gzip size is printed on every run but not
+checked. To go further, raise `WARN_BYTES` and `FAIL_BYTES` in
 `tests/static/built-search-index.test.mjs` in the same commit that grows the index.
 
 #### Account hygiene

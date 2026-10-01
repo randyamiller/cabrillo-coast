@@ -1,4 +1,4 @@
-/* Cabrillo Coast LLC — unit proof of the intended-change trailer scanner (AC-16, F-018) */
+/* Cabrillo Coast LLC — unit proof of the visual runner's trailer scanner and Playwright environment (AC-16, F-018) */
 /**
  * `createTrailerScanner` in `tests/visual/run-visual.mjs` decides whether a
  * commit message in `<base>..HEAD` declares an intended visual change with a
@@ -18,16 +18,29 @@
  *     `/^Visual-Change:[ \t]*intended[ \t\r]*$/im`, on several hundred
  *     generated messages, invalid UTF-8 included.
  *
+ * `playwrightEnv` builds the environment of each Playwright run. Playwright
+ * prefers some inherited variables to the config's reporter settings, so
+ * this suite also proves that a hostile environment cannot move the HTML
+ * report away from the config's `tests/visual/report/` (the folder the
+ * runner prints and the blog-checks workflow uploads), make it open, add a
+ * reporter or redirect the JSON results, while the runner's own inputs are
+ * set, unrelated variables pass through and the caller's object is left as
+ * it was.
+ *
  * Runs with `node --test tests/unit/run-visual.test.mjs` or as part of
  * `node --test "tests/**\/*.test.mjs"`. It needs no Jekyll build, no git, no
- * browser and no network, and writes no files. Importing run-visual.mjs runs
- * nothing: its entry point only starts when it is the program Node runs.
+ * browser and no network, and writes no files; it imports the Playwright
+ * config (and so `@playwright/test`, installed by `npm ci`) to read its
+ * reporter options. Importing run-visual.mjs runs nothing: its entry point
+ * only starts when it is the program Node runs.
  */
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-import { createTrailerScanner } from '../visual/run-visual.mjs';
+import { createTrailerScanner, playwrightEnv } from '../visual/run-visual.mjs';
 
 /* ------------------------------------------------------------------------ */
 /* Constants                                                                 */
@@ -44,6 +57,47 @@ const LARGE_STREAM_BYTES = 2.5 * 1024 * 1024;
 
 /** Number of generated messages in the regular-expression cross-check. */
 const GENERATED_MESSAGES = 600;
+
+/** The folder the Playwright config writes its HTML report to, from this file's location. */
+const REPORT_FOLDER = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'visual', 'report');
+
+/** The runner's own inputs to the config and the spec. */
+const INPUTS = Object.freeze({
+  baseUrl: 'http://127.0.0.1:41234/cabrillo-coast',
+  baselineDir: '/tmp/blog-visual-x/baseline',
+  resultsFile: '/tmp/blog-visual-x/compare-results.json',
+});
+
+/** An inherited environment that tries every reporter override Playwright 1.63 honours. */
+const HOSTILE_ENV = Object.freeze({
+  PATH: '/usr/local/bin:/usr/bin',
+  HOME: '/home/author',
+  CI: 'true',
+  PLAYWRIGHT_BROWSERS_PATH: '/opt/ms-playwright',
+  VISUAL_CHANGE_INTENDED: '1',
+  PLAYWRIGHT_HTML_OUTPUT_DIR: '/tmp/elsewhere/report',
+  PLAYWRIGHT_HTML_REPORT: 'relative-report',
+  PLAYWRIGHT_HTML_OPEN: 'always',
+  PW_TEST_HTML_REPORT_OPEN: 'always',
+  PLAYWRIGHT_HTML_ATTACHMENTS_BASE_URL: 'https://example.com/attachments/',
+  PW_TEST_REPORTER: 'html',
+  PLAYWRIGHT_JSON_OUTPUT_FILE: '/tmp/elsewhere/results.json',
+  JEKYLL_ENV: 'production',
+  VISUAL_BASE_URL: 'http://example.com/',
+  VISUAL_BASELINE_DIR: '/tmp/stale-baseline',
+  VISUAL_RESULTS_FILE: '/tmp/stale-results.json',
+});
+
+/** Variables `playwrightEnv` must remove whatever their value. */
+const REMOVED = Object.freeze([
+  'PLAYWRIGHT_HTML_OUTPUT_DIR',
+  'PLAYWRIGHT_HTML_REPORT',
+  'PW_TEST_HTML_REPORT_OPEN',
+  'PLAYWRIGHT_HTML_ATTACHMENTS_BASE_URL',
+  'PW_TEST_REPORTER',
+  'PLAYWRIGHT_JSON_OUTPUT_FILE',
+  'JEKYLL_ENV',
+]);
 
 /* ------------------------------------------------------------------------ */
 /* Helpers                                                                   */
@@ -101,6 +155,30 @@ function randomChunks(next, buffer) {
   for (let i = 1; i < cuts.length; i += 1) chunks.push(buffer.subarray(cuts[i - 1], cuts[i]));
   return chunks;
 }
+
+/**
+ * Options of the html reporter in `tests/visual/playwright.config.mjs`,
+ * the folder and open policy Playwright falls back to once no variable
+ * overrides them. The config refuses to load without `VISUAL_BASELINE_DIR`,
+ * so a placeholder is set for the import only (the config only resolves the
+ * path; nothing is written) and the caller's value is restored afterwards.
+ * @returns {Promise<{ outputFolder: string, open: string }>}
+ */
+async function configHtmlReporter() {
+  const saved = process.env.VISUAL_BASELINE_DIR;
+  process.env.VISUAL_BASELINE_DIR = path.join(path.sep, 'nonexistent', 'baseline');
+  let config;
+  try {
+    ({ default: config } = await import('../visual/playwright.config.mjs'));
+  } finally {
+    if (saved === undefined) delete process.env.VISUAL_BASELINE_DIR;
+    else process.env.VISUAL_BASELINE_DIR = saved;
+  }
+  const entry = config.reporter.find((reporter) => Array.isArray(reporter) && reporter[0] === 'html');
+  assert.ok(entry, 'the config has an html reporter');
+  return entry[1];
+}
+
 
 /* ------------------------------------------------------------------------ */
 /* Tests                                                                     */
@@ -260,4 +338,55 @@ test('[AC-16][F-018] agrees with the trailer regular expression on generated mes
   // Both outcomes occur often enough for the agreement to mean something.
   assert.ok(matched >= GENERATED_MESSAGES / 10, `${matched} generated messages declare the change`);
   assert.ok(GENERATED_MESSAGES - matched >= GENERATED_MESSAGES / 10, `${GENERATED_MESSAGES - matched} do not`);
+});
+
+test('[AC-16][F-018] playwrightEnv neutralises every inherited HTML-report override', async () => {
+  const base = { ...HOSTILE_ENV };
+  const env = playwrightEnv(base, INPUTS);
+
+  assert.equal(env.PLAYWRIGHT_HTML_OPEN, 'never');
+  for (const key of REMOVED) assert.equal(Object.hasOwn(env, key), false, `${key} is removed`);
+
+  // Read the way Playwright 1.63's HTML reporter reads them: the first set
+  // variable of each pair wins over the config's `outputFolder` and `open`,
+  // so with no folder variable left the config's folder is the one used.
+  const html = await configHtmlReporter();
+  const folder = env.PLAYWRIGHT_HTML_OUTPUT_DIR || env.PLAYWRIGHT_HTML_REPORT || html.outputFolder;
+  const open = env.PLAYWRIGHT_HTML_OPEN || env.PW_TEST_HTML_REPORT_OPEN || html.open;
+  assert.equal(path.resolve(folder), REPORT_FOLDER);
+  const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+  assert.equal(path.relative(repo, folder), path.join('tests', 'visual', 'report'));
+  assert.equal(open, 'never');
+  assert.equal(html.open, 'never', 'the config never opens the report either');
+});
+
+test('[AC-16][F-018] playwrightEnv sets the runner inputs and passes every unrelated variable through', () => {
+  const base = { ...HOSTILE_ENV };
+  const env = playwrightEnv(base, INPUTS);
+
+  assert.equal(env.VISUAL_BASE_URL, INPUTS.baseUrl);
+  assert.equal(env.VISUAL_BASELINE_DIR, INPUTS.baselineDir);
+  assert.equal(env.VISUAL_RESULTS_FILE, INPUTS.resultsFile);
+  for (const key of ['PATH', 'HOME', 'CI', 'PLAYWRIGHT_BROWSERS_PATH', 'VISUAL_CHANGE_INTENDED']) {
+    assert.equal(env[key], HOSTILE_ENV[key], `${key} passes through`);
+  }
+  // Nothing else is added or removed.
+  const expectedKeys = Object.keys(HOSTILE_ENV).filter((key) => !REMOVED.includes(key));
+  assert.deepEqual(Object.keys(env).sort(), expectedKeys.sort());
+
+  // The caller's object is a different one, left exactly as it was.
+  assert.notEqual(env, base);
+  assert.deepEqual(base, HOSTILE_ENV);
+
+  // Without a results file the variable is empty, which the config reads as "no JSON report".
+  const clean = { PATH: '/usr/bin' };
+  const plain = playwrightEnv(clean, { baseUrl: INPUTS.baseUrl, baselineDir: INPUTS.baselineDir });
+  assert.deepEqual(plain, {
+    PATH: '/usr/bin',
+    VISUAL_BASE_URL: INPUTS.baseUrl,
+    VISUAL_BASELINE_DIR: INPUTS.baselineDir,
+    VISUAL_RESULTS_FILE: '',
+    PLAYWRIGHT_HTML_OPEN: 'never',
+  });
+  assert.deepEqual(clean, { PATH: '/usr/bin' });
 });

@@ -19,7 +19,9 @@
  *     and language, the Content-Security-Policy directly after the charset,
  *     the allowed scripts, title and Open Graph metadata, skip link, mobile
  *     menu landmark, `aria-current` on Blog, the unsafe-markup scan of the
- *     prose region and the search form attributes.
+ *     prose region (bounded by the layout's own markup) and the listing state
+ *     the built article pages call for: every article in the list plus the
+ *     search form attributes, or the launch state when none was built.
  *   - AC-07 [F-018] every local link resolves (`checkSiteLinks`), canonical
  *     and `og:url` follow the deployment URL, repository-internal files are
  *     absent from the output, `CNAME` follows the deployment mode and the
@@ -30,19 +32,37 @@
  *     `assets/drafts/` path. The preview build renders the draft and its
  *     image, and its paths and text hold no trace of the future-dated post.
  *   - AC-05 [F-018] the escaping fixture's title is escaped everywhere it is
- *     printed, `{% raw %}` survives, Rouge highlighting and tables render.
- *   - AC-17 [F-018] the zero-article listing and an empty search index.
+ *     printed, `{% raw %}` survives, the Python and YAML blocks each hold
+ *     Rouge token classes, and tables render.
+ *   - AC-17 [F-018] the zero-article listing and an empty search index; the
+ *     real case runs while `_posts/` holds no regular `.md` file.
+ *   Self-tests on synthetic input prove that the prose scan, the listing
+ *   check, the Rouge check and the post inventory reject what they must.
  *
  * Paths resolve from this file's location (`ROOT`), never `process.cwd()`;
  * relative `SITE_DIR` and `FIXTURE_DIR` values resolve against `ROOT`. The
- * suite reads files only: it never builds, writes or uses the network.
+ * suite never builds or uses the network, and it reads the built output
+ * without changing it. Its one write is the post-inventory self-test, which
+ * creates a folder under `os.tmpdir()` and removes it.
  *
  * Run: bundle exec jekyll build && node --test tests/static/built-pages.test.mjs
  */
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -99,6 +119,16 @@ const OG_SITE_NAME = 'Cabrillo Coast LLC';
 /** Start tags the prose region of an article must never contain (AAP 0.5.3). */
 const FORBIDDEN_PROSE_TAGS = new Set(['script', 'iframe', 'object', 'embed', 'form', 'base', 'meta', 'link', 'style']);
 
+/** Start tag of the article's back links, exactly as `_layouts/post.html` writes it. */
+const POST_BACK_TAG = '<p class="post-back">';
+
+/**
+ * What the layouts write from the article's closing back link on: the link
+ * and the end of the container and the article (`_layouts/post.html`), then
+ * the end of `main` (`_layouts/blog.html`).
+ */
+const LAYOUT_TAIL_RE = /^<p class="post-back"><a href="[^"<>]*">← All articles<\/a><\/p>\s*<\/div>\s*<\/article>\s*<\/main\s*>/;
+
 /** Event-handler attribute names. */
 const EVENT_HANDLER_RE = /^on/i;
 
@@ -142,6 +172,27 @@ const DRAFT_IMAGE_PREFIX = 'assets/drafts/';
 
 /** The launch-state text of the listing (AAP 0.5.4). */
 const EMPTY_LISTING_TEXT = 'No articles have been published yet.';
+
+/**
+ * Class name of every Rouge token type, from `lib/rouge/token.rb` of Rouge
+ * 3.30.0, the version github-pages 232 pins. Plain text has no class and is
+ * written without a span.
+ */
+const ROUGE_TOKEN_CLASSES = Object.freeze(
+  new Set([
+    'w', 'esc', 'err', 'x',
+    'k', 'kc', 'kd', 'kn', 'kp', 'kr', 'kt', 'kv',
+    'n', 'na', 'nb', 'bp', 'nc', 'no', 'nd', 'ni', 'ne', 'nf', 'fm', 'py', 'nl', 'nn', 'nx', 'nt', 'nv',
+    'vc', 'vg', 'vi', 'vm',
+    'l', 'ld',
+    's', 'sa', 'sb', 'sc', 'dl', 'sd', 's2', 'se', 'sh', 'si', 'sx', 'sr', 's1', 'ss',
+    'm', 'mb', 'mf', 'mh', 'mi', 'il', 'mo', 'mx',
+    'o', 'ow',
+    'p', 'pi',
+    'c', 'ch', 'cd', 'cm', 'cp', 'cpf', 'c1', 'cs',
+    'g', 'gd', 'ge', 'gr', 'gh', 'gi', 'go', 'gp', 'gs', 'gu', 'gt', 'gl',
+  ]),
+);
 
 /** Fixture article slugs and the escaped title the escaping fixture must render as. */
 const ESCAPING_SLUG = 'fixture-escaping-and-liquid';
@@ -239,9 +290,16 @@ function closingTagIndex(html, name, from) {
 }
 
 /**
- * The prose region of an article: from the end of `<div class="prose">` to
- * the first `<p class="post-back">` after it, the layout contract of
- * `_layouts/post.html`. Fails the calling test when either is missing.
+ * The prose region of an article, bounded by markup the layouts own and never
+ * by markup the article body can write. It runs from the end of the
+ * first `<div class="prose">` (only layout markup with escaped values comes
+ * before it) to that div's own closing `</div>`, which the layout's closing
+ * back link directly follows. That link is the last `<p class="post-back">`
+ * in the page source; it must be a real tag, not text inside a comment opened
+ * in the prose, and only the end of the container, the article and `main` may
+ * follow it (`LAYOUT_TAIL_RE`). A back link written in the body therefore
+ * stays inside the region, and a page that does not match this structure
+ * fails the calling test instead of leaving part of its prose unscanned.
  * @param {string} html
  * @returns {string}
  */
@@ -249,9 +307,24 @@ function proseRegion(html) {
   const all = tags(html);
   const prose = all.find((t) => t.name === 'div' && classTokens(t).includes('prose'));
   assert.ok(prose, 'article has no <div class="prose"> (layout contract of _layouts/post.html)');
-  const back = all.find((t) => t.start >= prose.end && t.name === 'p' && classTokens(t).includes('post-back'));
-  assert.ok(back, 'article has no <p class="post-back"> after its prose (layout contract of _layouts/post.html)');
-  return html.slice(prose.end, back.start);
+
+  const boundary = html.lastIndexOf(POST_BACK_TAG);
+  assert.ok(boundary >= prose.end, `article has no ${POST_BACK_TAG} after its prose (layout contract of _layouts/post.html)`);
+  assert.ok(
+    all.some((t) => t.start === boundary && t.name === 'p'),
+    `the closing ${POST_BACK_TAG} is not a tag: a comment opened in the prose hides it, so the prose has no bound`,
+  );
+  const close = /<\/div>\s*$/.exec(html.slice(prose.end, boundary));
+  assert.ok(
+    close,
+    `the closing ${POST_BACK_TAG} must directly follow the </div> of the prose (layout contract of _layouts/post.html)`,
+  );
+  assert.ok(
+    LAYOUT_TAIL_RE.test(html.slice(boundary)),
+    `the closing ${POST_BACK_TAG} must be the "← All articles" link followed only by </div></article></main> ` +
+      `(layout contract of _layouts/post.html and _layouts/blog.html), found: ${html.slice(boundary, boundary + 160)}`,
+  );
+  return html.slice(prose.end, prose.end + close.index);
 }
 
 /**
@@ -302,14 +375,35 @@ function siteBlogPages() {
 }
 
 /**
- * Every `*.md` file under `ROOT/_posts`, recursively (Jekyll reads `_posts/`
+ * Every regular `*.md` file under `dir`, recursively, as sorted POSIX paths
+ * relative to it; empty when `dir` is missing or not a folder. Only real
+ * folders are entered and only regular files count, so neither a folder named
+ * `scratch.md` nor a symbolic link passes for an article (`Dirent` types come
+ * from `lstat`, so links are never followed).
+ * @param {string} dir
+ * @returns {string[]}
+ */
+function postFiles(dir) {
+  if (!existsSync(dir) || !lstatSync(dir).isDirectory()) return [];
+  const out = [];
+  const visit = (abs, prefix) => {
+    for (const entry of readdirSync(abs, { withFileTypes: true })) {
+      const rel = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
+      if (entry.isDirectory()) visit(path.join(abs, entry.name), rel);
+      else if (entry.isFile() && entry.name.toLowerCase().endsWith('.md')) out.push(rel);
+    }
+  };
+  visit(dir, '');
+  return out.sort();
+}
+
+/**
+ * Every article file under `ROOT/_posts`, recursively (Jekyll reads `_posts/`
  * subfolders too); empty when the folder does not exist.
  * @returns {string[]}
  */
 function realPostFiles() {
-  const dir = path.join(ROOT, '_posts');
-  if (!existsSync(dir)) return [];
-  return walk(dir).filter((rel) => rel.toLowerCase().endsWith('.md'));
+  return postFiles(path.join(ROOT, '_posts'));
 }
 
 /**
@@ -478,33 +572,86 @@ function assertBlogCurrent(html, kind) {
 }
 
 /**
- * The listing's search form, present whenever the list is: hidden until
- * `search.js` runs, a GET to the listing, and the index URL under the base path.
+ * The listing's state, chosen by the built article inventory and never by the
+ * listing's own markup, so a list or form that went missing cannot pass for
+ * the launch state.
+ *
+ * With articles: `ol#post-list.post-list` holds one `li[data-url]` per built
+ * article (the join `search.js` makes with the index); `form#blog-search` is
+ * hidden until `search.js` runs, a GET to the listing, and names the index
+ * under the base path in `data-index`; no `.post-empty` element is present.
+ * Without articles: one `p.post-empty` reading the empty-state text, and
+ * neither the form nor the list.
+ *
+ * The empty state is recognised by its layout-owned element, never by its
+ * wording: titles and summaries are escaped, so they cannot write a
+ * `.post-empty` element, but they may contain any text, the empty-state
+ * sentence included.
  * @param {string} html
- * @param {import('node:test').TestContext} t
+ * @param {{ base: string, articleUrls: string[] }} expected `base`: the site's
+ *   base path; `articleUrls`: the URL path of every built article page
  */
-function assertSearchForm(html, t) {
+function assertListing(html, { base, articleUrls }) {
   const all = tags(html);
-  if (!all.some((tag) => tag.attrs.id === 'post-list')) {
-    t.diagnostic('the listing holds no #post-list (no articles); the launch-state case covers it');
+  const byId = (id) => all.find((tag) => tag.attrs.id === id);
+  const emptyStates = all.filter((tag) => classTokens(tag).includes('post-empty'));
+
+  if (articleUrls.length === 0) {
+    assert.equal(emptyStates.length, 1, 'a listing without articles must hold exactly one .post-empty element');
+    const [empty] = emptyStates;
+    assert.equal(empty.name, 'p', `the empty state must be a <p>: ${empty.source}`);
+    const end = closingTagIndex(html, 'p', empty.end);
+    assert.notEqual(end, -1, 'p.post-empty is never closed');
+    assert.equal(textOf(html.slice(empty.end, end)), EMPTY_LISTING_TEXT, 'p.post-empty must read the empty-state text');
+    for (const id of ['blog-search', 'post-list']) {
+      assert.ok(!html.includes(`id="${id}"`) && byId(id) === undefined, `a listing without articles must not contain #${id}`);
+    }
     return;
   }
-  const form = all.find((tag) => tag.attrs.id === 'blog-search');
-  assert.ok(form, 'a listing with #post-list must hold form#blog-search');
+
+  const list = byId('post-list');
+  assert.ok(list, `the listing must hold #post-list for its ${articleUrls.length} built article(s)`);
+  assert.equal(list.name, 'ol', `#post-list must be an <ol>: ${list.source}`);
+  assert.ok(classTokens(list).includes('post-list'), `#post-list lacks class "post-list": ${list.source}`);
+  const close = closingTagIndex(html, 'ol', list.end);
+  assert.notEqual(close, -1, 'ol#post-list is never closed');
+  const listed = all
+    .filter((tag) => tag.name === 'li' && tag.start >= list.end && tag.start < close && Object.hasOwn(tag.attrs, 'data-url'))
+    .map((tag) => tag.attrs['data-url']);
+  assert.deepEqual(
+    [...listed].sort(),
+    [...articleUrls].sort(),
+    'the li[data-url] items of ol#post-list must name every built article exactly once',
+  );
+
+  const form = byId('blog-search');
+  assert.ok(form, `the listing must hold form#blog-search for its ${articleUrls.length} built article(s)`);
   assert.equal(form.name, 'form', `#blog-search must be a <form>: ${form.source}`);
   assert.equal(form.attrs.role, 'search', 'form#blog-search role');
   assert.ok(Object.hasOwn(form.attrs, 'hidden'), 'form#blog-search must be hidden until search.js runs');
   assert.equal((form.attrs.method || '').toLowerCase(), 'get', 'form#blog-search method');
-  assert.equal(form.attrs.action, `${BASE}/blog/`, 'form#blog-search action');
-  assert.equal(form.attrs['data-index'], `${BASE}/blog/search.json`, 'form#blog-search data-index');
+  assert.equal(form.attrs.action, `${base}/blog/`, 'form#blog-search action');
+  assert.equal(form.attrs['data-index'], `${base}/blog/search.json`, 'form#blog-search data-index');
+
+  assert.deepEqual(
+    emptyStates.map((tag) => tag.source),
+    [],
+    'a listing with articles must not show the empty state (.post-empty)',
+  );
 }
 
 function definePageContractTests() {
   test('[AC-06][F-018] every blog page meets the page contract', async (t) => {
     const pages = siteBlogPages();
     t.diagnostic(`${pages.length} blog page(s) under ${SITE_DIR}: ${pages.map((p) => p.rel).join(', ')}`);
+    // Article pages built, independent of the listing markup they are checked against.
+    const articleUrls = pages.filter((p) => p.kind === 'article').map((p) => p.urlPath);
+    t.diagnostic(
+      `${articleUrls.length} built article page(s): the listing must ` +
+        (articleUrls.length > 0 ? 'list each one and hold the search form' : 'show the launch state'),
+    );
     for (const page of pages) {
-      await t.test(`[AC-06][F-018] ${page.rel} (${page.urlPath})`, (st) => {
+      await t.test(`[AC-06][F-018] ${page.rel} (${page.urlPath})`, () => {
         const html = readFileSync(page.file, 'utf8');
         assert.ok(html.startsWith('<!DOCTYPE html>'), 'page must start with <!DOCTYPE html>');
         const root = tags(html).find((tag) => tag.name === 'html');
@@ -525,14 +672,18 @@ function definePageContractTests() {
         assertMetadata(html, page.kind);
         assertLandmarks(html);
         assertBlogCurrent(html, page.kind);
-        if (page.kind === 'listing') assertSearchForm(html, st);
+        if (page.kind === 'listing') assertListing(html, { base: BASE, articleUrls });
       });
     }
   });
 
   test('[AC-06][F-018] the prose scan flags unsafe markup and passes escaped code samples', () => {
+    // The structure _layouts/post.html and _layouts/blog.html build around the rendered body.
+    const back = '<p class="post-back"><a href="/blog/">← All articles</a></p>';
     const wrap = (inner) =>
-      `<div class="prose">\n${inner}\n</div>\n<p class="post-back"><a href="/blog/">All articles</a></p>`;
+      `<main id="main">\n<article class="section post">\n<div class="container">\n${back}\n` +
+      `<header class="post-header"><h1>T</h1></header>\n<div class="prose">\n${inner}\n</div>\n${back}\n` +
+      '</div>\n</article>\n</main>';
     const flagged = (inner) => unsafeMarkup(proseRegion(wrap(inner))).length > 0;
     const unsafe = [
       '<script>alert(1)</script>',
@@ -567,6 +718,76 @@ function definePageContractTests() {
 
     // The region stops at the closing back link, so a script after it belongs to the layout scan.
     assert.equal(proseRegion(`${wrap('<p>ok</p>')}<script src="/main.js"></script>`).includes('<script'), false);
+
+    // A back link, or a whole fake layout tail, written in the body does not end the region.
+    const spoofed = [
+      '<p class="post-back">x</p><iframe src="/"></iframe>',
+      `${back}</div></article></main><iframe src="/"></iframe>`,
+      "<p class='post-back'>x</p><form action=\"/\"></form>",
+    ];
+    for (const inner of spoofed) assert.ok(flagged(inner), `not flagged behind a spoofed back link: ${inner}`);
+
+    // A page whose prose cannot be bounded by the layout's own markup fails instead of passing unscanned.
+    const unbounded = {
+      'a comment opened in the prose hides the closing back link': wrap(
+        '<p class="post-back">x</p><iframe src="/"></iframe>\n<!--',
+      ),
+      'markup between the closing back link and </article>': wrap('<p>ok</p>').replace(
+        `${back}\n</div>\n</article>`,
+        `${back}\n<iframe src="/"></iframe>\n</div>\n</article>`,
+      ),
+      'markup between the prose and the closing back link': wrap('<p>ok</p>').replace(
+        `</div>\n${back}\n</div>`,
+        `</div>\n<iframe src="/"></iframe>\n${back}\n</div>`,
+      ),
+      'no closing back link after the prose': wrap('<p>ok</p>').replace(`${back}\n</div>\n</article>`, '</div>\n</article>'),
+    };
+    for (const [why, html] of Object.entries(unbounded)) {
+      assert.notEqual(html, wrap('<p>ok</p>'), `case not built: ${why}`);
+      assert.throws(() => proseRegion(html), assert.AssertionError, `prose region accepted: ${why}`);
+    }
+  });
+
+  test('[AC-06][F-018] the listing check follows the built article inventory, not the listing markup', () => {
+    const base = '/cabrillo-coast';
+    const urls = [`${base}/blog/second-article/`, `${base}/blog/first-article/`];
+    const index = `data-index="${base}/blog/search.json"`;
+    const form =
+      `<form class="blog-search" id="blog-search" role="search" action="${base}/blog/" method="get" ${index} hidden>\n` +
+      '<label for="blog-search-input">Search articles</label>\n' +
+      '<input id="blog-search-input" type="search" name="q">\n</form>';
+    const card = (url, words = 'Title') =>
+      `<li class="card post-card" data-url="${url}">\n<h2><a href="${url}">${words}</a></h2>\n` +
+      `<p class="post-summary">${words}</p>\n` +
+      `<ul class="tag-list" aria-label="Tags"><li><a class="tag-link" href="${base}/blog/?q=tag">tag</a></li></ul>\n</li>`;
+    const list = (items, words) =>
+      `<ol class="post-list" id="post-list" aria-label="Articles">\n${items.map((url) => card(url, words)).join('\n')}\n</ol>`;
+    const page = (inner) =>
+      '<!DOCTYPE html>\n<html lang="en">\n<body>\n<main id="main">\n<section class="section blog-index">\n' +
+      `<div class="container">\n<div class="section-head"><h1>Technical articles</h1></div>\n${inner}\n</div>\n` +
+      '</section>\n</main>\n</body>\n</html>';
+    const populated = page(`${form}\n${list(urls)}`);
+    const launch = page(`<p class="post-empty">${EMPTY_LISTING_TEXT}</p>`);
+    const check = (html, articleUrls) => () => assertListing(html, { base, articleUrls });
+    const fails = (html, articleUrls, why) => assert.throws(check(html, articleUrls), assert.AssertionError, `passed: ${why}`);
+
+    assert.doesNotThrow(check(populated, urls), 'a valid populated listing must pass');
+    fails(populated.replace('id="post-list"', 'id="posts"'), urls, 'list id renamed');
+    fails(page(form), urls, 'list removed');
+    fails(page(list(urls)), urls, 'form removed');
+    fails(populated.replace(` ${index}`, ''), urls, 'form without data-index');
+    fails(populated.replace(index, 'data-index="/blog/search.json"'), urls, 'data-index without the base path');
+    fails(page(`${form}\n${list(urls.slice(1))}`), urls, 'list missing an article');
+    fails(populated, [], 'populated listing with no built article');
+    fails(page(`<p class="post-empty">${EMPTY_LISTING_TEXT}</p>\n${form}\n${list(urls)}`), urls, 'empty state beside the list');
+    assert.doesNotThrow(
+      check(page(`${form}\n${list(urls, `Why ${EMPTY_LISTING_TEXT} matters`)}`), urls),
+      'the empty-state sentence in an article title or summary is article content, not the empty state',
+    );
+    assert.doesNotThrow(check(launch, []), 'the launch state with no built article must pass');
+    fails(launch, urls, 'launch state with built articles');
+    fails(page('<p class="post-empty">Nothing here.</p>'), [], 'launch state with the wrong empty-state text');
+    fails(page(''), [], 'no built article and no empty state');
   });
 }
 
@@ -701,6 +922,61 @@ function readArticle(slug) {
   return readFileSync(file, 'utf8');
 }
 
+/**
+ * The code HTML of the one fenced block for `lang` in a page: the content of
+ * `<code>` in `div.language-<lang>.highlighter-rouge > div.highlight >
+ * pre.highlight`, the structure kramdown writes with Rouge. Fails the calling
+ * test unless exactly one such block exists and holds that structure.
+ * @param {string} html
+ * @param {string} lang
+ * @returns {string}
+ */
+function rougeCode(html, lang) {
+  const blocks = tags(html).filter((t) => {
+    const classes = classTokens(t);
+    return t.name === 'div' && classes.includes(`language-${lang}`) && classes.includes('highlighter-rouge');
+  });
+  assert.equal(blocks.length, 1, `the page must hold exactly one div.language-${lang}.highlighter-rouge block`);
+  const opening = '<div class="highlight"><pre class="highlight"><code>';
+  const after = blocks[0].end;
+  assert.ok(
+    html.startsWith(opening, after),
+    `div.language-${lang}.highlighter-rouge must directly hold ${opening}, found: ${html.slice(after, after + 80)}`,
+  );
+  const close = closingTagIndex(html, 'code', after + opening.length);
+  assert.notEqual(close, -1, `the ${lang} code block is never closed`);
+  return html.slice(after + opening.length, close);
+}
+
+/**
+ * The fenced `lang` block was highlighted by Rouge: its code holds token
+ * spans, every span carries exactly one class from `ROUGE_TOKEN_CLASSES`,
+ * every class in `tokens` occurs, and its text holds every string in `text`.
+ * @param {string} html
+ * @param {string} lang
+ * @param {{ tokens: string[], text: string[] }} expected
+ */
+function assertRougeBlock(html, lang, { tokens, text }) {
+  const code = rougeCode(html, lang);
+  const spans = tags(code).filter((t) => t.name === 'span');
+  assert.ok(spans.length > 0, `the ${lang} block holds no Rouge token spans`);
+  const found = new Set();
+  for (const span of spans) {
+    const classes = classTokens(span);
+    assert.ok(
+      classes.length === 1 && ROUGE_TOKEN_CLASSES.has(classes[0]),
+      `every span of the ${lang} block must carry one Rouge token class: ${span.source}`,
+    );
+    found.add(classes[0]);
+  }
+  const missing = tokens.filter((token) => !found.has(token));
+  assert.deepEqual(missing, [], `the ${lang} block lacks Rouge token class(es); it holds ${[...found].sort().join(' ')}`);
+  const plain = textOf(code);
+  for (const expected of text) {
+    assert.ok(plain.includes(expected), `the ${lang} block lacks the text "${expected}", found: ${plain.slice(0, 160)}`);
+  }
+}
+
 function defineRenderingTests() {
   test('[AC-05][F-018] the escaping fixture is escaped in <title>, <h1> and og:title and keeps {% raw %} text', FIXTURE_ONLY, () => {
     const html = readArticle(ESCAPING_SLUG);
@@ -742,17 +1018,60 @@ function defineRenderingTests() {
     ]) {
       assert.ok(html.includes(expected), `missing ${expected}`);
     }
-    const blocks = [...html.matchAll(/<pre class="highlight">([\s\S]*?)<\/pre>/g)].map((m) => m[1]);
-    assert.ok(
-      blocks.some((block) => block.includes('<span class="')),
-      'highlighted code blocks hold no Rouge token spans',
-    );
+    assertRougeBlock(html, 'python', {
+      tokens: ['k', 'nf', 'c1', 's', 'mi', 'mf'],
+      text: ['def retry_delay(attempt, base=0.5, limit=30):', 'unit = "seconds"'],
+    });
+    // The quoted YAML strategy is the fixture's settled choice: Rouge writes its opening quote as s2.
+    assertRougeBlock(html, 'yaml', {
+      tokens: ['na', 'pi', 's2', 'm'],
+      text: ['strategy: "exponential"', 'max_attempts: 5'],
+    });
     const tables = [...html.matchAll(/<table\b[^>]*>([\s\S]*?)<\/table\s*>/gi)].map((m) => m[1]);
     assert.ok(
       tables.some((table) => table.includes('<th') && table.includes('style="text-align:')),
       'no rendered table with aligned header cells',
     );
     assert.equal(meta(html, 'property', 'article:modified_time'), undefined, 'the code fixture has no updated date');
+  });
+
+  test('[AC-05][F-018] the Rouge check requires recognized tokens in each language block', () => {
+    const block = (lang, code) =>
+      `<div class="language-${lang} highlighter-rouge"><div class="highlight"><pre class="highlight"><code>${code}` +
+      '</code></pre></div></div>';
+    const python =
+      '<span class="k">def</span> <span class="nf">delay</span><span class="p">(</span><span class="n">attempt</span>' +
+      '<span class="p">):</span>\n    <span class="c1"># Capped.\n</span>    <span class="n">unit</span> ' +
+      '<span class="o">=</span> <span class="s">"seconds"</span>\n    <span class="k">return</span> ' +
+      '<span class="mf">0.5</span> <span class="o">*</span> <span class="mi">2</span>\n';
+    const yaml =
+      '<span class="na">strategy</span><span class="pi">:</span> <span class="s2">"</span>' +
+      '<span class="s">exponential"</span>\n<span class="na">max_attempts</span><span class="pi">:</span> ' +
+      '<span class="m">5</span>\n';
+    const page = (...blocks) => `<div class="prose">\n${blocks.join('\n')}\n</div>`;
+    const check = (html) => () => {
+      assertRougeBlock(html, 'python', {
+        tokens: ['k', 'nf', 'c1', 's', 'mi', 'mf'],
+        text: ['def delay(attempt):', 'unit = "seconds"'],
+      });
+      assertRougeBlock(html, 'yaml', { tokens: ['na', 'pi', 's2', 'm'], text: ['strategy: "exponential"', 'max_attempts: 5'] });
+    };
+    const fails = (html, why) => assert.throws(check(html), assert.AssertionError, `passed: ${why}`);
+    const unspanned = (code) => code.replace(/<\/?span\b[^>]*>/g, '');
+    const nonRouge = (code) => code.replace(/<span class="[^"]*">/g, '<span class="token">');
+
+    assert.doesNotThrow(check(page(block('python', python), block('yaml', yaml))), 'valid Python and YAML blocks must pass');
+    fails(page(block('python', python), block('yaml', unspanned(yaml))), 'YAML block without token spans');
+    fails(page(block('python', unspanned(python)), block('yaml', yaml)), 'Python block without token spans');
+    fails(page(block('python', nonRouge(python)), block('yaml', nonRouge(yaml))), 'non-Rouge class on every span');
+    fails(page(block('python', python), block('yaml', yaml.replace('<span class="s2">"</span>', '"'))), 'YAML s2 token missing');
+    fails(page(block('python', python), block('yaml', yaml.replace('>5</span>', '>7</span>'))), 'expected YAML text missing');
+    fails(page(block('python', python)), 'YAML block missing');
+    fails(page(block('python', python), block('yaml', yaml), block('yaml', yaml)), 'YAML block written twice');
+    fails(
+      page(block('python', python), `<div class="language-yaml highlighter-rouge"><pre><code>${yaml}</code></pre></div>`),
+      'YAML block outside div.highlight > pre.highlight',
+    );
   });
 }
 
@@ -774,6 +1093,34 @@ function defineLaunchStateTests() {
   }
   test('[AC-17][F-018] the real build shows the launch state while _posts/ holds no article', { skip: realSkip }, () => {
     assertEmpty(SITE_DIR);
+  });
+
+  test('[AC-17][F-018] the post inventory counts regular .md files only', (t) => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'built-pages-posts-'));
+    try {
+      assert.deepEqual(postFiles(path.join(dir, 'missing')), [], 'a missing folder holds no article');
+      mkdirSync(path.join(dir, 'scratch.md'));
+      assert.deepEqual(postFiles(dir), [], 'an empty folder named scratch.md is not an article');
+
+      mkdirSync(path.join(dir, 'sub'));
+      writeFileSync(path.join(dir, 'sub', '2026-01-01-a.md'), '---\ntitle: "A"\n---\nBody.\n');
+      writeFileSync(path.join(dir, 'notes.txt'), 'Not an article.\n');
+      assert.deepEqual(postFiles(dir), ['sub/2026-01-01-a.md'], 'a nested regular .md file counts, a .txt file does not');
+
+      let linked = false;
+      try {
+        symlinkSync(path.join(dir, 'sub', '2026-01-01-a.md'), path.join(dir, 'link.md'));
+        symlinkSync(path.join(dir, 'sub'), path.join(dir, 'linked-folder'), 'dir');
+        linked = true;
+      } catch (error) {
+        t.diagnostic(`symbolic links are unsupported here (${error.code}); the link sub-case is skipped`);
+      }
+      if (linked) {
+        assert.deepEqual(postFiles(dir), ['sub/2026-01-01-a.md'], 'symbolic links are neither counted nor followed');
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 }
 

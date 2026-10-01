@@ -51,7 +51,9 @@
  *      that exited 1 is classified case by case from its JSON results
  *      (`compare-results.json` in the workspace): intent is accepted only
  *      when all 12 cases ran and every failed case is solely a screenshot
- *      size or pixel difference with its actual image. Mixed or unknown
+ *      size or pixel difference with its actual image, reported either by
+ *      `toHaveScreenshot` or by the spec's zero-tolerance comparison that
+ *      runs after it (tests/visual/lib/pixels.mjs). Mixed or unknown
  *      failures, and results that cannot be read, fail whatever was
  *      declared, and each problem is printed with its case.
  *   2  Usage error, or git answers that the base revision names no commit.
@@ -65,7 +67,9 @@
  * (`tests/visual/report/`) and test artefacts (`tests/visual/test-results/`,
  * with actual, expected and diff images) are left in place for inspection
  * and for the blog-checks workflow, which uploads the report when
- * verification fails. Both are git-ignored.
+ * verification fails. Both are git-ignored. The report always lands there
+ * and is never opened, whatever Playwright's HTML-report variables the
+ * caller's environment holds (`playwrightEnv`).
  *
  * Consumer: `scripts/verify.mjs` runs this as its last step, with inherited
  * output, `VISUAL_CHANGE_INTENDED` passed through and `JEKYLL_ENV` removed,
@@ -82,6 +86,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { DEADLINES, describeResult, formatDuration, runSync, spawnSupervised } from "../../scripts/lib/subprocess.mjs";
 import { buildFixtureSite } from "../fixtures/build-fixture-site.mjs";
+import { STRICT_MISMATCH } from "./lib/pixels.mjs";
 
 /* ------------------------------------------------------------------------ */
 /* Constants                                                                 */
@@ -113,7 +118,10 @@ const ANSI_SEQUENCE = /\u001b\[[0-9;]*m/g;
  * difference, or both, ending the line. A timed-out matcher puts a
  * `Timeout: <n>ms` line in between, and every other failure ("Failed to take
  * two consecutive stable screenshots.", a missing snapshot, a page or
- * assertion error) reads differently, so none of those match.
+ * assertion error) reads differently, so none of those match. The spec's
+ * second, zero-tolerance layer fails with its own message, which
+ * STRICT_MISMATCH (from lib/pixels.mjs) recognises in the same way; a
+ * strict comparison that could not decode an image matches neither.
  */
 const SCREENSHOT_MISMATCH = new RegExp(
   "^Error: expect\\(page\\)\\.toHaveScreenshot\\(expected\\) failed\\n\\n  " +
@@ -736,6 +744,63 @@ async function preflight(port) {
 /* ------------------------------------------------------------------------ */
 
 /**
+ * Environment of a Playwright run: `baseEnv` with the inputs of the config
+ * and the spec set, and every variable Playwright would prefer to the
+ * config's reporter settings neutralised. The HTML report then always goes
+ * to the config's folder, `tests/visual/report/` (REPORT_DIR), which the
+ * printed hints name and the blog-checks workflow uploads; it is never
+ * opened, and no reporter is added. Every other variable passes through
+ * unchanged, and `baseEnv` is not modified.
+ *
+ * @example
+ *   const env = playwrightEnv(process.env, {
+ *     baseUrl: "http://127.0.0.1:41234/cabrillo-coast",
+ *     baselineDir: "/tmp/blog-visual-x/baseline",
+ *     resultsFile: "/tmp/blog-visual-x/compare-results.json",
+ *   });
+ *
+ * @param {Record<string, string | undefined>} baseEnv Usually `process.env`.
+ * @param {{ baseUrl: string, baselineDir: string, resultsFile?: string }} inputs
+ *   `VISUAL_BASE_URL`, `VISUAL_BASELINE_DIR` and `VISUAL_RESULTS_FILE`; an
+ *   omitted results file is passed as an empty value, which writes no JSON
+ *   report.
+ * @returns {Record<string, string | undefined>} a new environment object.
+ */
+export function playwrightEnv(baseEnv, { baseUrl, baselineDir, resultsFile }) {
+  const env = {
+    ...baseEnv,
+    VISUAL_BASE_URL: baseUrl,
+    VISUAL_BASELINE_DIR: baselineDir,
+    VISUAL_RESULTS_FILE: resultsFile ?? "",
+  };
+  delete env.JEKYLL_ENV;
+  // Playwright prefers this variable to the config's outputFile; an inherited
+  // value would send the results somewhere this runner never reads.
+  delete env.PLAYWRIGHT_JSON_OUTPUT_FILE;
+  // The HTML reporter takes its folder from PLAYWRIGHT_HTML_OUTPUT_DIR, then
+  // from PLAYWRIGHT_HTML_REPORT, before the config's outputFolder, which is
+  // REPORT_DIR. Both are removed rather than forced to that folder: with
+  // either set, Playwright treats the folder as its default and prints its
+  // "show-report" hint without the folder, a command that finds no report.
+  delete env.PLAYWRIGHT_HTML_OUTPUT_DIR;
+  delete env.PLAYWRIGHT_HTML_REPORT;
+  // It takes its open policy from PLAYWRIGHT_HTML_OPEN, then from
+  // PW_TEST_HTML_REPORT_OPEN, before the config's `open: "never"`; an
+  // inherited "always" would start a report server that holds the run open.
+  env.PLAYWRIGHT_HTML_OPEN = "never";
+  delete env.PW_TEST_HTML_REPORT_OPEN;
+  // A base URL for attachments makes the report link its screenshots there
+  // instead of inside the report folder, so the uploaded report would show
+  // none of them.
+  delete env.PLAYWRIGHT_HTML_ATTACHMENTS_BASE_URL;
+  // PW_TEST_REPORTER adds one more reporter to the config's list, whose
+  // output this runner neither expects nor directs: a json one prints the
+  // whole report into the run's output, an html one builds the report twice.
+  delete env.PW_TEST_REPORTER;
+  return env;
+}
+
+/**
  * Runs the spec through Playwright Test against one served build and
  * resolves when the child closes. Supervised and asynchronous, never
  * `spawnSync`: the static servers live in this process's event loop and must
@@ -754,16 +819,7 @@ async function preflight(port) {
  *   then say nothing about the screenshots.
  */
 function runPlaywright(mode, port, baselineDir, resultsFile) {
-  const env = {
-    ...process.env,
-    VISUAL_BASE_URL: `http://127.0.0.1:${port}${MOUNT}`,
-    VISUAL_BASELINE_DIR: baselineDir,
-    VISUAL_RESULTS_FILE: resultsFile ?? "",
-  };
-  delete env.JEKYLL_ENV;
-  // Playwright prefers this variable to the config's outputFile; an inherited
-  // value would send the results somewhere this runner never reads.
-  delete env.PLAYWRIGHT_JSON_OUTPUT_FILE;
+  const env = playwrightEnv(process.env, { baseUrl: `http://127.0.0.1:${port}${MOUNT}`, baselineDir, resultsFile });
   const args = [CLI, "test", "--config", CONFIG, `--update-snapshots=${mode}`];
   const shown = args.map((a) => (path.isAbsolute(a) ? path.relative(REPO, a) : a)).join(" ");
   log(`$ VISUAL_BASE_URL=${env.VISUAL_BASE_URL} node ${shown}`);
@@ -808,9 +864,15 @@ function firstLine(message) {
   return text === "" ? "(no message)" : text.split("\n")[0];
 }
 
-/** True when `message` is solely a screenshot size or pixel difference (SCREENSHOT_MISMATCH). */
+/**
+ * True when `message` is solely a screenshot size or pixel difference, found
+ * by `toHaveScreenshot` (SCREENSHOT_MISMATCH) or by the spec's zero-tolerance
+ * comparison (STRICT_MISMATCH).
+ */
 function isScreenshotMismatch(message) {
-  return typeof message === "string" && SCREENSHOT_MISMATCH.test(message.replace(ANSI_SEQUENCE, ""));
+  if (typeof message !== "string") return false;
+  const text = message.replace(ANSI_SEQUENCE, "");
+  return SCREENSHOT_MISMATCH.test(text) || STRICT_MISMATCH.test(text);
 }
 
 /** True when a result attached the captured screenshot (`<name>-actual.png`). */
@@ -843,8 +905,10 @@ function collectCases(suites, cases = []) {
  * nothing but `report`.
  *
  * A failed result is a mismatch when it has at least one error, every error
- * is solely a `toHaveScreenshot` size or pixel difference, and it attached
- * its `<name>-actual.png`. Each of these is a problem instead: a report
+ * is solely a screenshot size or pixel difference (a `toHaveScreenshot`
+ * failure, or the spec's zero-tolerance comparison failing with
+ * `strictMismatchMessage`), and it attached its `<name>-actual.png`. Each of
+ * these is a problem instead: a report
  * without a `suites` or an `errors` list, a run-level error, fewer than
  * EXPECTED_SCREENSHOTS cases, a case with no result, a result neither passed
  * nor failed (timed out, interrupted, skipped), and a failed result with no
@@ -1142,8 +1206,9 @@ async function main(argv) {
      * 130 is an interrupted run with cases left unrun, and a signal or any
      * other code is abnormal. At least one `<name>-actual.png` must have been
      * written. The run's JSON results must then list every case, each passed
-     * or failed solely on a `toHaveScreenshot` size or pixel difference with
-     * its actual image attached. Any other failure in the run (a navigation,
+     * or failed solely on a screenshot size or pixel difference (from
+     * `toHaveScreenshot` or the spec's zero-tolerance comparison) with its
+     * actual image attached. Any other failure in the run (a navigation,
      * page, browser or assertion error, a timeout, a skipped case, a run-level
      * error, unreadable results) fails it whatever was declared.
      */

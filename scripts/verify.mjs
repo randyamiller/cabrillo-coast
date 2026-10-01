@@ -43,19 +43,25 @@
  *     SITE_URL from that file's `url`, and step 4 sets its own values.
  * VISUAL_CHANGE_INTENDED is kept, so `VISUAL_CHANGE_INTENDED=1` reaches step 5.
  *
- * Preflight: a missing Playwright install or Chromium build is a failure
- * before step 1, never a skip, so no check is silently left out locally that
- * CI would run. It runs first so authors are not kept waiting for the builds.
+ * Preflight: a missing Playwright install, or a Chromium that cannot start,
+ * is a failure before step 1, never a skip, so no check is silently left out
+ * locally that CI would run. It runs first so authors are not kept waiting
+ * for the builds. It launches and closes Chromium with the visual project's
+ * own selection (headless, no channel), which starts Playwright's
+ * `chromium-headless-shell` build, so it passes exactly when step 5 can start
+ * its browser, whichever of Playwright's two Chromium builds is installed.
  *
  * Deadlines: every git query and every step runs under a finite deadline
  * from `DEADLINES` in scripts/lib/subprocess.mjs, and is killed with SIGKILL
- * when it expires, so the run always ends. Each step's deadline exceeds the
- * deadlines of the tools it runs inside (the fixture builder's git, tar and
- * Jekyll runs, the visual runner's builds and Playwright runs), so a stuck
- * tool is stopped and reported by its own step first. Only a git that exited
- * by itself gives an answer: a killed or timed-out `@{upstream}` probe is a
- * failure, never "no upstream", and a killed `--base` probe is a failure,
- * never an unresolvable revision.
+ * when it expires, so the run always ends. The preflight launch is bounded
+ * by Playwright's launch timeout, set to `PREFLIGHT_LAUNCH_MS` (1 min).
+ * Each step's deadline exceeds the deadlines of the tools it runs inside
+ * (the fixture builder's git, tar and Jekyll runs, the visual runner's
+ * builds and Playwright runs), so a stuck tool is stopped and reported by
+ * its own step first. Only a git that exited by itself gives an answer: a
+ * killed or timed-out `@{upstream}` probe is a failure, never "no
+ * upstream", and a killed `--base` probe is a failure, never an
+ * unresolvable revision.
  *
  * Exit status:
  *   0  every step passed (the fixture folder has been removed);
@@ -64,17 +70,22 @@
  *      fixture folder, when it exists, is kept and its path printed for
  *      inspection);
  *   1  `_config.yml` cannot be read or names no http or https `url`,
- *      Playwright or its Chromium is missing, git cannot be run or a git
- *      query was killed or exceeded its deadline, the fixture folder cannot
- *      be created, or every step passed but the fixture folder cannot be
- *      removed (its path is printed);
+ *      Playwright is missing or its Chromium cannot start, git cannot be
+ *      run or a git query was killed or exceeded its deadline, the fixture
+ *      folder cannot be created, or every step passed but the fixture folder
+ *      cannot be removed (its path is printed);
  *   2  usage error, or the base revision does not resolve to a commit.
  * An interrupt (Ctrl-C) reaches the foreground step and this script alike;
- * no handler is installed, so the run ends at once with the shell's usual 130.
+ * no handler is installed (Playwright's, which closes the preflight browser,
+ * is removed with that browser), so the run ends at once with the shell's
+ * usual 130.
  *
  * Consumers: `.github/workflows/blog-checks.yml` runs
  * `node scripts/verify.mjs --base <base>`; `scripts/article.mjs` prints
  * `node scripts/verify.mjs` as the step after `publish`.
+ * tests/unit/verify.test.mjs imports `main` and `preflightPlaywright` and
+ * runs them with injected processes, environment, folders and browser
+ * module, so the step sequence and every refusal are tested without a build.
  */
 
 import fs from "node:fs";
@@ -130,9 +141,16 @@ const COMMIT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 /** Characters that never need shell quoting in a printed command. */
 const SHELL_SAFE = /^[A-Za-z0-9_@%+=:,./-]+$/;
 
+/**
+ * How long the preflight's Chromium launch may take, passed to Playwright as
+ * the launch `timeout`. A cold start takes a few seconds; a launch still
+ * pending after a minute cannot serve the visual comparison either.
+ */
+const PREFLIGHT_LAUNCH_MS = 60_000;
+
 const PLAYWRIGHT_MISSING = "Playwright is not installed. Run: npm ci && npx playwright install chromium";
 const CHROMIUM_MISSING =
-  "Playwright Chromium is missing. Run: npx playwright install chromium " +
+  "Playwright Chromium is missing or cannot start. Run: npx playwright install chromium " +
   "(in CI: npx playwright install --with-deps chromium)";
 const BUNDLE_MISSING = "bundle not found — install Ruby 3.3.4 and run bundle install";
 
@@ -145,11 +163,21 @@ const BUNDLE_MISSING = "bundle not found — install Ruby 3.3.4 and run bundle i
 
 /**
  * @typedef {object} Step
- * @property {"bundle" | "node"} program  Shown in logs; `node` runs as `process.execPath`.
+ * @property {"bundle" | "node"} program  Shown in logs; `node` runs as `Io.execPath` (`process.execPath`).
  * @property {(ctx: StepContext) => string[]} args
  * @property {(ctx: StepContext) => Record<string, string>} [env]  Variables added to the base environment.
  * @property {number} deadlineMs  How long the step may run, from `DEADLINES`.
  * @property {boolean} [createsFixture]  The fixture folder is created just before this step.
+ */
+
+/**
+ * What the run reads and starts processes through: the real process for the
+ * command line, fakes in tests/unit/verify.test.mjs.
+ * @typedef {object} Io
+ * @property {NodeJS.ProcessEnv} env  The caller's environment.
+ * @property {string} root  Repository root: where git and every step run.
+ * @property {typeof runSync} run  Runs one child process to its end and returns its `ProcessResult`.
+ * @property {string} execPath  The Node executable that `node` steps run as.
  */
 
 /**
@@ -257,9 +285,9 @@ function helpText() {
     "",
     "Exit status: 0 when every check passed and the fixture folder was removed; otherwise the",
     "failing step's status (1 when it was killed, exceeded its deadline or could not start); 1 when",
-    "_config.yml names no http or https url, Playwright Chromium is missing, a git query was killed",
-    "or timed out, or the fixture folder cannot be removed; 2 for a usage error or a base revision",
-    "that does not resolve.",
+    "_config.yml names no http or https url, Playwright Chromium is missing or cannot start, a git",
+    "query was killed or timed out, or the fixture folder cannot be removed; 2 for a usage error or a",
+    "base revision that does not resolve.",
   ].join("\n");
 }
 
@@ -309,16 +337,17 @@ export function parseCliArgs(argv) {
  * `DEADLINES.gitQuery` deadline. Arguments are an array and never pass
  * through a shell; `GIT_OPTIONAL_LOCKS=0` keeps git from writing even an
  * opportunistic index refresh.
+ * @param {Io} io
  * @param {string[]} args
  * @returns {{ status: number, stdout: string, stderr: string }} the outcome
  *   of a git that exited by itself, zero or not.
  * @throws {Error} when git cannot be started, is killed by a signal, exceeds
  *   its deadline or overflows its capture limit: none of these is an answer.
  */
-function git(args) {
-  const result = runSync("git", args, {
-    cwd: ROOT,
-    env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
+function git(io, args) {
+  const result = io.run("git", args, {
+    cwd: io.root,
+    env: { ...io.env, GIT_OPTIONAL_LOCKS: "0" },
     timeoutMs: DEADLINES.gitQuery,
   });
   if (result.error) {
@@ -335,13 +364,14 @@ function git(args) {
 /**
  * Full commit id of a revision, or null when git answered that it does not
  * name a commit. A value starting with `-` is refused before git sees it.
+ * @param {Io} io
  * @param {string} ref
  * @returns {string | null}
  * @throws {Error} when git gives no answer (see `git`).
  */
-function resolveCommit(ref) {
+function resolveCommit(io, ref) {
   if (ref.startsWith("-")) return null;
-  const result = git(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]);
+  const result = git(io, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]);
   const sha = result.stdout.trim();
   return result.status === 0 && COMMIT_ID.test(sha) ? sha : null;
 }
@@ -355,19 +385,20 @@ function resolveCommit(ref) {
  * own answer. A git query that was killed or timed out throws instead, so a
  * probe that never finished cannot make the run compare unpushed changes
  * against themselves, or report a valid `--base` as mistyped.
+ * @param {Io} io
  * @param {string | undefined} explicit
  * @returns {{ ref: string, label: string } | { error: string }}
  * @throws {Error} when a git query gives no answer; `main` exits 1.
  */
-function chooseBase(explicit) {
+function chooseBase(io, explicit) {
   if (explicit !== undefined) {
-    const sha = resolveCommit(explicit);
+    const sha = resolveCommit(io, explicit);
     if (sha === null) return { error: `base revision "${explicit}" does not resolve to a commit` };
     return { ref: explicit, label: `${explicit} (${sha.slice(0, 7)})` };
   }
-  const upstream = resolveCommit("@{upstream}");
+  const upstream = resolveCommit(io, "@{upstream}");
   if (upstream !== null) return { ref: upstream, label: `@{upstream} (${upstream.slice(0, 7)})` };
-  const head = resolveCommit("HEAD");
+  const head = resolveCommit(io, "HEAD");
   if (head === null) return { error: "HEAD does not resolve to a commit; commit something or pass --base <ref>" };
   return { ref: head, label: `HEAD (${head.slice(0, 7)}, no upstream)` };
 }
@@ -473,30 +504,62 @@ export function configuredSiteUrl(text) {
 /* Playwright preflight                                                      */
 /* ------------------------------------------------------------------------ */
 
+/** First non-blank line of a message, trimmed; Playwright follows it with a boxed install hint. */
+function firstLine(text) {
+  return (
+    String(text)
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => line !== "") ?? ""
+  );
+}
+
 /**
- * Confirms the visual comparison can run before any slow step starts. A
- * missing install or browser fails verification rather than skipping step 5,
- * so a local pass means the same as a CI pass.
+ * Confirms the visual comparison can run before any slow step starts, by
+ * launching and closing the browser it uses. A missing install or browser
+ * fails verification rather than skipping step 5, so a local pass means the
+ * same as a CI pass.
+ *
+ * The probe launches exactly what tests/visual/playwright.config.mjs
+ * launches: browserName chromium, no channel, no executable path, and
+ * Playwright Test's default `headless: true`. Playwright starts its
+ * `chromium-headless-shell` build for that, not the full Chromium that
+ * `chromium.executablePath()` names, so only a launch tells whether step 5
+ * can start its browser: with just the shell installed the comparison runs,
+ * and with just full Chromium it cannot. The launch also checks the host
+ * libraries Chromium needs. tests/unit/verify.test.mjs holds the visual
+ * project to this launch configuration.
+ * @param {object} [options]
+ * @param {() => Promise<object>} [options.load]  Loads `@playwright/test`; tests pass a fake module.
+ * @param {number} [options.timeoutMs]  Launch timeout; `PREFLIGHT_LAUNCH_MS` by default.
  * @returns {Promise<string | null>} the failure message, or null when ready.
  */
-async function preflightPlaywright() {
+export async function preflightPlaywright(options = {}) {
+  // Resolved from this file's location, so the repository's node_modules is used from any directory.
+  const { load = () => import("@playwright/test"), timeoutMs = PREFLIGHT_LAUNCH_MS } = options;
   let playwright;
   try {
-    // Resolved from this file's location, so the repository's node_modules is used from any directory.
-    playwright = await import("@playwright/test");
+    playwright = await load();
   } catch (err) {
     const notFound = err && (err.code === "ERR_MODULE_NOT_FOUND" || err.code === "MODULE_NOT_FOUND");
     return notFound ? PLAYWRIGHT_MISSING : `${PLAYWRIGHT_MISSING}\n(${errorMessage(err)})`;
   }
-  const chromium = playwright.chromium ?? (playwright.default && playwright.default.chromium);
-  if (!chromium || typeof chromium.executablePath !== "function") return PLAYWRIGHT_MISSING;
-  let executable = "";
+  const chromium = playwright && (playwright.chromium ?? (playwright.default && playwright.default.chromium));
+  if (!chromium || typeof chromium.launch !== "function") return PLAYWRIGHT_MISSING;
+  let browser;
   try {
-    executable = chromium.executablePath();
-  } catch {
-    executable = "";
+    // The visual project's selection (no channel, headless), so this starts chromium-headless-shell as step 5 does.
+    browser = await chromium.launch({ headless: true, timeout: timeoutMs });
+  } catch (err) {
+    const reason = firstLine(errorMessage(err));
+    return reason === "" ? CHROMIUM_MISSING : `${CHROMIUM_MISSING}\n(${reason})`;
   }
-  return executable && fs.existsSync(executable) ? null : CHROMIUM_MISSING;
+  try {
+    await browser.close();
+  } catch {
+    // The browser started, which is all the probe asks; a failed close does not make it missing.
+  }
+  return null;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -514,20 +577,26 @@ async function preflightPlaywright() {
  * could otherwise keep the run from ending. The tools a step runs carry
  * shorter deadlines of their own, so they are normally stopped, and the step
  * fails, long before this one expires.
+ * @param {Io} io
  * @param {Step} step
  * @param {number} number 1-based step number.
  * @param {StepContext} ctx
  * @param {NodeJS.ProcessEnv} baseEnv
  * @returns {number} 0 when the step passed.
  */
-function runStep(step, number, ctx, baseEnv) {
+function runStep(io, step, number, ctx, baseEnv) {
   const command = describeStep(step, ctx);
   console.log(`\n==> [${number}/${STEPS.length}] ${command}`);
 
-  const executable = step.program === "node" ? process.execPath : step.program;
+  const executable = step.program === "node" ? io.execPath : step.program;
   const env = { ...baseEnv, ...(step.env ? step.env(ctx) : {}) };
   const started = Date.now();
-  const result = runSync(executable, step.args(ctx), { cwd: ROOT, stdio: "inherit", env, timeoutMs: step.deadlineMs });
+  const result = io.run(executable, step.args(ctx), {
+    cwd: io.root,
+    stdio: "inherit",
+    env,
+    timeoutMs: step.deadlineMs,
+  });
 
   let code = 0;
   if (result.error) {
@@ -561,11 +630,32 @@ function runStep(step, number, ctx, baseEnv) {
 /* ------------------------------------------------------------------------ */
 
 /**
- * The whole verification.
+ * The whole verification. The command line passes no collaborators, so the
+ * real environment, repository, processes and browser are used;
+ * tests/unit/verify.test.mjs passes fakes to observe each step without
+ * running it.
  * @param {string[]} argv Arguments after the script path.
+ * @param {object} [collaborators]
+ * @param {NodeJS.ProcessEnv} [collaborators.env]  Caller's environment; `process.env` by default.
+ * @param {string} [collaborators.root]  Repository root; this checkout by default.
+ * @param {typeof runSync} [collaborators.run]  Runs git and every step; `runSync` by default.
+ * @param {() => Promise<string | null>} [collaborators.preflight]  Browser check; `preflightPlaywright` by default.
+ * @param {string} [collaborators.tmpdir]  Parent of the fixture folder; `os.tmpdir()` by default.
+ * @param {string} [collaborators.execPath]  Node executable of `node` steps; `process.execPath` by default.
  * @returns {Promise<number>} The exit code.
  */
-async function main(argv) {
+export async function main(argv, collaborators = {}) {
+  const {
+    env = process.env,
+    root = ROOT,
+    run = runSync,
+    preflight = preflightPlaywright,
+    tmpdir = os.tmpdir(),
+    execPath = process.execPath,
+  } = collaborators;
+  /** @type {Io} */
+  const io = { env, root, run, execPath };
+
   const args = parseCliArgs(argv);
   if (args.error !== undefined) {
     warn(args.error);
@@ -580,7 +670,7 @@ async function main(argv) {
   // Base revision, checked now so a bad value fails before the slow steps.
   let base;
   try {
-    base = chooseBase(args.base);
+    base = chooseBase(io, args.base);
   } catch (err) {
     warn(errorMessage(err));
     return 1;
@@ -590,18 +680,18 @@ async function main(argv) {
     console.error(USAGE);
     return 2;
   }
-  log(`repository: ${ROOT}`);
+  log(`repository: ${root}`);
   log(`base: ${base.label}`);
 
   // Environment hygiene.
-  const { env: baseEnv, removed } = buildBaseEnv(process.env);
+  const { env: baseEnv, removed } = buildBaseEnv(env);
   reportRemoved(removed);
   if (baseEnv.VISUAL_CHANGE_INTENDED !== undefined) {
     log(`VISUAL_CHANGE_INTENDED=${baseEnv.VISUAL_CHANGE_INTENDED} is passed to step 5`);
   }
 
   // Deployment host of the real site, read before any step so a bad value costs no build time.
-  const configPath = path.join(ROOT, CONFIG_FILE);
+  const configPath = path.join(root, CONFIG_FILE);
   let configText;
   try {
     configText = fs.readFileSync(configPath, "utf8");
@@ -617,7 +707,7 @@ async function main(argv) {
   log(`deployment host: ${site.url} (${CONFIG_FILE} url, step 2 SITE_URL)`);
 
   // Playwright Chromium preflight: a failure, never a skip.
-  const missing = await preflightPlaywright();
+  const missing = await preflight();
   if (missing !== null) {
     warn(missing);
     return 1;
@@ -629,13 +719,13 @@ async function main(argv) {
     const step = STEPS[i];
     if (step.createsFixture) {
       try {
-        ctx.fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), FIXTURE_PREFIX));
+        ctx.fixtureDir = fs.mkdtempSync(path.join(tmpdir, FIXTURE_PREFIX));
       } catch (err) {
-        warn(`cannot create the fixture folder under ${os.tmpdir()}: ${errorMessage(err)}`);
+        warn(`cannot create the fixture folder under ${tmpdir}: ${errorMessage(err)}`);
         return 1;
       }
     }
-    const code = runStep(step, i + 1, ctx, baseEnv);
+    const code = runStep(io, step, i + 1, ctx, baseEnv);
     if (code !== 0) return code;
   }
 
@@ -658,8 +748,9 @@ async function main(argv) {
 
 /**
  * True when this file is the program Node was started with, so importing it
- * (for example to exercise `parseCliArgs`) runs nothing. Node resolves the
- * main module to its real path, so `argv[1]` is compared after `realpathSync`.
+ * (for example to exercise `parseCliArgs` or `main`) runs nothing. Node
+ * resolves the main module to its real path, so `argv[1]` is compared after
+ * `realpathSync`.
  */
 function isMainModule() {
   if (!process.argv[1]) return false;

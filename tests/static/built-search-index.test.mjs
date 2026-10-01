@@ -1,13 +1,12 @@
-/* Cabrillo Coast LLC — built search index: validity, completeness, order, decoding and size (AC-08, AC-02, F-019) */
+/* Cabrillo Coast LLC — built search index: validity, completeness, fidelity, order and size (AC-08, AC-02; F-019, F-017) */
 /**
  * Checks the `blog/search.json` that Jekyll writes from the Liquid template
  * of the same name (AAP 0.5.5). `blog/search.js` fetches this file, parses it
  * with `JSON.parse` and joins each entry to its listing item on `url`, so the
- * index must be valid JSON, complete, newest first, aligned with the listing
- * and free of private content.
+ * index must be valid JSON, complete, faithful to each article, newest first,
+ * aligned with the listing and free of private content.
  *
- * `scripts/verify.mjs` runs this suite twice, and every assertion holds in
- * both runs:
+ * `scripts/verify.mjs` runs this suite twice:
  *   1. Real build: `SITE_DIR=_site`, empty base path, custom-domain mode.
  *      At launch there are no articles and the index is `[]`.
  *   2. Fixture project build: `SITE_DIR=<tmp>/project/cabrillo-coast`,
@@ -15,17 +14,47 @@
  *      and `FIXTURE_DIR=<tmp>`. The fixture articles are present, and the
  *      synthetic draft and future-dated post were staged but must not be built.
  *
+ * Common cases run, and must pass, in both runs; on the empty real build
+ * their per-entry checks hold vacuously. They cover the JSON array; entry
+ * keys, types and non-empty values; title, summary and tags against the
+ * listing and the article page; one entry per built article; URL resolution;
+ * newest-first order; listing order; AC-02 privacy; single-space distinct
+ * body tokens; and the size budget.
+ * Fixture-only cases need the fixture articles and run only when
+ * `FIXTURE_DIR` is set; in the real-build run node:test reports them as
+ * skipped with the reason `FIXTURE_DIR not set`. They cover body-only words
+ * and fenced code samples; bodies against the decoded built prose; leftover
+ * character references; and front-matter values against the fixture sources.
+ *
  * What it proves:
- *   - AC-08: the index is a JSON array of `{ url, title, summary, tags, date,
- *     body }` entries; there is exactly one entry per built article page and
- *     no duplicate; every URL resolves under the base path; entries are newest
- *     first and in the same order as the listing's `li[data-url]` items; the
- *     fixture bodies are indexed as decoded, lowercased text (`r&d`, `café`)
- *     with no leftover character references; front-matter values are raw text
- *     (`jsonify`, not `escape`); and the file stays inside its size budget,
- *     with raw and gzip sizes printed on every run.
- *   - AC-02 (index part): no entry belongs to the synthetic draft or the
- *     future-dated post, and no slug, no marker string and no
+ *   - AC-08, F-019, every build: the index is a JSON array of `{ url, title,
+ *     summary, tags, date, body }` entries with a non-empty title and summary
+ *     and 1 to 5 non-empty tags; each entry's title, summary and tags equal
+ *     its listing item (`h2 > a`, `p.post-summary`, `a.tag-link`) and its
+ *     article page (the single `h1`, the meta description, the
+ *     `header.post-header` tag links), decoded from Liquid `escape`; there is
+ *     exactly one entry per built article page and no duplicate; every URL
+ *     resolves under the base path; entries are newest first and in the same
+ *     order as the listing's `li[data-url]` items; every body is distinct
+ *     tokens joined by single spaces; and the file stays inside its size
+ *     budget, with raw and gzip sizes printed on every run.
+ *   - AC-08, F-019, fixture build: each fixture body equals an oracle derived
+ *     from its article page alone (the prose region with its markup removed
+ *     as `strip_html` removes it, `&lt;`, `&gt;`, `&quot;`, `&#39;` and
+ *     `&amp;` decoded, ASCII whitespace collapsed, lowercased, then reduced
+ *     to its distinct tokens in first-occurrence order). With explicit checks
+ *     for leftover live tags, case, separators, repeats and order, this
+ *     covers every step of the body chain but `normalize_whitespace` on its
+ *     own, whose removal changes no byte of the index because `split: " "`
+ *     already splits on runs of whitespace. Body-only words (`r&d`, `café`)
+ *     and text that occurs only inside fenced code
+ *     (`def retry_delay(attempt,`, `base_seconds:`, `{{ .values.image }}`)
+ *     are indexed, each probe re-checked against the fixture source; no body
+ *     keeps a character reference; and title, summary and tags equal the
+ *     fixture front matter as raw text (`jsonify`, not `escape`), with
+ *     dates read in UTC.
+ *   - AC-02, F-017 (index part): no entry belongs to the synthetic draft or
+ *     the future-dated post, and no slug, no marker string and no
  *     `assets/drafts/` path appears anywhere in the file: not in its raw
  *     text and not in any string value of the parsed index (every field of
  *     every entry, nested ones included), which also catches text hidden
@@ -52,8 +81,15 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
 
-import { DRAFT_MARKER, DRAFT_SLUG, FUTURE_MARKER, FUTURE_SLUG } from '../fixtures/build-fixture-site.mjs';
-import { parseStartTags } from './lib/site-links.mjs';
+import { parseArticle } from '../../scripts/lib/articles.mjs';
+import {
+  DRAFT_MARKER,
+  DRAFT_SLUG,
+  FIXTURE_POSTS,
+  FUTURE_MARKER,
+  FUTURE_SLUG,
+} from '../fixtures/build-fixture-site.mjs';
+import { decodeEntities, parseStartTags } from './lib/site-links.mjs';
 
 /* ------------------------------------------------------------------------ */
 /* Environment                                                               */
@@ -92,6 +128,16 @@ const ENTRY_KEYS = Object.freeze(['url', 'title', 'summary', 'tags', 'date', 'bo
 /** Keys whose values must be strings; `tags` is checked separately as a string array. */
 const STRING_KEYS = Object.freeze(['url', 'title', 'summary', 'date', 'body']);
 
+/** String keys the article schema requires to be non-empty (AAP 0.5.3: 1 or more characters). */
+const NON_EMPTY_KEYS = Object.freeze(['title', 'summary']);
+
+/** Number of tags every article carries (AAP 0.5.3: 1 to 5 items). */
+const TAGS_MIN = 1;
+const TAGS_MAX = 5;
+
+/** Source folder of the fixture articles named in `FIXTURE_POSTS`. */
+const FIXTURE_POSTS_DIR = path.join(ROOT, 'tests', 'fixtures', 'posts');
+
 /**
  * Size budget of the built index, following the warning-and-failure pattern of
  * the specification's thresholds (Tech Spec Table 6.6-21). A 2,000-word
@@ -118,6 +164,19 @@ const FIXTURE_URL_PART = '/blog/fixture-';
 const BODY_ONLY_WORDS = Object.freeze(['r&d', 'caf\u00e9']);
 
 /**
+ * Text that each fixture holds only inside its ``` fenced code blocks, as the
+ * index stores it (lowercased, distinct tokens still adjacent). A bare
+ * `retry_delay` would not do: the prose names `retry_delay(3)` in inline
+ * code, so it survives the loss of every fence. The Liquid probe keeps both
+ * braces, which `{% raw %}` must carry through. The fixture sources are
+ * re-checked on every run, so each probe keeps proving fenced code.
+ */
+const CODE_ONLY_PROBES = Object.freeze({
+  [CODE_FIXTURE_SLUG]: Object.freeze(['def retry_delay(attempt,', 'base_seconds:']),
+  [ESCAPING_FIXTURE_SLUG]: Object.freeze(['{{ .values.image }}']),
+});
+
+/**
  * The fixture title with characters `escape` would encode. `jsonify` keeps it
  * as raw text inside a valid JSON string.
  */
@@ -135,6 +194,45 @@ const FIXTURE_DATES = Object.freeze({
  * of the decoding chain is missing or out of order.
  */
 const UNDECODED_REFERENCES = Object.freeze(['&amp;', '&lt;', '&gt;', '&quot;', '&#39;']);
+
+/**
+ * Bounds of an article's prose region in `_layouts/post.html`: from the end
+ * of the single `div.prose` start tag to the `</div>` before the last back
+ * link, which directly follows the prose.
+ */
+const PROSE_OPEN = '<div class="prose">';
+const POST_BACK = '<p class="post-back">';
+
+/**
+ * Liquid 4.0.4 `strip_html`, reproduced for the body oracle: script, comment
+ * and style blocks go first, then every remaining tag.
+ */
+const STRIP_HTML_BLOCKS_RE = /<script[\s\S]*?<\/script>|<!--[\s\S]*?-->|<style[\s\S]*?<\/style>/g;
+const STRIP_HTML_TAGS_RE = /<[\s\S]*?>/g;
+
+/**
+ * The five references the index template decodes, and their text. Decoding
+ * them in one pass gives what the template's `&amp;`-last order gives
+ * (`&amp;lt;` becomes `&lt;`); any other reference stays literal (AAP 0.5.5).
+ */
+const INDEX_REFERENCE_RE = /&(?:lt|gt|quot|#39|amp);/g;
+const INDEX_REFERENCE_TEXT = Object.freeze({
+  '&lt;': '<',
+  '&gt;': '>',
+  '&quot;': '"',
+  '&#39;': "'",
+  '&amp;': '&',
+});
+
+/**
+ * A run of whitespace as `normalize_whitespace` and `split: " "` see it.
+ * Ruby's `\s` is ASCII only, so JavaScript's Unicode `\s` would collapse
+ * characters, such as U+00A0, that the template keeps inside a token.
+ */
+const RUBY_WHITESPACE_RE = /[ \t\r\n\f\v]+/g;
+
+/** A non-empty body of tokens joined by single spaces, as `split: " " | uniq | join: " "` writes it. */
+const TOKEN_BODY_RE = /^[^\t\n\v\f\r ]+(?: [^\t\n\v\f\r ]+)*$/;
 
 /**
  * Path prefix of every draft image (`assets/drafts/<slug>/…`), the AC-02
@@ -245,6 +343,178 @@ function* stringValues(value, where) {
   }
 }
 
+/**
+ * Built page of an index URL: `SITE_DIR` plus the URL without the base path,
+ * plus `index.html` (`/cabrillo-coast/blog/x/` → `<SITE_DIR>/blog/x/index.html`).
+ * @param {string} url
+ * @returns {string}
+ */
+function articlePageFile(url) {
+  return path.join(SITE_DIR, ...url.slice(BASE.length).split('/'), 'index.html');
+}
+
+/**
+ * `true` when the tag's `class` attribute lists `token` among its
+ * whitespace-separated class names (`card post-card` has `post-card`).
+ * @param {import('./lib/site-links.mjs').StartTag} tag
+ * @param {string} token
+ * @returns {boolean}
+ */
+function hasClass(tag, token) {
+  return Object.hasOwn(tag.attrs, 'class') && tag.attrs.class.split(/[\t\n\f\r ]+/).includes(token);
+}
+
+/**
+ * Decoded text of the element that `tag` opens: the source from the end of
+ * the start tag to the first `</name>` after it. That slice must hold no `<`,
+ * so nested markup or a mis-sliced region fails with the slice shown, not as
+ * a wrong value. Layouts print front matter through Liquid `escape`, so the
+ * slice is decoded before it is compared with the index.
+ * @param {string} html
+ * @param {import('./lib/site-links.mjs').StartTag} tag
+ * @param {string} where
+ * @returns {string}
+ */
+function elementText(html, tag, where) {
+  const close = html.indexOf(`</${tag.name}>`, tag.end);
+  assert.notEqual(close, -1, `${where}: the <${tag.name}> at offset ${tag.start} is never closed`);
+  const raw = html.slice(tag.end, close);
+  assert.ok(
+    !raw.includes('<'),
+    `${where}: the <${tag.name}> at offset ${tag.start} holds markup, not text: ${JSON.stringify(raw)}`,
+  );
+  return decodeEntities(raw);
+}
+
+/**
+ * Start tags of the listing item for `url`: from its `li[data-url]` to the
+ * next `li[data-url]`, or to the `</ol>` after the last one. The item's own
+ * `li` is left out.
+ * @param {string} html
+ * @param {import('./lib/site-links.mjs').StartTag[]} tags `parseStartTags(html)`
+ * @param {string} url
+ * @returns {import('./lib/site-links.mjs').StartTag[]}
+ */
+function listingItemTags(html, tags, url) {
+  const items = tags.filter((tag) => tag.name === 'li' && Object.hasOwn(tag.attrs, 'data-url'));
+  const at = items.findIndex((tag) => tag.attrs['data-url'] === url);
+  assert.notEqual(at, -1, `the listing has no li[data-url="${url}"]`);
+  const { start, end: itemOpenEnd } = items[at];
+  const end = at + 1 < items.length ? items[at + 1].start : html.indexOf('</ol>', itemOpenEnd);
+  assert.notEqual(end, -1, `the last listing item (${url}) is not followed by </ol>`);
+  return tags.filter((tag) => tag.start > start && tag.start < end);
+}
+
+/**
+ * Text of every `a.tag-link` among `tags`, in document order.
+ * @param {string} html
+ * @param {import('./lib/site-links.mjs').StartTag[]} tags
+ * @param {string} where
+ * @returns {string[]}
+ */
+function tagLinkTexts(html, tags, where) {
+  return tags
+    .filter((tag) => tag.name === 'a' && hasClass(tag, 'tag-link'))
+    .map((tag) => elementText(html, tag, where));
+}
+
+/**
+ * The fixture article's source, parsed with the same front-matter parser
+ * `article.mjs` uses. Fails when it reports an error, so a comparison never
+ * runs against partly parsed data.
+ * @param {string} file Basename inside `tests/fixtures/posts/`.
+ * @returns {{ data: Record<string, string | string[]>, body: string }}
+ */
+function fixtureSource(file) {
+  const source = path.join(FIXTURE_POSTS_DIR, file);
+  const { data, body, errors } = parseArticle(readFileSync(source, 'utf8'));
+  assert.deepEqual(errors, [], `${source} does not parse`);
+  return { data, body };
+}
+
+/**
+ * Splits Markdown into the text inside ``` fenced blocks and the text outside
+ * them. A line whose trimmed start is ``` toggles between the two and belongs
+ * to neither, so a fence's language name is in neither part.
+ * @param {string} markdown
+ * @returns {{ fenced: string, prose: string }}
+ */
+function splitFences(markdown) {
+  const fenced = [];
+  const prose = [];
+  let inFence = false;
+  for (const line of markdown.split(/\r?\n/)) {
+    if (line.trimStart().startsWith('```')) inFence = !inFence;
+    else (inFence ? fenced : prose).push(line);
+  }
+  return { fenced: fenced.join('\n'), prose: prose.join('\n') };
+}
+
+/**
+ * Tokens that occur more than once, each named once, in first-repeat order.
+ * @param {string[]} tokens
+ * @returns {string[]}
+ */
+function duplicateTokens(tokens) {
+  const seen = new Set();
+  const repeated = new Set();
+  for (const token of tokens) (seen.has(token) ? repeated : seen).add(token);
+  return [...repeated];
+}
+
+/**
+ * The body the index template must write for a built article, derived from
+ * the article page alone rather than from the template: the prose region,
+ * its markup removed as `strip_html` removes it, the five references decoded,
+ * ASCII whitespace collapsed and trimmed, lowercased, then reduced to its
+ * distinct tokens in first-occurrence order.
+ * @param {string} html Built article page.
+ * @param {string} where Page named in failure messages.
+ * @returns {{ prose: string, stripped: string, text: string, tokens: string[], distinct: string[] }}
+ *   `stripped` is the prose without markup, `text` the decoded, collapsed and
+ *   lowercased text, `tokens` every token of it and `distinct` the expected body tokens.
+ */
+function expectedBody(html, where) {
+  const open = html.indexOf(PROSE_OPEN);
+  assert.notEqual(open, -1, `${where} has no ${PROSE_OPEN}`);
+  assert.equal(html.indexOf(PROSE_OPEN, open + 1), -1, `${where} has more than one ${PROSE_OPEN}`);
+  const start = open + PROSE_OPEN.length;
+  const back = html.lastIndexOf(POST_BACK);
+  assert.ok(back > start, `${where}: no ${POST_BACK} follows the prose`);
+  const end = html.lastIndexOf('</div>', back);
+  assert.ok(end >= start, `${where}: no </div> closes the prose before the last ${POST_BACK}`);
+  const prose = html.slice(start, end);
+  const stripped = prose.replace(STRIP_HTML_BLOCKS_RE, '').replace(STRIP_HTML_TAGS_RE, '');
+  const text = stripped
+    .replace(INDEX_REFERENCE_RE, (reference) => INDEX_REFERENCE_TEXT[reference])
+    .replace(RUBY_WHITESPACE_RE, ' ')
+    .replace(/^ | $/g, '')
+    .toLowerCase();
+  const tokens = text === '' ? [] : text.split(' ');
+  return { prose, stripped, text, tokens, distinct: [...new Set(tokens)] };
+}
+
+/**
+ * Where two token lists first differ, with a few tokens of context on each
+ * side, so a failing body comparison names the step that went wrong.
+ * @param {string[]} actual
+ * @param {string[]} expected
+ * @returns {string}
+ */
+function firstTokenDifference(actual, expected) {
+  const show = (token) => (token === undefined ? 'the end of the body' : JSON.stringify(token));
+  const around = (list, i) => JSON.stringify(list.slice(Math.max(0, i - 3), i + 4).join(' '));
+  for (let i = 0; i < Math.max(actual.length, expected.length); i += 1) {
+    if (actual[i] !== expected[i]) {
+      return (
+        `first difference at token ${i}: got ${show(actual[i])}, expected ${show(expected[i])} ` +
+        `(got …${around(actual, i)}…, expected …${around(expected, i)}…)`
+      );
+    }
+  }
+  return 'the token lists are equal';
+}
+
 /* ------------------------------------------------------------------------ */
 /* Suite                                                                     */
 /* ------------------------------------------------------------------------ */
@@ -260,7 +530,7 @@ function defineSuite() {
   };
 
   /* ---------------------------------------------------------------------- */
-  /* Phase 1: load and entry shape                                          */
+  /* Phase 1: load, entry shape and metadata fidelity                       */
   /* ---------------------------------------------------------------------- */
 
   test('[AC-08][F-019] search.json is a valid JSON array', (t) => {
@@ -268,7 +538,7 @@ function defineSuite() {
     t.diagnostic(`search.json: ${index.entries.length} entries`);
   });
 
-  test('[AC-08][F-019] every entry has url, title, summary, tags, date and body of the right types', () => {
+  test('[AC-08][F-019] every entry has url, title, summary, tags, date and body of the right types, with non-empty title, summary and tags', () => {
     const entries = requireEntries();
     entries.forEach((entry, i) => {
       const where = `entry ${i}${entry && typeof entry.url === 'string' ? ` (${entry.url})` : ''}`;
@@ -280,12 +550,65 @@ function defineSuite() {
       for (const key of STRING_KEYS) {
         assert.equal(typeof entry[key], 'string', `${where}: ${key} must be a string, got ${JSON.stringify(entry[key])}`);
       }
+      // Required article fields: an empty value would silently drop every
+      // title- or summary-only match.
+      for (const key of NON_EMPTY_KEYS) {
+        assert.notEqual(entry[key], '', `${where}: ${key} must not be empty`);
+      }
       assert.ok(!Number.isNaN(Date.parse(entry.date)), `${where}: date ${JSON.stringify(entry.date)} does not parse`);
       assert.ok(Array.isArray(entry.tags), `${where}: tags must be an array, got ${JSON.stringify(entry.tags)}`);
+      assert.ok(
+        entry.tags.length >= TAGS_MIN && entry.tags.length <= TAGS_MAX,
+        `${where}: tags must hold ${TAGS_MIN} to ${TAGS_MAX} items, got ${JSON.stringify(entry.tags)}`,
+      );
       entry.tags.forEach((tag, j) => {
         assert.equal(typeof tag, 'string', `${where}: tags[${j}] must be a string, got ${JSON.stringify(tag)}`);
+        assert.notEqual(tag, '', `${where}: tags[${j}] must not be empty`);
       });
     });
+  });
+
+  test('[AC-08][F-019] entry title, summary and tags equal the listing item and the article page', () => {
+    const entries = requireEntries();
+    assert.ok(existsSync(LISTING_HTML), `${LISTING_HTML} not found: the build produced no listing`);
+    const listing = readFileSync(LISTING_HTML, 'utf8');
+    const listingTags = parseStartTags(listing);
+    for (const entry of entries) {
+      // Listing item: h2 > a holds the title, p.post-summary the summary,
+      // a.tag-link the tags in front-matter order.
+      const inListing = `listing item ${entry.url}`;
+      const item = listingItemTags(listing, listingTags, entry.url);
+      const heading = item.find((tag) => tag.name === 'h2');
+      assert.ok(heading, `${inListing} has no h2`);
+      const titleLink = item.find((tag) => tag.name === 'a' && tag.start > heading.start);
+      assert.ok(titleLink, `${inListing} has no link after its h2`);
+      assert.equal(elementText(listing, titleLink, inListing), entry.title, `${inListing}: title`);
+      const summaries = item.filter((tag) => tag.name === 'p' && hasClass(tag, 'post-summary'));
+      assert.equal(summaries.length, 1, `${inListing} must have exactly one p.post-summary`);
+      assert.equal(elementText(listing, summaries[0], inListing), entry.summary, `${inListing}: summary`);
+      assert.deepEqual(tagLinkTexts(listing, item, inListing), entry.tags, `${inListing}: tag links`);
+
+      // Article page: the single h1, the meta description and the tag links
+      // inside header.post-header.
+      const file = articlePageFile(entry.url);
+      assert.ok(isSiteFile(file), `${entry.url} does not resolve: ${file} is not a built file`);
+      const html = readFileSync(file, 'utf8');
+      const tags = parseStartTags(html);
+      const onPage = `article page ${entry.url}`;
+      const h1s = tags.filter((tag) => tag.name === 'h1');
+      assert.equal(h1s.length, 1, `${onPage} must have exactly one h1`);
+      assert.equal(elementText(html, h1s[0], onPage), entry.title, `${onPage}: h1`);
+      const descriptions = tags.filter((tag) => tag.name === 'meta' && tag.attrs.name === 'description');
+      assert.equal(descriptions.length, 1, `${onPage} must have exactly one meta[name="description"]`);
+      // parseStartTags has already decoded the attribute value.
+      assert.equal(descriptions[0].attrs.content, entry.summary, `${onPage}: meta description`);
+      const headers = tags.filter((tag) => tag.name === 'header' && hasClass(tag, 'post-header'));
+      assert.equal(headers.length, 1, `${onPage} must have exactly one header.post-header`);
+      const headerEnd = html.indexOf('</header>', headers[0].end);
+      assert.notEqual(headerEnd, -1, `${onPage}: header.post-header is never closed`);
+      const inHeader = tags.filter((tag) => tag.start > headers[0].start && tag.start < headerEnd);
+      assert.deepEqual(tagLinkTexts(html, inHeader, onPage), entry.tags, `${onPage}: header tag links`);
+    }
   });
 
   /* ---------------------------------------------------------------------- */
@@ -349,7 +672,7 @@ function defineSuite() {
   /* Phase 3: AC-02, private content never reaches the index                */
   /* ---------------------------------------------------------------------- */
 
-  test('[AC-02][F-019] no draft or future-dated post reaches the index', () => {
+  test('[AC-02][F-017] no draft or future-dated post reaches the index', () => {
     const entries = requireEntries();
     for (const { url } of entries) {
       assert.ok(!url.includes(DRAFT_SLUG), `the synthetic draft is indexed: ${url}`);
@@ -380,11 +703,31 @@ function defineSuite() {
   });
 
   /* ---------------------------------------------------------------------- */
-  /* Phase 4: body decoding and raw front-matter values (fixture build)     */
+  /* Phase 4: body tokens and decoding, raw front-matter values             */
   /* ---------------------------------------------------------------------- */
 
-  test('[AC-08][F-019] body-only words are indexed decoded and lowercased', FIXTURE_ONLY, () => {
-    const entry = fixtureEntry(requireEntries(), CODE_FIXTURE_SLUG);
+  test('[AC-08][F-019] every body is single-space-separated distinct tokens', () => {
+    const entries = requireEntries();
+    for (const entry of entries) {
+      assert.equal(typeof entry.body, 'string', `${entry.url}: body must be a string`);
+      if (entry.body === '') continue;
+      assert.match(
+        entry.body,
+        TOKEN_BODY_RE,
+        `${entry.url} body must be tokens joined by single spaces, with no other whitespace and none at either end`,
+      );
+      const repeated = duplicateTokens(entry.body.split(' '));
+      assert.deepEqual(
+        repeated,
+        [],
+        `${entry.url} body repeats ${repeated.length} token(s): ${JSON.stringify(repeated.slice(0, 20))}`,
+      );
+    }
+  });
+
+  test('[AC-08][F-019] body-only words and fenced code samples are indexed decoded and lowercased', FIXTURE_ONLY, () => {
+    const entries = requireEntries();
+    const entry = fixtureEntry(entries, CODE_FIXTURE_SLUG);
     const elsewhere = [entry.title, entry.summary, entry.tags.join(' ')].join(' ').toLowerCase();
     for (const word of BODY_ONLY_WORDS) {
       assert.ok(entry.body.includes(word), `${entry.url} body lacks ${JSON.stringify(word)}`);
@@ -393,8 +736,82 @@ function defineSuite() {
         `${JSON.stringify(word)} occurs in the title, summary or tags of ${entry.url}, so it no longer proves body search`,
       );
     }
-    // Code samples are part of the indexed body (AAP 0.5.5).
-    assert.ok(entry.body.includes('retry_delay'), `${entry.url} body lacks its python sample`);
+    // Code samples are part of the indexed body (AAP 0.5.5), the raw Liquid
+    // sample with its braces included.
+    for (const [slug, probes] of Object.entries(CODE_ONLY_PROBES)) {
+      const post = FIXTURE_POSTS.find((candidate) => candidate.slug === slug);
+      assert.ok(post, `CODE_ONLY_PROBES names ${slug}, which is not in FIXTURE_POSTS`);
+      const { fenced, prose } = splitFences(fixtureSource(post.file).body);
+      const fixture = fixtureEntry(entries, slug);
+      for (const probe of probes) {
+        assert.ok(
+          fenced.toLowerCase().includes(probe),
+          `${post.file}: ${JSON.stringify(probe)} is not inside a fenced code block, so it no longer proves code indexing`,
+        );
+        assert.ok(
+          !prose.toLowerCase().includes(probe),
+          `${post.file}: ${JSON.stringify(probe)} also occurs outside fenced code, so it no longer proves code indexing`,
+        );
+        assert.ok(
+          fixture.body.includes(probe),
+          `${fixture.url} body lacks its fenced code sample ${JSON.stringify(probe)}`,
+        );
+      }
+    }
+  });
+
+  test('[AC-08][F-019] fixture bodies equal the distinct tokens of the decoded built article prose', FIXTURE_ONLY, (t) => {
+    const entries = requireEntries();
+    for (const { slug } of FIXTURE_POSTS) {
+      const entry = fixtureEntry(entries, slug);
+      const file = articlePageFile(entry.url);
+      assert.ok(isSiteFile(file), `${entry.url} does not resolve: ${file} is not a built file`);
+      const where = `article page ${entry.url}`;
+      const expected = expectedBody(readFileSync(file, 'utf8'), where);
+      const live = parseStartTags(expected.prose);
+      // The fixture must give every step something to do.
+      assert.ok(live.length > 0, `${where}: the prose holds no markup, so HTML removal goes unchecked`);
+      assert.match(
+        expected.stripped,
+        /[\t\n\v\f\r]| {2}/,
+        `${where}: the prose holds no whitespace run, so collapsing goes unchecked`,
+      );
+      assert.ok(
+        expected.tokens.length > expected.distinct.length,
+        `${where}: the prose repeats no word, so distinct-token reduction goes unchecked`,
+      );
+      // HTML removal: no live tag of the prose survives into the body. A tag
+      // name the decoded text itself shows, such as the escaping fixture's
+      // `<script src=…>` code sample, is content and stays.
+      for (const name of new Set(live.map((tag) => tag.name))) {
+        // Tag names hold only word characters, ':' and '-', so none needs escaping.
+        const markup = new RegExp(`<${name}[\\s>/]`, 'i');
+        if (markup.test(expected.text)) continue;
+        const at = entry.body.search(markup);
+        assert.equal(
+          at,
+          -1,
+          `${entry.url} body still holds <${name}> markup: …${entry.body.slice(Math.max(0, at - 40), at + 40)}…`,
+        );
+      }
+      assert.equal(entry.body, entry.body.toLowerCase(), `${entry.url} body is not lowercased`);
+      assert.match(entry.body, TOKEN_BODY_RE, `${entry.url} body must be tokens joined by single spaces`);
+      const tokens = entry.body.split(' ');
+      const repeated = duplicateTokens(tokens);
+      assert.deepEqual(repeated, [], `${entry.url} body repeats tokens: ${JSON.stringify(repeated.slice(0, 20))}`);
+      const difference = firstTokenDifference(tokens, expected.distinct);
+      assert.deepEqual(
+        tokens,
+        expected.distinct,
+        `${entry.url} body must hold the prose's distinct tokens in first-occurrence order; ${difference}`,
+      );
+      assert.equal(
+        entry.body,
+        expected.distinct.join(' '),
+        `${entry.url} body must equal the decoded prose's distinct tokens; ${difference}`,
+      );
+      t.diagnostic(`${entry.url}: ${expected.tokens.length} prose tokens, ${expected.distinct.length} distinct`);
+    }
   });
 
   test('[AC-08][F-019] fixture bodies carry no undecoded character references', FIXTURE_ONLY, () => {
@@ -418,12 +835,29 @@ function defineSuite() {
     );
   });
 
-  test('[AC-08][F-019] front-matter values are raw text, not HTML-escaped', FIXTURE_ONLY, () => {
+  test('[AC-08][F-019] front-matter values are indexed as written: raw text, not HTML-escaped, dates in UTC', FIXTURE_ONLY, () => {
     const entries = requireEntries();
+    // Every fixture's title, summary and tags, compared with its source front
+    // matter: an empty, escaped, reordered or truncated value fails.
+    for (const { file, slug } of FIXTURE_POSTS) {
+      const { data } = fixtureSource(file);
+      for (const key of NON_EMPTY_KEYS) {
+        assert.ok(
+          typeof data[key] === 'string' && data[key] !== '',
+          `${file}: ${key} must be a non-empty string, got ${JSON.stringify(data[key])}`,
+        );
+      }
+      assert.ok(
+        Array.isArray(data.tags) && data.tags.length > 0,
+        `${file}: tags must be a non-empty list, got ${JSON.stringify(data.tags)}`,
+      );
+      const entry = fixtureEntry(entries, slug);
+      assert.equal(entry.title, data.title, `${entry.url}: title must equal the front matter of ${file}`);
+      assert.equal(entry.summary, data.summary, `${entry.url}: summary must equal the front matter of ${file}`);
+      assert.deepEqual(entry.tags, data.tags, `${entry.url}: tags must equal the front matter of ${file}`);
+    }
     const escaping = fixtureEntry(entries, ESCAPING_FIXTURE_SLUG);
     assert.equal(escaping.title, ESCAPING_FIXTURE_TITLE);
-    // Liquid inside {% raw %} survives into the index as literal text.
-    assert.ok(escaping.body.includes('.values.image'), `${escaping.url} body lacks its raw Liquid sample`);
     for (const [slug, day] of Object.entries(FIXTURE_DATES)) {
       const entry = fixtureEntry(entries, slug);
       assert.ok(entry.date.startsWith(day), `${entry.url} date ${entry.date} does not start with ${day} (UTC)`);

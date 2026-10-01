@@ -21,8 +21,9 @@
  * The spec folder, test artefacts and report are resolved from this file's
  * folder, never from `process.cwd()`, so they land in the same place wherever
  * Playwright was launched. Comparison strictness (`threshold: 0`, `maxDiffPixels: 0`) is set
- * on each `toHaveScreenshot` call in the spec and is deliberately not loosened
- * here.
+ * on each `toHaveScreenshot` call in the spec, which then compares every
+ * pixel again at zero tolerance (`lib/pixels.mjs`), and is deliberately not
+ * loosened here.
  */
 
 import { defineConfig } from "@playwright/test";

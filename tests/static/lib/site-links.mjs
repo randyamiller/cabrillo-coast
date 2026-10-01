@@ -4,9 +4,9 @@
  * name does not match `*.test.mjs`, so `node --test "tests/**\/*.test.mjs"`
  * only reaches it through the suites that import it:
  *   - `tests/static/built-pages.test.mjs`        all four exports
- *   - `tests/static/built-search-index.test.mjs` `parseStartTags`
+ *   - `tests/static/built-search-index.test.mjs` `parseStartTags`, `decodeEntities`
  *   - `tests/static/site-chrome.test.mjs`        `parseStartTags`, `decodeEntities`
- *   - `tests/unit/site-links.test.mjs`           `checkSiteLinks`
+ *   - `tests/unit/site-links.test.mjs`           all four exports
  *
  * Everything is synchronous, so consumers can call it at module top level or
  * inside `test()`. Importing the module has no side effects and nothing here
@@ -17,15 +17,18 @@
  * site's own pages, written by hand (`index.html`) or emitted by Jekyll,
  * kramdown and Liquid with every attribute value quoted and escaped. Two
  * properties make start tags reliable to find in that output:
- *   - Comments are blanked to equal-length whitespace before matching, so a
- *     URL inside a comment is never read as a link and offsets still point
- *     into the original text.
+ *   - Comments and start tags are read in one left-to-right scan, each
+ *     consumed whole. A URL inside a comment is never read as a link, and
+ *     `<!--` inside a quoted attribute value never opens a comment. A
+ *     comment ends where the HTML tokenizer ends one (`-->`, `--!>`, the
+ *     abrupt `<!-->` or `<!--->`, or the end of the input), and offsets
+ *     point into the original text.
  *   - Escaped markup (`&lt;a href="/nope"&gt;` in a code sample) has no `<`,
  *     and Rouge splits highlighted `src=` text across `<span>` elements, so
  *     neither is ever read as a tag or an attribute.
- * `<script>` and `<style>` contents are not blanked: blog pages carry no
- * inline scripts under their Content-Security-Policy, and the home page's
- * only script is external.
+ * `<script>` and `<style>` contents are scanned like any other text: blog
+ * pages carry no inline scripts under their Content-Security-Policy, and the
+ * home page's only script is external.
  *
  * Link-checking model (`checkSiteLinks`): every `href`, `src` and
  * `data-index` value on every built HTML page is resolved the way a browser
@@ -34,7 +37,7 @@
  * (empty base path) and the project-path build (`/cabrillo-coast`).
  */
 
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { URL, fileURLToPath } from 'node:url';
 
@@ -57,8 +60,11 @@ import { URL, fileURLToPath } from 'node:url';
  * @typedef {object} HtmlPage
  * @property {string} file    Absolute path of the page.
  * @property {string} rel     POSIX path relative to the site directory.
- * @property {string} urlPath URL path of the page under the base path
- *                            (`blog/index.html` → `<base>/blog/`).
+ * @property {string} urlPath URL path a browser requests for the page: the
+ *                            percent-encoded base path, then `rel` with each
+ *                            segment percent-encoded (`blog/index.html` →
+ *                            `<base>/blog/`, `notes#v1.html` →
+ *                            `<base>/notes%23v1.html`).
  */
 
 /**
@@ -91,8 +97,12 @@ const NAMED_ENTITIES = Object.freeze({
   nbsp: '\u00a0',
 });
 
-/** An HTML comment, or an unterminated one running to the end of the input. */
-const COMMENT_RE = /<!--[\s\S]*?(?:-->|$)/g;
+/**
+ * An HTML comment, ended where the HTML tokenizer ends one: at `-->` or
+ * `--!>`, at once for the abrupt empty comments `<!-->` and `<!--->`, or at
+ * the end of the input when it is never closed. No capture groups.
+ */
+const COMMENT_RE = /<!--(?:-?>|[\s\S]*?(?:--!?>|$))/g;
 
 /**
  * A start tag with quote-aware attributes. `\s` crosses newlines, so tags
@@ -101,6 +111,15 @@ const COMMENT_RE = /<!--[\s\S]*?(?:-->|$)/g;
  */
 const START_TAG_RE =
   /<([a-zA-Z][\w:-]*)((?:\s+[^\s"'>\/=]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+))?)*)\s*\/?>/g;
+
+/**
+ * A comment or a start tag, whichever begins first. Scanning with one
+ * alternation consumes each construct whole, so `<!--` inside a quoted
+ * attribute value never opens a comment and a tag inside a comment is never
+ * read. The two alternatives cannot both match at one offset (`<!` against
+ * `<` plus a letter), and the tag's groups are 1 (name) and 2 (attributes).
+ */
+const MARKUP_RE = new RegExp(`${COMMENT_RE.source}|${START_TAG_RE.source}`, 'g');
 
 /** One attribute inside the attribute group captured by `START_TAG_RE`. */
 const ATTR_RE = /([^\s"'>\/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
@@ -146,6 +165,21 @@ function normalizeBase(baseurl) {
 }
 
 /**
+ * A normalised base path in the encoding of a parsed URL's pathname, which
+ * is the form a resolved reference's pathname takes: the pathname setter
+ * percent-encodes `?`, `#`, spaces and the other characters a URL path
+ * cannot hold literally. The empty base path stays `""`.
+ * @param {string} base Output of `normalizeBase`.
+ * @returns {string}
+ */
+function encodeBase(base) {
+  if (base === '') return '';
+  const url = new URL(RESOLVE_ORIGIN);
+  url.pathname = `${base}/`;
+  return url.pathname.slice(0, -1);
+}
+
+/**
  * Resolves the site directory argument to an absolute path. A `file:` URL is
  * accepted so callers can pass `new URL('../../_site', import.meta.url)`.
  * @param {unknown} siteDir
@@ -187,6 +221,21 @@ function siteHostOf(siteUrl) {
 function statOrNull(file) {
   try {
     return statSync(file, { throwIfNoEntry: false }) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `realpathSync` that returns `null` instead of throwing for a missing entry,
+ * a dangling or looping symbolic link, a path through a regular file or an
+ * invalid path (a NUL byte).
+ * @param {string} file
+ * @returns {string | null}
+ */
+function realpathOrNull(file) {
+  try {
+    return realpathSync(file);
   } catch {
     return null;
   }
@@ -271,8 +320,11 @@ export function decodeEntities(text) {
 }
 
 /**
- * Lists every start tag of an HTML document in document order. Comments are
- * ignored; offsets and `source` refer to the original string.
+ * Lists every start tag of an HTML document in document order. One
+ * left-to-right scan reads comments and start tags whole: a tag inside a
+ * comment is not returned, and `<!--` inside a quoted attribute value is
+ * text, not the start of a comment. Offsets and `source` refer to the
+ * original string.
  *
  * @example
  * const [nav] = parseStartTags('<nav class="mobile-menu" id="mobile-menu" aria-label="Primary" hidden>');
@@ -282,14 +334,13 @@ export function decodeEntities(text) {
  */
 export function parseStartTags(html) {
   const original = typeof html === 'string' ? html : String(html ?? '');
-  // Every comment character except a newline becomes a space, so the blanked
-  // text has the same length and every offset maps straight back.
-  const blanked = original.replace(COMMENT_RE, (comment) => comment.replace(/[^\n]/g, ' '));
   /** @type {StartTag[]} */
   const tags = [];
-  const re = new RegExp(START_TAG_RE.source, 'g');
+  const re = new RegExp(MARKUP_RE.source, 'g');
   let match;
-  while ((match = re.exec(blanked)) !== null) {
+  while ((match = re.exec(original)) !== null) {
+    // A comment has no tag-name group; it is consumed and skipped.
+    if (match[1] === undefined) continue;
     const start = match.index;
     const end = start + match[0].length;
     tags.push({
@@ -317,7 +368,7 @@ export function parseStartTags(html) {
  */
 export function listHtmlPages(siteDir, baseurl = '') {
   const root = resolveSiteDir(siteDir, 'listHtmlPages');
-  const base = normalizeBase(baseurl);
+  const base = encodeBase(normalizeBase(baseurl));
   /** @type {HtmlPage[]} */
   const pages = [];
   const walk = (dir) => {
@@ -327,13 +378,19 @@ export function listHtmlPages(siteDir, baseurl = '') {
         walk(file);
       } else if (entry.isFile() && entry.name.endsWith('.html')) {
         const rel = path.relative(root, file).split(path.sep).join('/');
+        // Every segment is percent-encoded, so a `#`, `?`, `%` or space in a
+        // name stays part of the path when references are resolved on it.
+        const encoded = rel
+          .split('/')
+          .map((segment) => encodeURIComponent(segment))
+          .join('/');
         let urlPath;
         if (rel === INDEX_FILE) {
           urlPath = `${base}/`;
         } else if (rel.endsWith(`/${INDEX_FILE}`)) {
-          urlPath = `${base}/${rel.slice(0, -INDEX_FILE.length)}`;
+          urlPath = `${base}/${encoded.slice(0, -INDEX_FILE.length)}`;
         } else {
-          urlPath = `${base}/${rel}`;
+          urlPath = `${base}/${encoded}`;
         }
         pages.push({ file, rel, urlPath });
       }
@@ -357,12 +414,16 @@ export function listHtmlPages(siteDir, baseurl = '') {
  *   `/blog/`).
  * - Each resolved path must lie under the base path, name an existing file
  *   (a path ending in `/` names its `index.html`; a directory holding
- *   `index.html` is accepted), and any fragment on an HTML target must equal
- *   an `id` in that page.
+ *   `index.html` is accepted) that is still inside the site directory once
+ *   every symbolic link is resolved, and any fragment on an HTML target must
+ *   equal an `id` in that page. A symbolic link inside the site to a file or
+ *   directory outside it is `missing file`, so it never lends its ids.
  *
  * Findings are returned in page order, then document order; an empty array
  * means every reference resolves. A malformed reference is reported as
- * `missing file` rather than thrown.
+ * `missing file` rather than thrown. A missing `siteDir` throws the
+ * file-system error (`ENOENT`); an empty or non-path `siteDir` throws a
+ * `TypeError`.
  *
  * @example
  * checkSiteLinks({ siteDir: '_site', baseurl: '', siteUrl: 'https://www.cabrillocoast.com' });
@@ -375,14 +436,14 @@ export function listHtmlPages(siteDir, baseurl = '') {
  * @returns {LinkFinding[]}
  */
 export function checkSiteLinks({ siteDir, baseurl = '', siteUrl } = {}) {
-  const root = resolveSiteDir(siteDir, 'checkSiteLinks');
+  // Canonical, so containment compares canonical paths and the ids cached
+  // per listed page share their keys with canonical targets.
+  const root = realpathSync(resolveSiteDir(siteDir, 'checkSiteLinks'));
   const rootPrefix = root.endsWith(path.sep) ? root : root + path.sep;
   const base = normalizeBase(baseurl);
   // The resolved pathname is percent-encoded, so compare it with the base
-  // path in the same encoding. The pathname setter also encodes `?` and `#`.
-  const baseUrl = new URL(RESOLVE_ORIGIN);
-  baseUrl.pathname = `${base}/`;
-  const encodedBase = base === '' ? '' : baseUrl.pathname.slice(0, -1);
+  // path in the same encoding.
+  const encodedBase = encodeBase(base);
   const siteHost = siteHostOf(siteUrl);
 
   // First pass: parse every page once, keeping its references and its ids.
@@ -401,8 +462,9 @@ export function checkSiteLinks({ siteDir, baseurl = '', siteUrl } = {}) {
   });
 
   /**
-   * Ids of a target page; a target outside the listed pages (reached through
-   * a differently spelled path) is parsed once and cached.
+   * Ids of a target page, by canonical path. A target the walk did not list
+   * (an in-site symbolic link named `.html` whose file is not) is parsed
+   * once and cached.
    * @param {string} file
    * @returns {Set<string>}
    */
@@ -417,6 +479,19 @@ export function checkSiteLinks({ siteDir, baseurl = '', siteUrl } = {}) {
       idCache.set(file, ids);
     }
     return ids;
+  };
+
+  /**
+   * `file` with every symbolic link resolved, or `null` when it does not
+   * resolve or its canonical path lies outside the site directory. The
+   * lexical check alone would let an in-site link to an outside file pass.
+   * @param {string} file
+   * @returns {string | null}
+   */
+  const canonicalInside = (file) => {
+    const canonical = realpathOrNull(file);
+    if (canonical === null) return null;
+    return canonical === root || canonical.startsWith(rootPrefix) ? canonical : null;
   };
 
   /**
@@ -460,19 +535,26 @@ export function checkSiteLinks({ siteDir, baseurl = '', siteUrl } = {}) {
     }
     if (remainder === '' || remainder.endsWith('/')) remainder += INDEX_FILE;
 
-    let target = path.join(root, remainder);
-    if (target !== root && !target.startsWith(rootPrefix)) return REASON_MISSING_FILE;
+    // `served` is the name the URL asks for, a directory mapped to its
+    // `index.html`; it decides whether the fragment is checked. `target` is
+    // the file actually read, every symbolic link resolved.
+    let served = path.join(root, remainder);
+    if (served !== root && !served.startsWith(rootPrefix)) return REASON_MISSING_FILE;
+    let target = canonicalInside(served);
+    if (target === null) return REASON_MISSING_FILE;
     const stats = statOrNull(target);
     if (stats === null) return REASON_MISSING_FILE;
     if (stats.isDirectory()) {
-      target = path.join(target, INDEX_FILE);
+      served = path.join(served, INDEX_FILE);
+      target = canonicalInside(path.join(target, INDEX_FILE));
+      if (target === null) return REASON_MISSING_FILE;
       const indexStats = statOrNull(target);
       if (indexStats === null || !indexStats.isFile()) return REASON_MISSING_FILE;
     } else if (!stats.isFile()) {
       return REASON_MISSING_FILE;
     }
 
-    if (hash !== '' && target.endsWith('.html')) {
+    if (hash !== '' && served.endsWith('.html')) {
       let fragment;
       try {
         fragment = decodeURIComponent(hash.slice(1));

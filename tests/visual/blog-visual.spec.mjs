@@ -14,12 +14,27 @@
  *   2. with `--update-snapshots=none` against the working-tree build,
  *      comparing every screenshot with its baseline.
  *
- * The comparison is literal pixel equality (`threshold: 0`,
- * `maxDiffPixels: 0`). Two separate builds of identical source render
- * identically in the same browser build on the same machine, so any tolerance
- * would only hide a real regression. Intended visual changes are declared to
- * run-visual.mjs (a `Visual-Change: intended` commit trailer or
- * `VISUAL_CHANGE_INTENDED=1`), never by loosening this file.
+ * The comparison is literal pixel equality, checked in two layers:
+ *   1. `toHaveScreenshot` with `threshold: 0` and `maxDiffPixels: 0`, which
+ *      waits for a stable render and writes Playwright's own expected,
+ *      actual and diff images when it fails. Its pixelmatch comparator does
+ *      not count changed pixels it classifies as anti-aliased, and blends
+ *      every pixel with white by its alpha first, so on its own it can pass
+ *      a changed glyph edge or a change hidden behind zero alpha.
+ *   2. Once the matcher has passed, outside the baseline run, a new capture
+ *      with the same options is compared with the baseline file sample by
+ *      sample at zero tolerance (`compareScreenshots` in `lib/pixels.mjs`),
+ *      so those differences fail too. A difference writes
+ *      `<name>-expected.png`, `<name>-actual.png` and `<name>-diff.png` into
+ *      the case's output folder, attaches them to the report, and fails the
+ *      case with `strictMismatchMessage`, which run-visual.mjs classifies as
+ *      a screenshot difference. A baseline or capture that cannot be decoded
+ *      fails with its own message, never as a difference.
+ * Two separate builds of identical source render identically in the same
+ * browser build on the same machine, so any tolerance would only hide a real
+ * regression. Intended visual changes are declared to run-visual.mjs (a
+ * `Visual-Change: intended` commit trailer or `VISUAL_CHANGE_INTENDED=1`),
+ * never by loosening this file.
  *
  * Inputs (environment):
  *   VISUAL_BASE_URL      Served site root including the base path, for example
@@ -40,7 +55,11 @@
  *     form: it fetches no index and leaves the status line empty.
  */
 
+import fs from "node:fs";
+
 import { test, expect } from "@playwright/test";
+
+import { compareScreenshots, strictMismatchMessage } from "./lib/pixels.mjs";
 
 /*
  * Fail at load time, before any test runs, rather than screenshot an
@@ -79,6 +98,70 @@ const HEIGHT = 900;
 /* Google Fonts stylesheet and font files, the only third-party requests. */
 const FONT_ROUTE = /^https:\/\/fonts\.(googleapis|gstatic)\.com\//;
 
+/*
+ * What both comparison layers capture, defined once so the strict capture
+ * can never drift from the one `toHaveScreenshot` compared.
+ */
+function captureOptions(page) {
+  return {
+    fullPage: true,
+    animations: "disabled",
+    mask: [page.locator("#year")],
+  };
+}
+
+/**
+ * The second layer: a new capture must equal the baseline file in every
+ * sample of every pixel (`compareScreenshots`), with no anti-aliasing or
+ * alpha allowance. Called only after `toHaveScreenshot` has passed, so the
+ * page is stable and the baseline exists.
+ *
+ * Skipped when the run updates every snapshot (`--update-snapshots=all`):
+ * that run has just written the baseline from this very render.
+ *
+ * On a difference, writes `<stem>-expected.png` (the baseline bytes),
+ * `<stem>-actual.png` and `<stem>-diff.png` into the case's output folder,
+ * as Playwright names its own, so the report pairs them and run-visual.mjs
+ * counts the actual image; attaches all three; then throws
+ * `strictMismatchMessage`.
+ * @param {import("@playwright/test").Page} page
+ * @param {string} file Screenshot file name, for example `listing-375-light.png`.
+ * @param {ReturnType<typeof captureOptions>} capture
+ * @throws {Error} on any difference, or when either image cannot be decoded
+ *   (a different message, so it is never taken for a difference).
+ */
+async function expectIdenticalPixels(page, file, capture) {
+  const info = test.info();
+  if (info.config.updateSnapshots === "all") return;
+
+  // `toHaveScreenshot` hides the caret and captures at CSS scale by default;
+  // `page.screenshot` must be told, or it would capture at device scale.
+  const actual = await page.screenshot({ ...capture, caret: "hide", scale: "css" });
+  const expected = await fs.promises.readFile(info.snapshotPath(file, { kind: "screenshot" }));
+
+  let result;
+  try {
+    result = compareScreenshots(expected, actual);
+  } catch (err) {
+    throw new Error(`Strict pixel comparison of ${file} could not run: ${err.message}`, { cause: err });
+  }
+  if (result.equal) return;
+
+  const stem = file.replace(/\.png$/, "");
+  const evidence = [
+    ["expected", expected],
+    ["actual", actual],
+    ["diff", result.diffPng],
+  ];
+  for (const [suffix, bytes] of evidence) {
+    const name = `${stem}-${suffix}.png`;
+    const target = info.outputPath(name);
+    await fs.promises.writeFile(target, bytes);
+    await info.attach(name, { path: target, contentType: "image/png" });
+  }
+  throw new Error(strictMismatchMessage(file, result));
+}
+
 test.describe("[AC-16][F-018] blog visual comparison", () => {
   for (const { name, path } of PAGES) {
     for (const width of WIDTHS) {
@@ -100,13 +183,14 @@ test.describe("[AC-16][F-018] blog visual comparison", () => {
             await document.fonts.ready;
           });
 
-          await expect(page).toHaveScreenshot(`${name}-${width}-${scheme}.png`, {
-            fullPage: true,
-            animations: "disabled",
+          const file = `${name}-${width}-${scheme}.png`;
+          const capture = captureOptions(page);
+          await expect(page).toHaveScreenshot(file, {
+            ...capture,
             threshold: 0,
             maxDiffPixels: 0,
-            mask: [page.locator("#year")],
           });
+          await expectIdenticalPixels(page, file, capture);
         });
       }
     }

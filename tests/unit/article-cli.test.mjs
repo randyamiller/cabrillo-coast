@@ -23,12 +23,16 @@
  * after the run, so nothing is written inside this repository.
  *
  * Git isolation: every git call, and every tool run (the tool spawns git
- * itself), gets `ENV`. It replaces the system and global configuration with
- * an empty file, so no developer hook, `core.hooksPath`, template folder,
- * signing or LFS filter can influence a case, and it drops the variables a
- * git hook exports (`GIT_DIR`, `GIT_INDEX_FILE`, …) that would otherwise
- * redirect the temporary repositories to the repository running the tests.
- * Setup commits and pushes use `--no-verify`.
+ * itself), gets `ENV`, made by `isolatedEnv`. It replaces the system and
+ * global configuration with an empty file and the template folder
+ * (`GIT_TEMPLATE_DIR`, which outranks `init.templateDir`) with an empty
+ * folder, so no developer hook, `core.hooksPath`, template hook or template
+ * configuration, signing or LFS filter can influence a case or run during
+ * one, and it drops the variables a git hook exports (`GIT_DIR`,
+ * `GIT_INDEX_FILE`, …) that would otherwise redirect the temporary
+ * repositories to the repository running the tests. Setup commits and pushes
+ * use `--no-verify`. One case builds a hostile template and shows that it is
+ * imported and run without the override and never with it.
  *
  * Run: node --test tests/unit/article-cli.test.mjs (Node 22 or later, git 2.32
  * or later for GIT_CONFIG_GLOBAL; HOME and XDG_CONFIG_HOME are redirected as
@@ -75,23 +79,51 @@ const GIT_REDIRECT_VARS = new Set([
   'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_SYSTEM',
 ]);
 
-const ENV = { ...process.env };
-for (const name of Object.keys(ENV)) {
-  if (GIT_REDIRECT_VARS.has(name) || /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(name)) delete ENV[name];
+/**
+ * An empty folder that `git init` and `git clone` copy into every new
+ * repository in place of a template, so none receives hooks, configuration
+ * or an `info/exclude` from the template of the environment running the
+ * tests. `GIT_TEMPLATE_DIR` outranks `init.templateDir`, and only an explicit
+ * `--template` outranks it; no call here passes one.
+ */
+const EMPTY_TEMPLATE_DIR = path.join(PARENT, 'git-template');
+fs.mkdirSync(EMPTY_TEMPLATE_DIR);
+
+/**
+ * The environment for git and the tool, derived from `base`: the variables in
+ * `GIT_REDIRECT_VARS` and every `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`
+ * pair removed; the system configuration off and an empty file as the global
+ * one; HOME and XDG_CONFIG_HOME redirected; `EMPTY_TEMPLATE_DIR` as the
+ * template; a fixed identity, no terminal prompts, and `PARENT` as the
+ * ceiling, so a temporary root that is not a repository never discovers an
+ * enclosing one. A function of `base` so a case can show what it does to a
+ * hostile environment.
+ *
+ * @param {NodeJS.ProcessEnv} base The environment to isolate.
+ * @returns {NodeJS.ProcessEnv} A new object; `base` is not changed.
+ */
+function isolatedEnv(base) {
+  const env = { ...base };
+  for (const name of Object.keys(env)) {
+    if (GIT_REDIRECT_VARS.has(name) || /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(name)) delete env[name];
+  }
+  return Object.assign(env, {
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_GLOBAL: GIT_CONFIG_FILE,
+    HOME: FAKE_HOME,
+    XDG_CONFIG_HOME: FAKE_HOME,
+    GIT_TEMPLATE_DIR: EMPTY_TEMPLATE_DIR,
+    GIT_AUTHOR_NAME: 'Article Test',
+    GIT_COMMITTER_NAME: 'Article Test',
+    GIT_AUTHOR_EMAIL: 'test@example.invalid',
+    GIT_COMMITTER_EMAIL: 'test@example.invalid',
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_CEILING_DIRECTORIES: PARENT,
+  });
 }
-Object.assign(ENV, {
-  GIT_CONFIG_NOSYSTEM: '1',
-  GIT_CONFIG_GLOBAL: GIT_CONFIG_FILE,
-  HOME: FAKE_HOME,
-  XDG_CONFIG_HOME: FAKE_HOME,
-  GIT_AUTHOR_NAME: 'Article Test',
-  GIT_COMMITTER_NAME: 'Article Test',
-  GIT_AUTHOR_EMAIL: 'test@example.invalid',
-  GIT_COMMITTER_EMAIL: 'test@example.invalid',
-  GIT_TERMINAL_PROMPT: '0',
-  // A temporary root that is not a repository never discovers an enclosing one.
-  GIT_CEILING_DIRECTORIES: PARENT,
-});
+
+/** The environment of every git call and every tool run. */
+const ENV = isolatedEnv(process.env);
 
 /** Time limit for cases that create repositories, clone or push. */
 const GIT_CASE = { timeout: 60000 };
@@ -104,23 +136,79 @@ const PNG = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
 /* ------------------------------------------------------------------------ */
 
 /**
+ * Describes what happened to a child process, for a failure message: the
+ * command line, the working directory, the exit status, the signal that
+ * ended it, the error that kept it from starting or finishing (a spawn
+ * failure, or `ETIMEDOUT` when its time limit ran out) and everything it
+ * wrote to stdout and stderr, which is kept even when there is an error.
+ *
+ * @param {string} command The program that was spawned.
+ * @param {string[]} args Its arguments.
+ * @param {string | undefined} cwd Its working directory; undefined for this process's own.
+ * @param {{ status: number | null, signal: string | null, error?: { code?: string, message: string } | null,
+ *   stdout?: string | null, stderr?: string | null }} result What `spawnSync` returned, or the same
+ *   fields recorded by a process that ran the child.
+ * @returns {string}
+ */
+function describeSpawn(command, args, cwd, result) {
+  const error = result.error ? `${result.error.code ?? 'no code'}: ${result.error.message}` : 'none';
+  return [
+    `command: ${JSON.stringify([command, ...args])}`,
+    `cwd: ${cwd ?? process.cwd()}`,
+    `status: ${result.status}, signal: ${result.signal}, error: ${error}`,
+    `stdout:\n${result.stdout ?? ''}`,
+    `stderr:\n${result.stderr ?? ''}`,
+  ].join('\n');
+}
+
+/**
+ * Runs a setup or probe child to completion (UTF-8 output, a 30-second limit
+ * unless `options` says otherwise) and returns its result, failing with
+ * `describeSpawn` unless it started, exited by itself with status 0 and was
+ * ended by no signal, so its output is never used when it did not succeed.
+ *
+ * @param {string} command The program to spawn.
+ * @param {string[]} args Its arguments.
+ * @param {import('node:child_process').SpawnSyncOptions} [options] Passed to `spawnSync`.
+ * @returns {import('node:child_process').SpawnSyncReturns<string>}
+ */
+function spawnOk(command, args, options = {}) {
+  const result = spawnSync(command, args, { encoding: 'utf8', timeout: 30000, ...options });
+  if (result.error || result.signal !== null || result.status !== 0) {
+    assert.fail(`a setup or probe command did not succeed\n${describeSpawn(command, args, options.cwd, result)}`);
+  }
+  return result;
+}
+
+/**
  * Runs `node [nodeArgs…] scripts/article.mjs <args>` with `ENV` plus `env`
  * (a case that puts a stand-in git on PATH passes that PATH in `env`).
  * Standard input is always given (empty by default) so `guard` never waits
- * on an open terminal.
+ * on an open terminal. A tool that cannot be started or outlives its time
+ * limit fails the case with `describeSpawn`; any exit status, refusals
+ * included, is returned for the case to assert.
  *
- * @returns {{ status: number, stdout: string, stderr: string, out: string }}
+ * @returns {{ status: number | null, signal: string | null, stdout: string, stderr: string, out: string }}
  */
 function run(args, { cwd, input = '', nodeArgs = [], env = {} } = {}) {
-  const result = spawnSync(process.execPath, [...nodeArgs, ARTICLE_MJS, ...args], {
+  const argv = [...nodeArgs, ARTICLE_MJS, ...args];
+  const result = spawnSync(process.execPath, argv, {
     cwd,
     input,
     env: { ...ENV, ...env },
     encoding: 'utf8',
     timeout: 30000,
   });
-  if (result.error) throw result.error;
-  return { status: result.status, stdout: result.stdout, stderr: result.stderr, out: result.stdout + result.stderr };
+  if (result.error) {
+    assert.fail(`the tool could not run to completion\n${describeSpawn(process.execPath, argv, cwd, result)}`);
+  }
+  return {
+    status: result.status,
+    signal: result.signal,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    out: result.stdout + result.stderr,
+  };
 }
 
 /** Runs a tool command in a temporary root: `--root <root>`, with the root as the working directory. */
@@ -128,19 +216,15 @@ function cli(root, ...args) {
   return run([...args, '--root', root], { cwd: root });
 }
 
-/** Asserts the exit code, showing the tool's output when it differs. */
+/** Asserts the exit code, showing the signal and the tool's output when it differs. */
 function expectExit(result, code) {
-  assert.equal(result.status, code, `expected exit code ${code}, got ${result.status}; output:\n${result.out}`);
+  assert.equal(result.status, code,
+    `expected exit code ${code}, got ${result.status} (signal ${result.signal}); output:\n${result.out}`);
 }
 
-/** Runs git with `ENV`; throws with git's stderr on failure and returns the trimmed stdout. */
+/** Runs git with `ENV`; fails with `describeSpawn` unless git succeeds, and returns the trimmed stdout. */
 function git(cwd, ...args) {
-  const result = spawnSync('git', args, { cwd, env: ENV, encoding: 'utf8', timeout: 30000 });
-  if (result.error) throw result.error;
-  if (result.status !== 0) {
-    throw new Error(`git ${args.join(' ')} failed (exit ${result.status}) in ${cwd}:\n${result.stderr}`);
-  }
-  return result.stdout.trim();
+  return spawnOk('git', args, { cwd, env: ENV }).stdout.trim();
 }
 
 /** A setup commit; hooks never run for it. */
@@ -169,7 +253,8 @@ function indexMode(repo, rel) {
  *     editor saving while the tool runs;
  *   - `run-tool`: run `node <argv…>` (with this preload, no rules and the
  *     extra variables `env`) to completion in `cwd`, write its
- *     `{ status, stdout, stderr }` to `out` as JSON, then make the call: a
+ *     `{ status, signal, error, stdout, stderr }` (`error` as
+ *     `{ code, message }`, or null) to `out` as JSON, then make the call: a
  *     competing run of the tool at that exact moment.
  * `ARTICLE_FAKE_NOW` (an ISO time) fixes the clock, as for a run on the other
  * side of UTC midnight. The tool calls `fs.<fn>` on the module's default
@@ -196,7 +281,13 @@ const runTool = (rule) => {
     encoding: 'utf8',
     timeout: 30000,
   });
-  fs.writeFileSync(rule.out, JSON.stringify({ status: child.status, stdout: child.stdout, stderr: child.stderr }));
+  fs.writeFileSync(rule.out, JSON.stringify({
+    status: child.status,
+    signal: child.signal,
+    error: child.error ? { code: child.error.code ?? null, message: child.error.message } : null,
+    stdout: child.stdout,
+    stderr: child.stderr,
+  }));
 };
 const rules = JSON.parse(process.env.ARTICLE_FAULTS || '[]').map((rule) => ({ ...rule, used: false }));
 const names = new Set(['openSync', 'closeSync', 'writeSync', ...rules.map((rule) => rule.fn)]);
@@ -382,6 +473,253 @@ function prePush(repo, localRef, remoteRef, remoteSha) {
 }
 
 /* ------------------------------------------------------------------------ */
+/* State snapshots                                                           */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * Every entry below `dir`, keyed by its POSIX path relative to `dir`: the
+ * mode of a folder, the mode and target of a symbolic link, and the mode and
+ * bytes of a file. A `.git` entry directly in `dir` is left out; `repoSnapshot`
+ * records a repository's git state itself.
+ *
+ * @returns {Record<string, { mode: number, bytes?: Buffer, link?: string }>}
+ */
+function treeSnapshot(dir) {
+  const entries = {};
+  const walk = (rel) => {
+    for (const name of fs.readdirSync(rel === '' ? dir : abs(dir, rel)).sort()) {
+      const childRel = rel === '' ? name : `${rel}/${name}`;
+      if (childRel === '.git') continue;
+      const target = abs(dir, childRel);
+      const stat = fs.lstatSync(target);
+      if (stat.isDirectory()) {
+        entries[childRel] = { mode: stat.mode };
+        walk(childRel);
+      } else if (stat.isSymbolicLink()) {
+        entries[childRel] = { mode: stat.mode, link: fs.readlinkSync(target) };
+      } else {
+        entries[childRel] = { mode: stat.mode, bytes: fs.readFileSync(target) };
+      }
+    }
+  };
+  walk('');
+  return entries;
+}
+
+/** Runs a read-only git query that must succeed with `GIT_OPTIONAL_LOCKS=0`, so it never refreshes the index. */
+function gitQuiet(cwd, ...args) {
+  return spawnOk('git', args, { cwd, env: { ...ENV, GIT_OPTIONAL_LOCKS: '0' } }).stdout;
+}
+
+/**
+ * The state of a temporary repository (one with a commit, as `makeRepo`
+ * makes) that a read-only command must leave as it found it: the bytes of
+ * `.git/index`, read before any git command runs; every working-tree entry
+ * from `treeSnapshot`, git-ignored ones such as `_drafts/` included; every
+ * ref with its object, HEAD's symbolic ref and commit; and the porcelain
+ * status, untracked and ignored files included. Its git commands use
+ * `gitQuiet`, so taking a snapshot changes nothing either.
+ */
+function repoSnapshot(repo) {
+  const indexFile = abs(repo, '.git/index');
+  const index = fs.existsSync(indexFile) ? fs.readFileSync(indexFile) : null;
+  return {
+    index,
+    worktree: treeSnapshot(repo),
+    refs: gitQuiet(repo, 'for-each-ref', '--format=%(refname) %(objectname)'),
+    head: [gitQuiet(repo, 'rev-parse', '--symbolic-full-name', 'HEAD'), gitQuiet(repo, 'rev-parse', 'HEAD')],
+    status: gitQuiet(repo, 'status', '--porcelain', '--untracked-files=all', '--ignored'),
+  };
+}
+
+/** The refs of a bare remote and the text of its HEAD, which a refused push must leave as they were. */
+function remoteSnapshot(remote) {
+  return {
+    refs: gitQuiet(remote, 'for-each-ref', '--format=%(refname) %(objectname)'),
+    head: fs.readFileSync(path.join(remote, 'HEAD'), 'utf8'),
+  };
+}
+
+/**
+ * Runs `action` between two calls of `snapshot` and asserts that both
+ * returned the same: the command left `what` exactly as it found it.
+ *
+ * @template T
+ * @param {() => unknown} snapshot Records the state to keep.
+ * @param {() => T} action Runs the command.
+ * @param {string} what The state, as the failure message names it.
+ * @returns {T} What `action` returned.
+ */
+function unchangedBy(snapshot, action, what) {
+  const before = snapshot();
+  const result = action();
+  assert.deepEqual(snapshot(), before, `${what} must be exactly as before the command`);
+  return result;
+}
+
+/** `cli(root, 'check', …files)`, asserting that check, read-only on every outcome, changed nothing in the root. */
+function checkRoot(root, ...files) {
+  return unchangedBy(() => treeSnapshot(root), () => cli(root, 'check', ...files), `the root ${root}`);
+}
+
+/** `guardStaged(repo)`, asserting that guard left the repository exactly as it found it. */
+function guardStagedUnchanged(repo) {
+  return unchangedBy(() => repoSnapshot(repo), () => guardStaged(repo), 'the repository');
+}
+
+/** `prePush(repo, …)`, asserting that guard left the repository and its remote exactly as it found them. */
+function prePushUnchanged({ repo, remote }, localRef, remoteRef, remoteSha) {
+  return unchangedBy(
+    () => ({ repo: repoSnapshot(repo), remote: remoteSnapshot(remote) }),
+    () => prePush(repo, localRef, remoteRef, remoteSha),
+    'the repository and its remote',
+  );
+}
+
+/* ------------------------------------------------------------------------ */
+/* Temporary repository isolation                                            */
+/* ------------------------------------------------------------------------ */
+
+/** Hooks of the hostile template: client hooks `--no-verify` does not skip, and the hooks a push runs on the remote. */
+const HOSTILE_HOOKS = [
+  'post-checkout', 'post-commit', 'post-receive', 'pre-commit',
+  'pre-push', 'pre-receive', 'reference-transaction', 'update',
+];
+
+/** Configuration keys the hostile template sets, as `git config --name-only` prints them. */
+const HOSTILE_KEYS = ['commit.gpgsign', 'core.hookspath', 'user.name'];
+
+/**
+ * Writes a hostile git template into a new case folder. Each hook in
+ * `HOSTILE_HOOKS` appends its name to a log and then fails, except
+ * `reference-transaction`, which succeeds so that a repository can still be
+ * created and the later hooks get their turn on git versions that run it
+ * while `init` writes HEAD (older ones do not). Its `config` turns on commit
+ * signing, points `core.hooksPath` at those hooks and sets an identity.
+ *
+ * @returns {{ dir: string, template: string, ran: () => string[] }} The case
+ *   folder, the template folder, and the names of the hooks run so far.
+ */
+function hostileTemplate() {
+  const dir = caseDir('hostile-template');
+  const template = path.join(dir, 'template');
+  const hooks = path.join(template, 'hooks');
+  const log = path.join(dir, 'hooks-ran.log');
+  fs.mkdirSync(hooks, { recursive: true });
+  for (const name of HOSTILE_HOOKS) {
+    fs.writeFileSync(path.join(hooks, name), [
+      '#!/bin/sh',
+      `printf '%s\\n' ${shQuote(name)} >> ${shQuote(log)}`,
+      `exit ${name === 'reference-transaction' ? 0 : 1}`,
+      '',
+    ].join('\n'), { mode: 0o755 });
+  }
+  fs.writeFileSync(path.join(template, 'config'),
+    `[commit]\n\tgpgsign = true\n[core]\n\thooksPath = ${quoted(hooks)}\n[user]\n\tname = Hostile Template\n`);
+  return {
+    dir,
+    template,
+    ran: () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\n').filter((line) => line !== '') : []),
+  };
+}
+
+/** The keys set in a repository's own configuration file (`.git/config`, or `config` of a bare repository). */
+function localConfigKeys(repo) {
+  return git(repo, 'config', '--local', '--list', '--name-only').split('\n');
+}
+
+/** Asserts that a repository's git folder holds no hooks and its configuration none of `HOSTILE_KEYS`. */
+function assertNoTemplateImports(gitDir, label) {
+  assert.deepEqual(list(gitDir, 'hooks'), [], `${label}: no hooks`);
+  const keys = localConfigKeys(gitDir);
+  for (const key of HOSTILE_KEYS) assert.equal(keys.includes(key), false, `${label}: no ${key}:\n${keys.join('\n')}`);
+}
+
+test('[AC-03][F-017] temporary repositories take no hooks or configuration from an inherited git template', GIT_CASE, async (t) => {
+  await t.test('[AC-03][F-017] without the override, an inherited template is imported by init and run by clone and push', GIT_CASE, () => {
+    const hostile = hostileTemplate();
+    // ENV as it was before it overrode the template: what an inherited GIT_TEMPLATE_DIR did to every case.
+    const leaky = { ...ENV, GIT_TEMPLATE_DIR: hostile.template };
+    /** Runs git with the leaky environment; returns its result and description, as the hostile hooks may fail it. */
+    const leakyGit = (cwd, ...args) => {
+      const result = spawnSync('git', args, { cwd, env: leaky, encoding: 'utf8', timeout: 30000 });
+      return { result, description: describeSpawn('git', args, cwd, result) };
+    };
+
+    const repo = path.join(hostile.dir, 'repo');
+    const init = leakyGit(hostile.dir, 'init', '-q', '-b', 'main', repo);
+    assert.equal(init.result.status, 0, init.description);
+    assert.deepEqual(list(repo, '.git/hooks'), [...HOSTILE_HOOKS].sort(), 'init copies the template hooks');
+    const keys = localConfigKeys(repo);
+    for (const key of HOSTILE_KEYS) assert.ok(keys.includes(key), `init copies ${key}:\n${keys.join('\n')}`);
+
+    const remote = path.join(hostile.dir, 'remote.git');
+    const bare = leakyGit(hostile.dir, 'init', '-q', '--bare', remote);
+    assert.equal(bare.result.status, 0, bare.description);
+    assert.deepEqual(list(remote, 'hooks'), [...HOSTILE_HOOKS].sort(), 'a bare init copies them too');
+
+    const source = makeRepo();
+    leakyGit(hostile.dir, 'clone', '-q', source, path.join(hostile.dir, 'clone'));
+    assert.ok(hostile.ran().includes('post-checkout'), `clone runs the template's post-checkout: ${hostile.ran()}`);
+
+    const push = leakyGit(source, 'push', '-q', '--no-verify', remote, 'main');
+    assert.notEqual(push.result.status, 0, `the remote's pre-receive refuses the push:\n${push.description}`);
+    assert.ok(hostile.ran().includes('pre-receive'),
+      `--no-verify does not skip the remote's pre-receive: ${hostile.ran()}`);
+  });
+
+  await t.test('[AC-03][F-017] isolatedEnv swaps an inherited template for the empty one, so init, commit, clone, checkout and push import and run nothing', GIT_CASE, () => {
+    const hostile = hostileTemplate();
+    const env = isolatedEnv({ ...process.env, GIT_TEMPLATE_DIR: hostile.template });
+    assert.equal(env.GIT_TEMPLATE_DIR, EMPTY_TEMPLATE_DIR, 'the inherited template is replaced');
+    /**
+     * Runs git with the isolated environment, which must succeed, and returns
+     * its trimmed stdout. Nothing passes --no-verify, so any imported hook runs.
+     */
+    const isolatedGit = (cwd, ...args) => spawnOk('git', args, { cwd, env }).stdout.trim();
+
+    const repo = path.join(hostile.dir, 'repo');
+    isolatedGit(hostile.dir, 'init', '-q', '-b', 'main', repo);
+    write(repo, 'first.txt', 'first\n');
+    isolatedGit(repo, 'add', 'first.txt');
+    isolatedGit(repo, 'commit', '-q', '-m', 'First');
+    const remote = path.join(hostile.dir, 'remote.git');
+    isolatedGit(hostile.dir, 'init', '-q', '--bare', remote);
+    isolatedGit(repo, 'remote', 'add', 'origin', remote);
+    isolatedGit(repo, 'push', '-q', 'origin', 'main');
+
+    const clone = path.join(hostile.dir, 'clone');
+    isolatedGit(hostile.dir, 'clone', '-q', remote, clone);
+    isolatedGit(clone, 'checkout', '-q', '-b', 'feature');
+    write(clone, 'second.txt', 'second\n');
+    isolatedGit(clone, 'add', 'second.txt');
+    isolatedGit(clone, 'commit', '-q', '-m', 'Second');
+    isolatedGit(clone, 'push', '-q', 'origin', 'feature');
+    assert.equal(isolatedGit(remote, 'rev-parse', 'refs/heads/feature'), isolatedGit(clone, 'rev-parse', 'HEAD'),
+      'the push from the clone arrived');
+
+    assertNoTemplateImports(path.join(repo, '.git'), 'repository');
+    assertNoTemplateImports(remote, 'bare remote');
+    assertNoTemplateImports(path.join(clone, '.git'), 'clone');
+    assert.deepEqual(hostile.ran(), [], 'no hook of the hostile template ran');
+    assert.deepEqual(fs.readdirSync(EMPTY_TEMPLATE_DIR), [], 'the empty template stays empty');
+  });
+
+  await t.test('[AC-03][F-017] ENV uses the empty template, so makeRepo, makeRemoteRepo and a clone carry no hooks', GIT_CASE, () => {
+    assert.equal(ENV.GIT_TEMPLATE_DIR, EMPTY_TEMPLATE_DIR);
+    assert.deepEqual(fs.readdirSync(EMPTY_TEMPLATE_DIR), [], 'the template folder is empty');
+    const plain = makeRepo();
+    const { repo, remote } = makeRemoteRepo();
+    const clone = caseDir('clone');
+    git(PARENT, 'clone', '-q', remote, clone);
+    assertNoTemplateImports(path.join(plain, '.git'), 'makeRepo');
+    assertNoTemplateImports(path.join(repo, '.git'), 'makeRemoteRepo repository');
+    assertNoTemplateImports(remote, 'makeRemoteRepo remote');
+    assertNoTemplateImports(path.join(clone, '.git'), 'clone');
+  });
+});
+
+/* ------------------------------------------------------------------------ */
 /* Usage                                                                     */
 /* ------------------------------------------------------------------------ */
 
@@ -496,22 +834,22 @@ test('[AC-03][F-017] new leaves no draft when its image folder cannot be created
 test('[AC-03][F-017] check rejects the untouched template and accepts a valid draft', () => {
   const root = makeRoot();
   expectExit(cli(root, 'new', 'fresh-template'), 0);
-  const fresh = cli(root, 'check', '_drafts/fresh-template.md');
+  const fresh = checkRoot(root, '_drafts/fresh-template.md');
   expectExit(fresh, 1);
   assert.match(fresh.stderr, /TODO/, 'leftover TODO: markers are reported');
   assert.match(fresh.stderr, /tags/, 'the empty tags list is reported');
 
   write(root, '_drafts/valid-draft.md', validArticle());
-  expectExit(cli(root, 'check', '_drafts/valid-draft.md'), 0);
+  expectExit(checkRoot(root, '_drafts/valid-draft.md'), 0);
 });
 
 test('[AC-03][F-017] check applies the schema to posts: an updated date is accepted, a published: key is not', () => {
   const root = makeRoot();
   write(root, `_posts/${PAST}-revised.md`, validArticle({ updated: todayUtc() }));
-  expectExit(cli(root, 'check', `_posts/${PAST}-revised.md`), 0);
+  expectExit(checkRoot(root, `_posts/${PAST}-revised.md`), 0);
 
   write(root, `_posts/${PAST}-hidden.md`, validArticle({ extra: 'published: false' }));
-  const hidden = cli(root, 'check', `_posts/${PAST}-hidden.md`);
+  const hidden = checkRoot(root, `_posts/${PAST}-hidden.md`);
   expectExit(hidden, 1);
   assert.match(hidden.stderr, /published/);
 });
@@ -521,7 +859,7 @@ test('[AC-03][F-017] check reports a stray } in the tags list as a front-matter 
     await t.test(`[AC-03][F-017] check refuses tags: [${tags.join(', ')}]`, () => {
       const root = makeRoot();
       write(root, '_drafts/brace-tags.md', validArticle({ tags }));
-      const result = cli(root, 'check', '_drafts/brace-tags.md');
+      const result = checkRoot(root, '_drafts/brace-tags.md');
       expectExit(result, 1);
       assert.match(result.stderr, /_drafts\/brace-tags\.md: front matter line 4: unexpected "\}" in a flow list/);
       assert.doesNotMatch(result.out, /TypeError|\n\s+at /, 'no exception or stack trace');
@@ -542,7 +880,7 @@ test('[AC-03][F-017] check refuses bare tags YAML reads as null, a boolean, a nu
     await t.test(`[AC-03][F-017] check refuses the bare tag ${tag}`, () => {
       const root = makeRoot();
       write(root, '_drafts/typed-tag.md', validArticle({ tags: ['testing', tag] }));
-      const result = cli(root, 'check', '_drafts/typed-tag.md');
+      const result = checkRoot(root, '_drafts/typed-tag.md');
       expectExit(result, 1);
       const message = `front matter line 4: bare ${tag} in a flow list is read by YAML as ${kind}, not text; write "${tag}"`;
       assert.match(result.stderr, new RegExp(escapeRegExp(message)));
@@ -558,7 +896,7 @@ test('[AC-03][F-017] check refuses bare tags YAML reads as null, a boolean, a nu
     await t.test(`[AC-03][F-017] check accepts tags: [${tags.join(', ')}]`, () => {
       const root = makeRoot();
       write(root, '_drafts/text-tags.md', validArticle({ tags }));
-      expectExit(cli(root, 'check', '_drafts/text-tags.md'), 0);
+      expectExit(checkRoot(root, '_drafts/text-tags.md'), 0);
     });
   }
 });
@@ -567,14 +905,14 @@ test('[AC-03][F-017] check warns about unwrapped Liquid inside code without fail
   const root = makeRoot();
   const fence = ['```yaml', 'image: {{ x }}', '```'].join('\n');
   write(root, '_drafts/code-warn.md', validArticle({ body: `A Helm values file:\n\n${fence}` }));
-  const unwrapped = cli(root, 'check', '_drafts/code-warn.md');
+  const unwrapped = checkRoot(root, '_drafts/code-warn.md');
   expectExit(unwrapped, 0);
   assert.notEqual(unwrapped.stderr.trim(), '', 'a warning is printed');
   assert.match(unwrapped.stderr, /raw|liquid/i);
 
   write(root, '_drafts/code-wrapped.md',
     validArticle({ body: `A Helm values file:\n\n{% raw %}\n${fence}\n{% endraw %}` }));
-  const wrapped = cli(root, 'check', '_drafts/code-wrapped.md');
+  const wrapped = checkRoot(root, '_drafts/code-wrapped.md');
   expectExit(wrapped, 0);
   assert.doesNotMatch(wrapped.stderr, /raw|liquid/i, 'no warning once the code is wrapped');
 });
@@ -587,14 +925,14 @@ test('[AC-03][F-017] check warns about unwrapped Liquid in an inline code span t
   write(root, '_drafts/span-warn.md', text);
   const line = text.split('\n').findIndex((t) => t.includes('.Values.image')) + 1;
   assert.ok(line > 0);
-  const unwrapped = cli(root, 'check', '_drafts/span-warn.md');
+  const unwrapped = checkRoot(root, '_drafts/span-warn.md');
   expectExit(unwrapped, 0);
   assert.match(unwrapped.stderr, /raw|liquid/i);
   assert.match(unwrapped.stderr, new RegExp(`span-warn\\.md:${line}\\b`), `the warning names line ${line}`);
 
   write(root, '_drafts/span-wrapped.md',
     validArticle({ body: `A Helm values file:\n\n{% raw %}${span}{% endraw %}` }));
-  const wrapped = cli(root, 'check', '_drafts/span-wrapped.md');
+  const wrapped = checkRoot(root, '_drafts/span-wrapped.md');
   expectExit(wrapped, 0);
   assert.doesNotMatch(wrapped.stderr, /raw|liquid/i, 'no warning once the span is wrapped');
 });
@@ -602,18 +940,18 @@ test('[AC-03][F-017] check warns about unwrapped Liquid in an inline code span t
 test('[AC-03][F-017] check rejects unsafe markup in prose but not the same markup shown as code', () => {
   const root = makeRoot();
   write(root, '_drafts/prose-script.md', validArticle({ body: 'Intro.\n\n<script>alert(1)</script>' }));
-  const script = cli(root, 'check', '_drafts/prose-script.md');
+  const script = checkRoot(root, '_drafts/prose-script.md');
   expectExit(script, 1);
   assert.match(script.stderr, /unsafe markup[^\n]*<script>/);
 
   write(root, '_drafts/prose-handler.md', validArticle({ body: 'Intro.\n\n<img src="/x.png" onerror="alert(1)">' }));
-  const handler = cli(root, 'check', '_drafts/prose-handler.md');
+  const handler = checkRoot(root, '_drafts/prose-handler.md');
   expectExit(handler, 1);
   assert.match(handler.stderr, /unsafe markup[^\n]*onerror/, 'the event handler itself is reported');
 
   write(root, '_drafts/code-script.md',
     validArticle({ body: 'This is what not to write:\n\n```html\n<script>alert(1)</script>\n```' }));
-  expectExit(cli(root, 'check', '_drafts/code-script.md'), 0);
+  expectExit(checkRoot(root, '_drafts/code-script.md'), 0);
 });
 
 test('[AC-03][F-017] check reports every line of a multi-line tag that holds an event handler or a javascript: URL', async (t) => {
@@ -636,7 +974,7 @@ test('[AC-03][F-017] check reports every line of a multi-line tag that holds an 
       const root = makeRoot();
       const text = validArticle({ body });
       write(root, `_drafts/${slug}.md`, text);
-      const result = cli(root, 'check', `_drafts/${slug}.md`);
+      const result = checkRoot(root, `_drafts/${slug}.md`);
       expectExit(result, 1);
       for (const mark of marks) {
         const line = text.split('\n').findIndex((l) => l.includes(mark)) + 1;
@@ -683,7 +1021,7 @@ test('[AC-03][F-017] check rejects external, data:, alt-less and missing images 
       const root = makeRoot();
       if (file) write(root, `assets/drafts/${slug}/figure.png`, PNG);
       write(root, `_drafts/${slug}.md`, validArticle({ body: `Figure:\n\n${body(slug)}` }));
-      const result = cli(root, 'check', `_drafts/${slug}.md`);
+      const result = checkRoot(root, `_drafts/${slug}.md`);
       expectExit(result, 1);
       assert.match(result.stderr, message);
     });
@@ -693,7 +1031,7 @@ test('[AC-03][F-017] check rejects external, data:, alt-less and missing images 
     write(root, 'assets/drafts/img-ok/figure.png', PNG);
     write(root, '_drafts/img-ok.md',
       validArticle({ body: `Figure:\n\n![A labelled figure](${image('img-ok', 'figure.png')})` }));
-    expectExit(cli(root, 'check', '_drafts/img-ok.md'), 0);
+    expectExit(checkRoot(root, '_drafts/img-ok.md'), 0);
   });
 });
 
@@ -801,7 +1139,7 @@ test('[AC-03][F-017] check validates the image source kramdown renders, not a di
       const root = makeRoot();
       write(root, `assets/drafts/${slug}/figure.png`, PNG);
       write(root, `_drafts/${slug}.md`, validArticle({ body: `Figure:\n\n${body(slug)}` }));
-      const result = cli(root, 'check', `_drafts/${slug}.md`);
+      const result = checkRoot(root, `_drafts/${slug}.md`);
       if (message === undefined) {
         expectExit(result, 0);
       } else {
@@ -824,7 +1162,7 @@ test('[AC-03][F-017] check refuses a pile-up of unclosed <img> tags too large to
   const root = makeRoot();
   // Every start ends at the same `>`; reading each one whole would take quadratic time.
   write(root, '_drafts/img-pileup.md', validArticle({ body: `Figure:\n\n${'<img '.repeat(2000)}>` }));
-  const result = cli(root, 'check', '_drafts/img-pileup.md');
+  const result = checkRoot(root, '_drafts/img-pileup.md');
   expectExit(result, 1);
   assert.match(result.stderr, /too many overlapping <img> tags to check/);
 });
@@ -980,12 +1318,30 @@ test('[AC-03][F-017] unpublish moves the post and its images back to the drafts 
   expectExit(cli(root, 'check', '_drafts/pic.md'), 0);
 });
 
+/** `cli(root, 'unpublish', slug)` for a refusal, asserting that it moved, wrote and removed nothing in the root. */
+function unpublishRefused(root, slug) {
+  return unchangedBy(() => treeSnapshot(root), () => cli(root, 'unpublish', slug), `the root ${root}`);
+}
+
+/**
+ * Asserts that a post from `writePostWithImage` was unpublished: the draft is
+ * the post with only its image path rewritten, the image arrived in
+ * `assets/drafts/<slug>/`, and neither the post nor its published image folder is left.
+ */
+function assertUnpublishedWithImage(root, slug, { rel, text }) {
+  assert.equal(read(root, `_drafts/${slug}.md`), text.split(`/assets/blog/${slug}/`).join(`/assets/drafts/${slug}/`),
+    'the draft is the post with only its image path rewritten');
+  assert.deepEqual(fs.readFileSync(abs(root, `assets/drafts/${slug}/figure.png`)), PNG,
+    'the image arrived intact in assets/drafts/');
+  assert.equal(exists(root, rel), false, 'the post is gone');
+  assert.equal(exists(root, `assets/blog/${slug}`), false, 'the published image folder is gone');
+}
+
 test('[AC-03][F-017] unpublish refuses while a post_url names the post, and succeeds once the reference is gone', () => {
   const root = makeRoot();
-  const targetRel = `_posts/${PAST}-target.md`;
+  const target = writePostWithImage(root, 'target');
   const referrerName = `${PAST}-referrer.md`;
   const referrerRel = `_posts/${referrerName}`;
-  write(root, targetRel, validArticle({ title: 'The target' }));
   const referrerText = validArticle({
     title: 'The referrer',
     body: `Background first.\n\nRead [the target]({{ site.baseurl }}{% post_url ${PAST}-target %}) next.`,
@@ -994,24 +1350,20 @@ test('[AC-03][F-017] unpublish refuses while a post_url names the post, and succ
   const line = referrerText.split('\n').findIndex((text) => text.includes('post_url')) + 1;
   assert.ok(line > 0);
 
-  const refused = cli(root, 'unpublish', 'target');
+  const refused = unpublishRefused(root, 'target');
   expectExit(refused, 1);
   assert.match(refused.stderr, new RegExp(`${escapeRegExp(referrerName)}[^\\n]*\\b${line}\\b`),
     `the refusal names ${referrerName} and line ${line}`);
-  assert.ok(exists(root, targetRel), 'the post stays in _posts/');
-  assert.equal(exists(root, '_drafts/target.md'), false, 'no draft is written');
+  assertStillPost(root, 'target', target);
 
   write(root, referrerRel, validArticle({ title: 'The referrer', body: 'No links to the target any more.' }));
   expectExit(cli(root, 'unpublish', 'target'), 0);
-  assert.ok(exists(root, '_drafts/target.md'), 'the post is back in _drafts/');
-  assert.equal(exists(root, targetRel), false);
+  assertUnpublishedWithImage(root, 'target', target);
 });
 
 test('[AC-03][F-017] unpublish refuses while a post_url and an ordinary link name the post, and succeeds once both are gone', () => {
   const root = makeRoot();
-  const targetRel = `_posts/${PAST}-target.md`;
-  const targetText = validArticle({ title: 'The target' });
-  write(root, targetRel, targetText);
+  const target = writePostWithImage(root, 'target');
   const taggedRel = `_posts/${PAST}-tagged.md`;
   const taggedText = validArticle({
     title: 'Tagged referrer',
@@ -1027,13 +1379,13 @@ test('[AC-03][F-017] unpublish refuses while a post_url and an ordinary link nam
   const lineOf = (text, needle) => text.split('\n').findIndex((line) => line.includes(needle)) + 1;
   const taggedAt = new RegExp(`${escapeRegExp(taggedRel)}:${lineOf(taggedText, 'post_url')}: `);
   const linkedAt = new RegExp(`${escapeRegExp(linkedRel)}:${lineOf(linkedText, '/blog/target/')}: `);
-  /** Asserts that nothing moved: the post is unchanged and no draft exists. */
+  /** Asserts that nothing moved: the post and its image are unchanged and no draft exists. */
   const unmoved = () => {
-    assert.equal(read(root, targetRel), targetText, 'the post stays in _posts/ unchanged');
+    assertStillPost(root, 'target', target);
     assert.equal(exists(root, '_drafts'), false, 'nothing is moved to _drafts/');
   };
 
-  const both = cli(root, 'unpublish', 'target');
+  const both = unpublishRefused(root, 'target');
   expectExit(both, 1);
   assert.match(both.stderr, /2 references/);
   assert.match(both.stderr, taggedAt, 'the post_url reference is named with its file and line');
@@ -1041,7 +1393,7 @@ test('[AC-03][F-017] unpublish refuses while a post_url and an ordinary link nam
   unmoved();
 
   write(root, linkedRel, validArticle({ title: 'Linked referrer', body: 'No link to the target any more.' }));
-  const one = cli(root, 'unpublish', 'target');
+  const one = unpublishRefused(root, 'target');
   expectExit(one, 1);
   assert.match(one.stderr, taggedAt, 'the remaining post_url still refuses');
   assert.doesNotMatch(one.stderr, new RegExp(escapeRegExp(linkedRel)), 'the removed link is no longer listed');
@@ -1049,8 +1401,7 @@ test('[AC-03][F-017] unpublish refuses while a post_url and an ordinary link nam
 
   write(root, taggedRel, validArticle({ title: 'Tagged referrer', body: 'No tag for the target any more.' }));
   expectExit(cli(root, 'unpublish', 'target'), 0);
-  assert.equal(read(root, '_drafts/target.md'), targetText, 'the draft is the post unchanged');
-  assert.equal(exists(root, targetRel), false, 'the post is gone');
+  assertUnpublishedWithImage(root, 'target', target);
 });
 
 test('[AC-03][F-017] unpublish refuses while a post_url or link tag written with whitespace control names the post', async (t) => {
@@ -1064,10 +1415,8 @@ test('[AC-03][F-017] unpublish refuses while a post_url or link tag written with
   for (const form of forms) {
     await t.test(`[AC-03][F-017] unpublish refuses a reference written as ${form}`, () => {
       const root = makeRoot();
-      const targetRel = `_posts/${PAST}-target.md`;
+      const target = writePostWithImage(root, 'target');
       const referrerName = `${PAST}-referrer.md`;
-      const targetText = validArticle({ title: 'The target' });
-      write(root, targetRel, targetText);
       const referrerText = validArticle({
         title: 'The referrer',
         body: `Background first.\n\nRead [the target]({{ site.baseurl }}${form}) next.`,
@@ -1076,11 +1425,11 @@ test('[AC-03][F-017] unpublish refuses while a post_url or link tag written with
       const line = referrerText.split('\n').findIndex((text) => text.includes(form)) + 1;
       assert.ok(line > 0);
 
-      const result = cli(root, 'unpublish', 'target');
+      const result = unpublishRefused(root, 'target');
       expectExit(result, 1);
       assert.match(result.stderr, new RegExp(`${escapeRegExp(referrerName)}[^\\n]*\\b${line}\\b`),
         `the refusal names ${referrerName} and line ${line}`);
-      assert.equal(read(root, targetRel), targetText, 'the post stays in _posts/ unchanged');
+      assertStillPost(root, 'target', target);
       assert.equal(exists(root, '_drafts'), false, 'nothing is moved to _drafts/');
     });
   }
@@ -1098,16 +1447,14 @@ test('[AC-03][F-017] unpublish refuses while another article links to the post i
   for (const form of forms) {
     await t.test(`[AC-03][F-017] unpublish refuses a link written as ${form}`, () => {
       const root = makeRoot();
-      const targetRel = `_posts/${PAST}-target.md`;
+      const target = writePostWithImage(root, 'target');
       const referrerRel = `_posts/${PAST}-referrer.md`;
-      const targetText = validArticle({ title: 'The target' });
-      write(root, targetRel, targetText);
       write(root, referrerRel, validArticle({ title: 'The referrer', body: `See [the target article](${form}).` }));
 
-      const result = cli(root, 'unpublish', 'target');
+      const result = unpublishRefused(root, 'target');
       expectExit(result, 1);
       assert.match(result.stderr, new RegExp(escapeRegExp(referrerRel)), 'the refusal names the referring file');
-      assert.equal(read(root, targetRel), targetText, 'the post stays in _posts/ unchanged');
+      assertStillPost(root, 'target', target);
       assert.equal(exists(root, '_drafts'), false, 'nothing is moved to _drafts/');
     });
   }
@@ -1493,17 +1840,24 @@ test('[AC-03][F-017] a per-slug lock serializes new, publish and unpublish, and 
     write(root, '_drafts/race.md', validArticle({ title: 'Race' }));
     const out = path.join(root, '..', `${path.basename(root)}-competitor.json`);
     const tomorrow = new Date(Date.now() + 86400000).toISOString();
+    const competitorArgv = [ARTICLE_MJS, 'publish', 'race', '--root', root];
     const first = cliWithFaults(root, [{
       fn: 'openSync',
       path: '_posts/',
       action: 'run-tool',
-      argv: [ARTICLE_MJS, 'publish', 'race', '--root', root],
+      argv: competitorArgv,
       cwd: root,
       env: { ARTICLE_FAKE_NOW: tomorrow },
       out,
     }], 'publish', 'race');
+    assert.ok(fs.existsSync(out), `the competing run was started while the first one ran:\n${first.out}`);
     const competitor = JSON.parse(fs.readFileSync(out, 'utf8'));
-    assert.equal(competitor.status, 1, `the competing run is refused:\n${competitor.stderr}`);
+    assert.deepEqual(
+      { status: competitor.status, signal: competitor.signal, error: competitor.error },
+      { status: 1, signal: null, error: null },
+      `the competing run ran to completion and is refused:\n${
+        describeSpawn(process.execPath, ['--import', FAULT_PRELOAD_URL, ...competitorArgv], root, competitor)}`,
+    );
     assert.match(competitor.stderr,
       new RegExp(`another article\\.mjs run \\(process \\d+ on ${escapeRegExp(os.hostname())}\\) is changing slug race`));
     expectExit(first, 0);
@@ -1516,8 +1870,7 @@ test('[AC-03][F-017] a per-slug lock serializes new, publish and unpublish, and 
   await t.test('[AC-03][F-017] a lock left by a process that no longer runs is replaced', () => {
     const root = makeRoot();
     write(root, '_drafts/stale.md', validArticle({ title: 'Stale lock' }));
-    const gone = spawnSync(process.execPath, ['-e', ''], { encoding: 'utf8' });
-    assert.equal(gone.status, 0);
+    const gone = spawnOk(process.execPath, ['-e', '']);
     write(root, lockRel('stale'), `${gone.pid} ${os.hostname()}\n`);
     const result = cli(root, 'publish', 'stale');
     expectExit(result, 0);
@@ -1566,12 +1919,8 @@ test('[AC-03][F-017] the next steps start with a quoted cd to --root when the to
   write(root, '_templates/article.md', fs.readFileSync(TEMPLATE));
   const fromBase = (...args) => run([...args, '--root', root], { cwd: base });
   const cdLines = (result) => result.stdout.split('\n').filter((line) => line.startsWith('  cd '));
-  /** The folder a printed `cd` line lands in when pasted into a POSIX shell. */
-  const landsIn = (line) => {
-    const shell = spawnSync('sh', ['-c', `${line} && pwd -P`], { encoding: 'utf8', timeout: 30000 });
-    if (shell.error) throw shell.error;
-    return shell.stdout.trim();
-  };
+  /** The folder a printed `cd` line lands in when pasted into a POSIX shell, which must succeed. */
+  const landsIn = (line) => spawnOk('sh', ['-c', `${line} && pwd -P`]).stdout.trim();
 
   const created = fromBase('new', 'away');
   expectExit(created, 0);
@@ -1620,6 +1969,10 @@ function stageHookWithoutExecBit(repo) {
 }
 
 test('[AC-03][F-017] guard --staged refuses every tracked-content and article rule break, naming the path', GIT_CASE, async (t) => {
+  // One clock read names the future post wherever it is used, so a run that
+  // crosses UTC midnight still expects the file it wrote; two days ahead it is
+  // still in the future then.
+  const futureRel = `_posts/${addDaysUtc(2)}-future.md`;
   const cases = [
     {
       name: 'a draft added with git add -f',
@@ -1648,10 +2001,10 @@ test('[AC-03][F-017] guard --staged refuses every tracked-content and article ru
     },
     {
       name: 'a future-dated post',
-      offender: `_posts/${addDaysUtc(2)}-future.md`,
+      offender: futureRel,
       setup(repo) {
-        write(repo, `_posts/${addDaysUtc(2)}-future.md`, validArticle());
-        git(repo, 'add', '_posts');
+        write(repo, futureRel, validArticle());
+        git(repo, 'add', futureRel);
       },
     },
     {
@@ -1697,7 +2050,7 @@ test('[AC-03][F-017] guard --staged refuses every tracked-content and article ru
     await t.test(`[AC-03][F-017] guard --staged refuses ${name}`, GIT_CASE, () => {
       const repo = makeRepo();
       setup(repo);
-      const result = guardStaged(repo);
+      const result = guardStagedUnchanged(repo);
       expectExit(result, 1);
       assert.ok(result.stderr.includes(offender), `stderr names ${offender}:\n${result.stderr}`);
       if (message) assert.match(result.stderr, message);
@@ -1731,12 +2084,128 @@ test('[AC-03][F-017] guard --staged accepts a hook once its index mode is 100755
   expectExit(guardStaged(repo), 0);
 });
 
+test('[AC-03][F-017] guard --staged judges the index, not the working tree: article text, image existence and image folders', GIT_CASE, async (t) => {
+  const postRel = `_posts/${PAST}-diverge.md`;
+  const imageRel = 'assets/blog/diverge/fig.png';
+  const SCRIPT = '<script>alert(1)</script>';
+  const unsafeText = validArticle({ body: `Intro.\n\n${SCRIPT}` });
+  const safeText = validArticle({ body: 'Plain text with nothing to refuse.' });
+  const figureText = validArticle({ body: "![Figure]({{ '/assets/blog/diverge/fig.png' | relative_url }})" });
+  const lineOf = (text, needle) => text.split('\n').findIndex((line) => line.includes(needle)) + 1;
+  const orphan = 'assets/blog/diverge/: image folder has no matching _posts/*-diverge.md';
+  /** The text of a path as staged: its index blob, not the working-tree file. */
+  const stagedText = (repo, rel) => gitQuiet(repo, 'show', `:${rel}`);
+  /** The path as `git ls-files` lists it: the path when it is in the index, '' when it is not. */
+  const indexed = (repo, rel) => gitQuiet(repo, 'ls-files', '--', rel).trim();
+  /** Asserts a refusal reporting exactly the `messages`, each as one `error: ` line, and nothing on stdout. */
+  const refused = (result, messages) => {
+    expectExit(result, 1);
+    assert.deepEqual(result.stderr.split('\n').filter((line) => line.startsWith('error: ')),
+      messages.map((message) => `error: ${message}`), `stderr:\n${result.stderr}`);
+    assert.match(result.stderr, new RegExp(`guard: commit refused \\(${messages.length} problems?\\)`));
+    assert.equal(result.stdout, '');
+  };
+  /** Asserts an acceptance whose only output is the `line` on stdout. */
+  const accepted = (result, line) => {
+    expectExit(result, 0);
+    assert.equal(result.stdout, `${line}\n`);
+    assert.equal(result.stderr, '');
+  };
+
+  await t.test('[AC-03][F-017] guard --staged refuses unsafe staged text that is repaired only in the working tree', GIT_CASE, () => {
+    const repo = makeRepo();
+    write(repo, postRel, unsafeText);
+    git(repo, 'add', postRel);
+    write(repo, postRel, safeText);
+    assert.equal(stagedText(repo, postRel), unsafeText, 'the index holds the unsafe text');
+
+    refused(guardStagedUnchanged(repo), [`${postRel}:${lineOf(unsafeText, SCRIPT)}: unsafe markup: ${SCRIPT}`]);
+    assert.equal(stagedText(repo, postRel), unsafeText, 'the staged blob is unchanged');
+    assert.equal(read(repo, postRel), safeText, 'the working-tree repair is unchanged');
+  });
+
+  await t.test('[AC-03][F-017] guard --staged accepts valid staged text whose working-tree copy has an unsafe edit', GIT_CASE, () => {
+    const repo = makeRepo();
+    write(repo, postRel, safeText);
+    git(repo, 'add', postRel);
+    write(repo, postRel, unsafeText);
+    assert.equal(stagedText(repo, postRel), safeText, 'the index holds the valid text');
+
+    accepted(guardStagedUnchanged(repo), 'guard: staged tree ok (1 changed article checked)');
+    assert.equal(stagedText(repo, postRel), safeText, 'the staged blob is unchanged');
+    assert.equal(read(repo, postRel), unsafeText, 'the unstaged edit is unchanged');
+  });
+
+  await t.test('[AC-03][F-017] guard --staged refuses a staged post whose image exists only in the working tree', GIT_CASE, () => {
+    const repo = makeRepo();
+    write(repo, postRel, figureText);
+    write(repo, imageRel, PNG);
+    git(repo, 'add', postRel);
+    assert.equal(indexed(repo, imageRel), '', 'the image is untracked');
+
+    refused(guardStagedUnchanged(repo),
+      [`${postRel}:${lineOf(figureText, 'fig.png')}: image /${imageRel} does not exist`]);
+    assert.equal(indexed(repo, imageRel), '', 'the image is still untracked');
+    assert.deepEqual(fs.readFileSync(abs(repo, imageRel)), PNG, 'the image file is unchanged');
+  });
+
+  await t.test('[AC-03][F-017] guard --staged accepts a staged post and image after the image is deleted from the working tree only', GIT_CASE, () => {
+    const repo = makeRepo();
+    write(repo, postRel, figureText);
+    write(repo, imageRel, PNG);
+    git(repo, 'add', postRel, imageRel);
+    fs.rmSync(abs(repo, imageRel));
+
+    accepted(guardStagedUnchanged(repo), 'guard: staged tree ok (1 changed article checked)');
+    assert.equal(indexed(repo, imageRel), imageRel, 'the image is still staged');
+    assert.equal(exists(repo, imageRel), false, 'the image is still absent from the working tree');
+  });
+
+  await t.test('[AC-03][F-017] guard --staged refuses a staged image whose post exists only in the working tree, untracked', GIT_CASE, () => {
+    const repo = makeRepo();
+    write(repo, postRel, figureText);
+    write(repo, imageRel, PNG);
+    git(repo, 'add', imageRel);
+    assert.equal(indexed(repo, postRel), '', 'the post is untracked');
+
+    refused(guardStagedUnchanged(repo), [orphan]);
+    assert.equal(indexed(repo, postRel), '', 'the post is still untracked');
+    assert.equal(read(repo, postRel), figureText, 'the post file is unchanged');
+  });
+
+  await t.test('[AC-03][F-017] guard --staged refuses a post removed from the index with git rm --cached and kept on disk', GIT_CASE, () => {
+    const repo = makeRepo();
+    write(repo, postRel, figureText);
+    write(repo, imageRel, PNG);
+    git(repo, 'add', postRel, imageRel);
+    commit(repo, 'Publish: diverge');
+    git(repo, 'rm', '-q', '--cached', postRel);
+
+    refused(guardStagedUnchanged(repo), [orphan]);
+    assert.equal(indexed(repo, postRel), '', 'the post is still out of the index');
+    assert.equal(read(repo, postRel), figureText, 'the post file is unchanged');
+  });
+
+  await t.test('[AC-03][F-017] guard --staged accepts a committed post and image after the post is deleted from the working tree only', GIT_CASE, () => {
+    const repo = makeRepo();
+    write(repo, postRel, figureText);
+    write(repo, imageRel, PNG);
+    git(repo, 'add', postRel, imageRel);
+    commit(repo, 'Publish: diverge');
+    fs.rmSync(abs(repo, postRel));
+
+    accepted(guardStagedUnchanged(repo), 'guard: staged tree ok (0 changed articles checked)');
+    assert.equal(stagedText(repo, postRel), figureText, 'the post is still in the index');
+    assert.equal(exists(repo, postRel), false, 'the post is still absent from the working tree');
+  });
+});
+
 /* ------------------------------------------------------------------------ */
 /* guard --pre-push                                                          */
 /* ------------------------------------------------------------------------ */
 
 test('[AC-03][F-017] guard --pre-push refuses a range in which one commit adds a draft and a later one deletes it', GIT_CASE, () => {
-  const { repo } = makeRemoteRepo();
+  const { repo, remote } = makeRemoteRepo();
   const remoteSha = git(repo, 'rev-parse', 'HEAD');
   write(repo, '_drafts/leak.md', validArticle({ title: 'Not for publication yet' }));
   git(repo, 'add', '-f', '_drafts/leak.md');
@@ -1746,7 +2215,7 @@ test('[AC-03][F-017] guard --pre-push refuses a range in which one commit adds a
   assert.equal(git(repo, 'ls-tree', '-r', '--name-only', 'HEAD').includes('_drafts/'), false,
     'the tip itself holds no draft, so only a check of every commit catches it');
 
-  const result = prePush(repo, 'refs/heads/main', 'refs/heads/main', remoteSha);
+  const result = prePushUnchanged({ repo, remote }, 'refs/heads/main', 'refs/heads/main', remoteSha);
   expectExit(result, 1);
   assert.match(result.stderr, /_drafts\/leak\.md/);
 });
@@ -1755,7 +2224,7 @@ test('[AC-03][F-017] guard --pre-push refuses a commit that deletes a post but l
   const postRel = `_posts/${PAST}-gone.md`;
   /** A pushed post with an image, then a local commit that deletes only the post. */
   const orphanedRepo = () => {
-    const { repo } = makeRemoteRepo((r) => {
+    const { repo, remote } = makeRemoteRepo((r) => {
       write(r, postRel, validArticle({ body: "![Figure]({{ '/assets/blog/gone/fig.png' | relative_url }})" }));
       write(r, 'assets/blog/gone/fig.png', PNG);
       git(r, 'add', postRel, 'assets/blog/gone/fig.png');
@@ -1764,12 +2233,12 @@ test('[AC-03][F-017] guard --pre-push refuses a commit that deletes a post but l
     const remoteSha = git(repo, 'rev-parse', 'HEAD');
     git(repo, 'rm', '-q', postRel);
     commit(repo, 'Delete the post only');
-    return { repo, remoteSha };
+    return { repo, remote, remoteSha };
   };
 
   await t.test('[AC-03][F-017] guard --pre-push refuses when the folder is still orphaned at the tip', GIT_CASE, () => {
-    const { repo, remoteSha } = orphanedRepo();
-    const result = prePush(repo, 'refs/heads/main', 'refs/heads/main', remoteSha);
+    const { repo, remote, remoteSha } = orphanedRepo();
+    const result = prePushUnchanged({ repo, remote }, 'refs/heads/main', 'refs/heads/main', remoteSha);
     expectExit(result, 1);
     assert.match(result.stderr, /assets\/blog\/gone/);
   });
@@ -1777,23 +2246,23 @@ test('[AC-03][F-017] guard --pre-push refuses a commit that deletes a post but l
   // Every pushed commit is published, so a later commit that removes the
   // folder does not make the orphaning commit acceptable.
   await t.test('[AC-03][F-017] guard --pre-push refuses even when a later commit in the range removes the folder', GIT_CASE, () => {
-    const { repo, remoteSha } = orphanedRepo();
+    const { repo, remote, remoteSha } = orphanedRepo();
     git(repo, 'rm', '-q', '-r', 'assets/blog/gone');
     commit(repo, 'Delete the images too');
-    const result = prePush(repo, 'refs/heads/main', 'refs/heads/main', remoteSha);
+    const result = prePushUnchanged({ repo, remote }, 'refs/heads/main', 'refs/heads/main', remoteSha);
     expectExit(result, 1);
     assert.match(result.stderr, /assets\/blog\/gone/);
   });
 });
 
 test('[AC-03][F-017] guard --pre-push checks a new branch against what the remote already holds', GIT_CASE, () => {
-  const { repo } = makeRemoteRepo();
+  const { repo, remote } = makeRemoteRepo();
   git(repo, 'checkout', '-q', '-b', 'feature');
   write(repo, '_drafts/branch.md', validArticle());
   git(repo, 'add', '-f', '_drafts/branch.md');
   commit(repo, 'Draft on a branch');
 
-  const result = prePush(repo, 'refs/heads/feature', 'refs/heads/feature', '0'.repeat(40));
+  const result = prePushUnchanged({ repo, remote }, 'refs/heads/feature', 'refs/heads/feature', '0'.repeat(40));
   expectExit(result, 1);
   assert.match(result.stderr, /_drafts\/branch\.md/);
 });
@@ -1811,12 +2280,75 @@ test('[AC-03][F-017] guard --pre-push accepts a valid post', GIT_CASE, () => {
   assert.match(result.stdout, /\b1 commit\b/, 'exactly the one new commit is checked');
 });
 
+test('[AC-03][F-017] guard --pre-push accepts an empty push, checking no commit, and changes nothing', GIT_CASE, async (t) => {
+  const ZERO = '0'.repeat(40);
+  /** Commits a draft added with `git add -f`, which guard refuses in any commit it inspects. */
+  const commitDraft = (repo) => {
+    write(repo, '_drafts/held.md', validArticle({ title: 'Not for publication' }));
+    git(repo, 'add', '-f', '_drafts/held.md');
+    commit(repo, 'Add a draft by mistake');
+  };
+  /** Runs guard --pre-push with `input` on stdin, asserting that it left the repository and its remote unchanged. */
+  const pushGuard = ({ repo, remote }, input) => unchangedBy(
+    () => ({ repo: repoSnapshot(repo), remote: remoteSnapshot(remote) }),
+    () => run(['guard', '--pre-push'], { cwd: repo, input }),
+    'the repository and its remote',
+  );
+  /** Asserts that guard refuses the draft commit once a ref line actually pushes it: the control for each case. */
+  const refusesWhenPushed = (repos, localSha, remoteSha) => {
+    const control = pushGuard(repos, `refs/heads/main ${localSha} refs/heads/main ${remoteSha}\n`);
+    expectExit(control, 1);
+    assert.match(control.stderr, /_drafts\/held\.md/, 'the draft commit is refused when it is in the range');
+  };
+
+  await t.test('[AC-03][F-017] guard --pre-push checks 0 commits when the local and remote SHAs are equal', GIT_CASE, () => {
+    const repos = makeRemoteRepo(commitDraft);
+    const tip = git(repos.repo, 'rev-parse', 'HEAD');
+    assert.equal(git(repos.remote, 'rev-parse', 'refs/heads/main'), tip, 'the remote already holds the tip');
+
+    const result = pushGuard(repos, `refs/heads/main ${tip} refs/heads/main ${tip}\n`);
+    expectExit(result, 0);
+    assert.equal(result.stdout, 'guard: ok (0 commits checked)\n');
+    assert.equal(result.stderr, '');
+    refusesWhenPushed(repos, tip, git(repos.repo, 'rev-parse', 'HEAD~1'));
+  });
+
+  for (const input of ['', '\n']) {
+    await t.test(`[AC-03][F-017] guard --pre-push given ${JSON.stringify(input)} on stdin checks nothing and prints nothing`, GIT_CASE, () => {
+      const repos = makeRemoteRepo();
+      const remoteSha = git(repos.repo, 'rev-parse', 'HEAD');
+      commitDraft(repos.repo);
+
+      const result = pushGuard(repos, input);
+      expectExit(result, 0);
+      assert.equal(result.stdout, '');
+      assert.equal(result.stderr, '');
+      refusesWhenPushed(repos, git(repos.repo, 'rev-parse', 'HEAD'), remoteSha);
+    });
+  }
+
+  await t.test('[AC-03][F-017] guard --pre-push checks 0 commits for a branch deletion', GIT_CASE, () => {
+    const repos = makeRemoteRepo();
+    const remoteSha = git(repos.repo, 'rev-parse', 'HEAD');
+    git(repos.repo, 'checkout', '-q', '-b', 'feature');
+    commitDraft(repos.repo);
+    git(repos.repo, 'push', '-q', '--no-verify', 'origin', 'feature');
+    const featureSha = git(repos.repo, 'rev-parse', 'HEAD');
+
+    const result = pushGuard(repos, `(delete) ${ZERO} refs/heads/feature ${featureSha}\n`);
+    expectExit(result, 0);
+    assert.equal(result.stdout, 'guard: ok (0 commits checked)\n');
+    assert.equal(result.stderr, '');
+    refusesWhenPushed(repos, featureSha, remoteSha);
+  });
+});
+
 /* ------------------------------------------------------------------------ */
 /* Article analyses reused by blob id                                        */
 /* ------------------------------------------------------------------------ */
 
 test('[AC-03][F-017] guard --pre-push checks a recurring article blob in every commit, refusing only the one lacking its image', GIT_CASE, () => {
-  const { repo } = makeRemoteRepo();
+  const { repo, remote } = makeRemoteRepo();
   const remoteSha = git(repo, 'rev-parse', 'HEAD');
   const postRel = `_posts/${PAST}-recurring.md`;
   const imageRel = 'assets/blog/recurring/fig.png';
@@ -1841,7 +2373,7 @@ test('[AC-03][F-017] guard --pre-push checks a recurring article blob in every c
   assert.equal(blobAt('HEAD~2'), blobAt('HEAD'), 'the restoring commit holds it too');
   assert.equal(blobAt('HEAD~3'), blobAt('HEAD~1'), 'the changed version recurs as well');
 
-  const result = prePush(repo, 'refs/heads/main', 'refs/heads/main', remoteSha);
+  const result = prePushUnchanged({ repo, remote }, 'refs/heads/main', 'refs/heads/main', remoteSha);
   expectExit(result, 1);
   const tip = git(repo, 'rev-parse', 'HEAD').slice(0, 7);
   const reported = result.stderr.split('\n').filter((line) => line.startsWith('error: '));
@@ -1919,8 +2451,7 @@ let realGitPath;
 /** Absolute path of the git on `ENV`'s PATH, resolved once, before any shim stands in front of it. */
 function realGit() {
   if (realGitPath === undefined) {
-    const result = spawnSync('sh', ['-c', 'command -v git'], { env: ENV, encoding: 'utf8', timeout: 30000 });
-    if (result.error) throw result.error;
+    const result = spawnOk('sh', ['-c', 'command -v git'], { env: ENV });
     const found = result.stdout.trim();
     assert.ok(path.isAbsolute(found), `command -v git found no git on PATH: ${JSON.stringify(result.stdout)}`);
     realGitPath = found;
@@ -1966,7 +2497,8 @@ test('[AC-03][F-017] guard --staged refuses (fail closed) when git is killed by 
   expectExit(guardStaged(repo), 0);
 
   const shim = gitShim('diff --cached');
-  const result = run(['guard', '--staged'], { cwd: repo, env: shim.env });
+  const result = unchangedBy(() => repoSnapshot(repo), () => run(['guard', '--staged'], { cwd: repo, env: shim.env }),
+    'the repository');
   expectExit(result, 1);
   assert.match(result.stderr, /git diff --cached [^\n]*failed: was killed by SIGKILL/,
     'the refusal names the git command and the signal');
@@ -1978,7 +2510,7 @@ test('[AC-03][F-017] guard --staged refuses (fail closed) when git is killed by 
 });
 
 test('[AC-03][F-017] guard --pre-push refuses (fail closed) when the probe for the remote tip is killed, without widening the range', SHIM_CASE, () => {
-  const { repo } = makeRemoteRepo();
+  const { repo, remote } = makeRemoteRepo();
   const remoteSha = git(repo, 'rev-parse', 'HEAD');
   const postRel = `_posts/${PAST}-pushed.md`;
   write(repo, postRel, validArticle({ title: 'Pushed article' }));
@@ -1988,11 +2520,15 @@ test('[AC-03][F-017] guard --pre-push refuses (fail closed) when the probe for t
 
   const shim = gitShim('cat-file -e');
   const localSha = git(repo, 'rev-parse', 'HEAD');
-  const result = run(['guard', '--pre-push'], {
-    cwd: repo,
-    env: shim.env,
-    input: `refs/heads/main ${localSha} refs/heads/main ${remoteSha}\n`,
-  });
+  const result = unchangedBy(
+    () => ({ repo: repoSnapshot(repo), remote: remoteSnapshot(remote) }),
+    () => run(['guard', '--pre-push'], {
+      cwd: repo,
+      env: shim.env,
+      input: `refs/heads/main ${localSha} refs/heads/main ${remoteSha}\n`,
+    }),
+    'the repository and its remote',
+  );
   expectExit(result, 1);
   assert.match(result.stderr,
     new RegExp(`git cat-file -e ${escapeRegExp(`${remoteSha}^{commit}`)} failed: was killed by SIGKILL`),
