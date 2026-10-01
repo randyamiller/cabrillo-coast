@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+{%- comment -%}
+  Base layout for every blog page. Nothing may render before the doctype: every built blog
+  page must start with it.
+
+  Applied by blog/index.html (layout: blog, search: true) and, through _layouts/post.html, by
+  every article in _posts/. blog/search.json uses layout: null and never reaches it. The home
+  page index.html has no front matter, so Jekyll copies it unchanged and never applies this.
+
+  Contracts checked by the built-page tests:
+    - The Content-Security-Policy meta tag directly follows the charset tag, with nothing in
+      between, because a meta policy governs only the markup after it. GitHub Pages allows no
+      custom response headers, so this tag is the blog's only content-security control, and
+      its value is fixed character for character.
+    - The only script elements are main.js on every page (mobile menu, header shadow, footer
+      year) and search.js where the page sets search: true. No inline script, event handler
+      attribute, style element or base element: the policy or the tests reject each of them.
+    - Every front-matter or configuration value printed into the markup passes through escape.
+    - Local URLs pass through relative_url, and canonical and og:url through absolute_url, so
+      links resolve on the custom domain (empty base path) and under a project path alike.
+      The base path and host are never written by hand.
+    - main holds only the page content and nothing that changes from build to build (the
+      footer year lives in the footer include), so the live main element can be compared
+      byte for byte with a local build of the same commit.
+    - A page without a title falls back to the site title, so no title renders empty.
+{%- endcomment %}
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% if page.title %}{{ page.title | escape }} — {% endif %}{{ site.title | escape }}</title>
+  {%- assign page_description = page.summary | default: page.description | default: site.description %}
+  <meta name="description" content="{{ page_description | escape }}">
+  <meta name="theme-color" content="#0d3b4f">
+  <link rel="canonical" href="{{ page.url | absolute_url }}">
+
+  <meta property="og:type" content="{% if page.collection == 'posts' %}article{% else %}website{% endif %}">
+  <meta property="og:url" content="{{ page.url | absolute_url }}">
+  <meta property="og:title" content="{{ page.title | default: site.title | escape }}">
+  <meta property="og:description" content="{{ page_description | escape }}">
+  <meta property="og:site_name" content="Cabrillo Coast LLC">
+  {%- if page.collection == 'posts' %}
+  <meta property="article:published_time" content="{{ page.date | date_to_xmlschema }}">
+  {%- if page.updated %}
+  <meta property="article:modified_time" content="{{ page.updated | date_to_xmlschema }}">
+  {%- endif %}
+  {%- endif %}
+
+  <link rel="icon" href="{{ '/favicon.svg' | relative_url }}" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600;700&display=swap">
+  <link rel="stylesheet" href="{{ '/styles.css' | relative_url }}">
+  <link rel="stylesheet" href="{{ '/blog/blog.css' | relative_url }}">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  {% include site-header.html %}
+
+  <main id="main">
+    {{ content }}
+  </main>
+
+  {% include site-footer.html %}
+
+  <script src="{{ '/main.js' | relative_url }}"></script>
+  {%- if page.search %}
+  <script src="{{ '/blog/search.js' | relative_url }}"></script>
+  {%- endif %}
+</body>
+</html>

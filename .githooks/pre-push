@@ -1,0 +1,12 @@
+#!/bin/sh
+# Refuses a push when any commit in the pushed range would publish drafts, draft images,
+# orphan article images, `published:` keys, or future-dated or invalid articles, including
+# content added and later deleted within the range. Enable once per clone with
+# `git config core.hooksPath .githooks`. `git push --no-verify` bypasses it, so it is a
+# safeguard, not a guarantee (see README "Publishing a technical article").
+cd "$(git rev-parse --show-toplevel)" || exit 1
+command -v node >/dev/null 2>&1 || { echo "pre-push: Node.js 22 or later is required to run scripts/article.mjs guard; push refused." >&2; exit 1; }
+[ -f scripts/article.mjs ] || { echo "pre-push: scripts/article.mjs not found; push refused." >&2; exit 1; }
+# git's ref lines reach guard on the inherited stdin, untouched. The remote name and URL
+# ($1, $2) are deliberately not passed: guard accepts no arguments and would exit 2.
+exec node scripts/article.mjs guard --pre-push
