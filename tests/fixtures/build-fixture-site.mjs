@@ -41,9 +41,20 @@
  *   empty-src/               `src/` without `_posts/`.
  *   empty/                   Zero-article build (launch state).
  *
- * Exit codes: 0 when all three variants are built, 1 for a copy or build
- * failure, 2 for a usage error. On failure `<outDir>` is left in place for
- * inspection; its owner removes it.
+ * Exit codes: 0 when all three variants are built; 1 for a copy or build
+ * failure, including a git, tar or Jekyll run that was killed, exceeded its
+ * deadline or could not be started; 2 for a usage error, including a
+ * `--ref` that git answers does not name a commit. On failure `<outDir>` is
+ * left in place for inspection; its owner removes it.
+ *
+ * Deadlines: every child runs under a deadline from `DEADLINES` in
+ * scripts/lib/subprocess.mjs (`gitQuery` for each git query, `gitArchive`,
+ * `tarExtract`, and `jekyllBuild` for each build) and is killed when it
+ * expires, so the builder stays synchronous yet never blocks its caller for
+ * longer than one deadline at a time. Only a git that exited by itself gives
+ * an answer: a killed or timed-out `rev-parse` is a failure, never an
+ * unresolvable `--ref`, and a failed path probe is a failure, never a path
+ * that is absent.
  *
  * Nothing here is published: `_config.yml` excludes `tests/`, and the
  * synthetic draft, its image and the future-dated post are written only into
@@ -51,14 +62,23 @@
  * `JEKYLL_ENV` removed: a local production build derives the wrong base path
  * (`/pages/randyamiller/cabrillo-coast`), so the project base path is passed
  * with `--baseurl` in place of the Pages API.
+ *
+ * Containment: everything the builder writes or removes lies below
+ * `<outDir>`. Staging copies symbolic links as links without following them,
+ * so before each write into the staged source and before the `assets/drafts/`
+ * removal, every existing folder on the way must be a real folder
+ * (`assertRealFolders`). A symlinked `_posts/` or `assets/` in the working tree
+ * or the revision stops the build with exit 1 instead of redirecting fixture
+ * files, synthetic content or that removal to wherever the link points.
  */
 
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
-import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
+
+import { DEADLINES, describeResult, runSync } from "../../scripts/lib/subprocess.mjs";
 
 /* ------------------------------------------------------------------------ */
 /* Public constants (imported by the built-output suites)                    */
@@ -185,47 +205,69 @@ function spawnErrorMessage(cmd, error) {
 
 /**
  * Runs a command with inherited output, printing it first. Arguments are
- * passed as an array and never through a shell.
+ * passed as an array and never through a shell. The command is killed when
+ * its deadline expires.
  * @param {string} cmd
  * @param {string[]} args
- * @param {import("node:child_process").SpawnSyncOptions} [options]
- * @throws {Error} exit code 1 when the command cannot start or exits non-zero.
+ * @param {{ cwd?: string, env?: NodeJS.ProcessEnv }} options
+ * @param {number} timeoutMs Deadline from `DEADLINES`.
+ * @throws {Error} exit code 1 when the command cannot start, is killed,
+ *   exceeds its deadline or exits non-zero.
  */
-function run(cmd, args, options = {}) {
-  console.log(`$ ${[cmd, ...args].join(" ")}`);
-  const result = spawnSync(cmd, args, { stdio: "inherit", ...options });
+function run(cmd, args, options, timeoutMs) {
+  const line = [cmd, ...args].join(" ");
+  console.log(`$ ${line}`);
+  const result = runSync(cmd, args, { ...options, stdio: "inherit", timeoutMs });
   if (result.error) throw fail(spawnErrorMessage(cmd, result.error), 1);
-  if (result.status !== 0) {
-    const how = result.signal ? `was killed by ${result.signal}` : `exited with status ${result.status}`;
-    throw fail(`${cmd} ${how}: ${[cmd, ...args].join(" ")}`, 1);
-  }
+  if (!result.ok) throw fail(`${cmd} ${describeResult(result)}: ${line}`, 1);
 }
 
 /**
- * Runs a command whose output is parsed, capturing stdout and stderr.
+ * Runs a command whose output is parsed, capturing stdout and stderr. Only a
+ * command that exited by itself returns: its status, zero or not, is the
+ * command's answer, for the caller to read.
  * @param {string} cmd
  * @param {string[]} args
- * @param {import("node:child_process").SpawnSyncOptions} [options]
- * @returns {{ status: number | null, stdout: string, stderr: string }}
- * @throws {Error} exit code 1 when the command cannot start.
+ * @param {{ cwd?: string, env?: NodeJS.ProcessEnv }} options
+ * @param {number} timeoutMs Deadline from `DEADLINES`.
+ * @returns {{ status: number, stdout: string, stderr: string }}
+ * @throws {Error} exit code 1 when the command cannot start, is killed,
+ *   exceeds its deadline or overflows its capture limit.
  */
-function capture(cmd, args, options = {}) {
-  const result = spawnSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], ...options });
+function capture(cmd, args, options, timeoutMs) {
+  const result = runSync(cmd, args, { ...options, timeoutMs });
   if (result.error) throw fail(spawnErrorMessage(cmd, result.error), 1);
-  return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+  if (!result.completed) {
+    const stderr = result.stderr.trim();
+    throw fail(`${[cmd, ...args].join(" ")} ${describeResult(result)}${stderr === "" ? "" : `: ${stderr}`}`, 1);
+  }
+  return { status: result.status, stdout: result.stdout, stderr: result.stderr };
 }
 
-/** Read-only git plumbing in the repository. */
+/**
+ * Environment of every git command: the caller's, with `GIT_OPTIONAL_LOCKS=0`
+ * so a read-only command never writes even an opportunistic index refresh.
+ */
+function gitEnv() {
+  return { ...process.env, GIT_OPTIONAL_LOCKS: "0" };
+}
+
+/** Read-only git plumbing in the repository, with the `DEADLINES.gitQuery` deadline. */
 function git(args) {
-  return capture("git", args, { cwd: REPO_ROOT });
+  return capture("git", args, { cwd: REPO_ROOT, env: gitEnv() }, DEADLINES.gitQuery);
 }
 
-/** True when `p` exists and is a directory. */
+/**
+ * True when `p` exists and is a directory. Only absence (ENOENT, ENOTDIR)
+ * reads as false; any other failure (EACCES, EIO, …) is thrown.
+ * @throws {Error} exit code 1 when `p` cannot be inspected.
+ */
 function isDirectory(p) {
   try {
     return fs.statSync(p).isDirectory();
-  } catch {
-    return false;
+  } catch (err) {
+    if (err.code === "ENOENT" || err.code === "ENOTDIR") return false;
+    throw fail(`cannot inspect ${p}: ${err.message}`, 1);
   }
 }
 
@@ -254,6 +296,57 @@ function canonicalPath(p) {
 function isWithin(child, parent) {
   const rel = path.relative(parent, child);
   return rel === "" || (rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+}
+
+/**
+ * `fs.lstatSync(p)`, or null when nothing is at `p` (ENOENT, or ENOTDIR when
+ * a parent is a file). Any other failure (EACCES, EIO, …) is an operational
+ * error and is never taken for absence.
+ * @returns {fs.Stats | null}
+ * @throws {Error} exit code 1 when `p` cannot be inspected.
+ */
+function lstatOrNull(p) {
+  try {
+    return fs.lstatSync(p);
+  } catch (err) {
+    if (err.code === "ENOENT" || err.code === "ENOTDIR") return null;
+    throw fail(`cannot inspect ${p}: ${err.message}`, 1);
+  }
+}
+
+/**
+ * Containment rule for the staged source: before anything is written into
+ * `dir` or removed below it, every folder from `root` (exclusive) down to
+ * `dir` (inclusive) that already exists must be a real folder. Staging copies
+ * symbolic links as links and never follows them (following one could pull
+ * real draft images into the stage), so a symlinked `_posts/` or `assets/`
+ * from the working tree or a revision would otherwise send a fixture copy, a
+ * synthetic file or the `assets/drafts/` removal to wherever the link points,
+ * outside `<outDir>`. The first missing folder ends the check: `mkdirSync`
+ * creates it and everything below it as real folders.
+ * @param {string} root The staged source folder this run created.
+ * @param {string} dir The folder about to be written into or removed below.
+ * @throws {Error} exit code 1 when `dir` lies outside `root`, or when a folder
+ *   on the way is a symbolic link, is not a folder or cannot be inspected.
+ */
+function assertRealFolders(root, dir) {
+  if (!isWithin(dir, root)) throw fail(`refusing to write to ${dir}: it lies outside ${root}`, 1);
+  let current = root;
+  for (const segment of path.relative(root, dir).split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment);
+    const stat = lstatOrNull(current);
+    if (stat === null) return;
+    const rel = toPosix(path.relative(root, current));
+    if (stat.isSymbolicLink()) {
+      throw fail(
+        `refusing to write or remove below ${current}: it is a symbolic link, which could lead outside ${root}; make ${rel} a real folder in the site source`,
+        1,
+      );
+    }
+    if (!stat.isDirectory()) {
+      throw fail(`refusing to write below ${current}: it is not a folder; make ${rel} a folder in the site source`, 1);
+    }
+  }
 }
 
 /** Every file under `dir`, as POSIX paths relative to `dir`, sorted. */
@@ -330,6 +423,8 @@ function assertEmptyOrAbsent(outDir) {
  * Resolves `--ref` to a commit id. Values starting with `-` are refused
  * before git sees them, so a revision can never be read as a git option.
  * @returns {string} the full commit id.
+ * @throws {Error} exit code 2 when git answers that `ref` names no commit;
+ *   exit code 1 when git gives no answer (killed, timed out, not started).
  */
 function resolveRevision(ref) {
   if (ref.startsWith("-")) throw fail(`cannot resolve --ref ${ref}`, 2);
@@ -339,9 +434,38 @@ function resolveRevision(ref) {
   return sha;
 }
 
-/** True when `relativePath` (file or folder) exists at commit `sha`. */
+/**
+ * True when `relativePath` (file or folder) exists at commit `sha`, false
+ * when git confirms it does not.
+ *
+ * `git ls-tree -z --full-tree <sha> -- <path>` lists the entry itself, a
+ * folder as its own tree entry, and exits 0 with no output when the path is
+ * absent, so absence is an answer rather than an error. A bad or unreadable
+ * object exits non-zero, which is a failure, never absence: otherwise a
+ * damaged object would drop an existing optional path or report a required
+ * one missing. One path per call, because several paths make ls-tree list
+ * the contents of the folders among them. `--literal-pathspecs` keeps every
+ * character of the path literal.
+ * @param {string} sha Full commit id.
+ * @param {string} relativePath Repository-relative POSIX path, no trailing slash.
+ * @returns {boolean}
+ * @throws {Error} exit code 1 when git does not answer or exits non-zero.
+ */
 function existsAtRevision(sha, relativePath) {
-  return git(["cat-file", "-e", `${sha}:${relativePath}`]).status === 0;
+  const result = git(["--literal-pathspecs", "ls-tree", "-z", "--full-tree", sha, "--", relativePath]);
+  if (result.status !== 0) {
+    const stderr = result.stderr.trim();
+    throw fail(
+      `cannot tell whether ${relativePath} exists at ${sha.slice(0, 12)}: ` +
+        `git ls-tree exited with status ${result.status}${stderr === "" ? "" : `: ${stderr}`}`,
+      1,
+    );
+  }
+  // Records are `<mode> <type> <object>\t<path>`, each ended by NUL.
+  return result.stdout.split("\0").some((record) => {
+    const tab = record.indexOf("\t");
+    return tab !== -1 && record.slice(tab + 1) === relativePath;
+  });
 }
 
 /* ------------------------------------------------------------------------ */
@@ -357,12 +481,12 @@ function keepInStage(sourcePath) {
 /**
  * Copies the allow-listed paths from the working tree, so new files are
  * included before their first commit. Missing optional paths (`_posts/`,
- * `CNAME`, …) are skipped.
+ * `CNAME`, …) are skipped; a path that cannot be inspected stops the build.
  */
 function stageWorkingTree(srcDir, paths) {
   for (const rel of paths) {
     const from = path.join(REPO_ROOT, ...rel.split("/"));
-    if (!fs.existsSync(from)) continue;
+    if (lstatOrNull(from) === null) continue;
     fs.cpSync(from, path.join(srcDir, ...rel.split("/")), { recursive: true, filter: keepInStage });
   }
 }
@@ -374,12 +498,21 @@ function stageWorkingTree(srcDir, paths) {
 function stageRevision(outDir, srcDir, sha, paths) {
   const tarPath = path.join(outDir, "ref.tar");
   try {
-    run("git", ["archive", "--format=tar", "-o", tarPath, sha, "--", ...paths], { cwd: REPO_ROOT });
-    run("tar", ["-xf", tarPath, "-C", srcDir]);
+    run(
+      "git",
+      ["archive", "--format=tar", "-o", tarPath, sha, "--", ...paths],
+      { cwd: REPO_ROOT, env: gitEnv() },
+      DEADLINES.gitArchive,
+    );
+    run("tar", ["-xf", tarPath, "-C", srcDir], {}, DEADLINES.tarExtract);
   } finally {
     fs.rmSync(tarPath, { force: true });
   }
-  fs.rmSync(path.join(srcDir, ...DRAFT_IMAGES_DIR.split("/")), { recursive: true, force: true });
+  const draftImages = path.join(srcDir, ...DRAFT_IMAGES_DIR.split("/"));
+  // A symlinked `assets/` would aim this removal at the real `drafts/` inside the folder it points
+  // to; a symlinked `assets/drafts` itself is only unlinked by `rmSync`, never followed.
+  assertRealFolders(srcDir, path.dirname(draftImages));
+  fs.rmSync(draftImages, { recursive: true, force: true });
 }
 
 /**
@@ -395,6 +528,8 @@ function stageFixtures(srcDir) {
   }
 
   const postsDir = path.join(srcDir, POSTS_DIR);
+  // Before the folder is created or listed: a symlinked staged `_posts/` would take the fixtures elsewhere.
+  assertRealFolders(srcDir, postsDir);
   fs.mkdirSync(postsDir, { recursive: true });
 
   const reserved = new Map([
@@ -434,15 +569,23 @@ function stageFixtures(srcDir) {
 
   for (const rel of fixtures) {
     const dest = path.join(postsDir, ...rel.split("/"));
+    // COPYFILE_EXCL refuses a symbolic link at `dest` itself; its folders are checked here.
+    assertRealFolders(srcDir, path.dirname(dest));
     fs.mkdirSync(path.dirname(dest), { recursive: true });
     fs.copyFileSync(path.join(FIXTURE_POSTS_DIR, ...rel.split("/")), dest, fs.constants.COPYFILE_EXCL);
   }
   return fixtures.length;
 }
 
-/** Writes a new UTF-8 file, refusing to overwrite one. */
-function writeNewFile(filePath, text) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+/**
+ * Writes a new UTF-8 file below the staged source `root`, refusing to
+ * overwrite one. Its folders must be real (`assertRealFolders`), and the `wx`
+ * flag also refuses a symbolic link standing at the file's own path.
+ */
+function writeNewFile(root, filePath, text) {
+  const dir = path.dirname(filePath);
+  assertRealFolders(root, dir);
+  fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(filePath, text, { encoding: "utf8", flag: "wx" });
 }
 
@@ -467,8 +610,8 @@ function writeSyntheticContent(srcDir) {
     `![Draft figure]({{ '/${DRAFT_IMAGE}' | relative_url }})`,
     "",
   ].join("\n");
-  writeNewFile(path.join(srcDir, "_drafts", `${DRAFT_SLUG}.md`), draft);
-  writeNewFile(path.join(srcDir, ...DRAFT_IMAGE.split("/")), DRAFT_IMAGE_SVG);
+  writeNewFile(srcDir, path.join(srcDir, "_drafts", `${DRAFT_SLUG}.md`), draft);
+  writeNewFile(srcDir, path.join(srcDir, ...DRAFT_IMAGE.split("/")), DRAFT_IMAGE_SVG);
 
   const futureFile = `${oneYearAheadUtc()}-${FUTURE_SLUG}.md`;
   const future = [
@@ -481,7 +624,7 @@ function writeSyntheticContent(srcDir) {
     `This post carries the marker ${FUTURE_MARKER} and must never be built.`,
     "",
   ].join("\n");
-  writeNewFile(path.join(srcDir, POSTS_DIR, futureFile), future);
+  writeNewFile(srcDir, path.join(srcDir, POSTS_DIR, futureFile), future);
   return futureFile;
 }
 
@@ -519,7 +662,7 @@ function jekyllBuild({ source, destination, configs, extra = [] }) {
     configs.map((name) => path.join(source, name)).join(","),
     ...extra,
   ];
-  run("bundle", args, { cwd: source, env: jekyllEnv() });
+  run("bundle", args, { cwd: source, env: jekyllEnv() }, DEADLINES.jekyllBuild);
   const missing = BUILD_OUTPUTS.filter((rel) => !fs.existsSync(path.join(destination, ...rel.split("/"))));
   if (missing.length > 0) {
     throw fail(`jekyll build into ${destination} produced no ${missing.join(" and no ")}`, 1);
@@ -527,27 +670,13 @@ function jekyllBuild({ source, destination, configs, extra = [] }) {
 }
 
 
-/* ------------------------------------------------------------------------ */
-/* Public API                                                                */
-/* ------------------------------------------------------------------------ */
-
 /**
- * Stages the site source and builds the project, preview and empty variants.
- *
- * @example
- *   const { project } = await buildFixtureSite({ outDir: path.join(os.tmpdir(), "fx") });
- *   // project === "<tmp>/fx/project/cabrillo-coast"; serve "<tmp>/fx/project" for /cabrillo-coast/
- *
- * @param {object} options
- * @param {string} options.outDir Output folder: absent, or an empty folder, outside the repository.
- * @param {string} [options.ref] Revision to take the site source from; the working tree when omitted.
- * @param {boolean} [options.fixturesOnly=false] Leave the real `_posts/` out of the staged source.
- * @returns {Promise<Readonly<{ src: string, project: string, preview: string, empty: string }>>}
- *   Absolute paths of the staged source and the three built sites (`project` is the site
- *   folder `<outDir>/project/cabrillo-coast`).
- * @throws {Error} with `exitCode` 2 for a usage error, 1 for a copy or build failure.
+ * The whole run behind `buildFixtureSite`: option checks, pre-flight checks,
+ * staging and the three builds. Its errors are normalized by that wrapper.
+ * @param {{ outDir?: string, ref?: string | null, fixturesOnly?: boolean }} options
+ * @returns {Readonly<{ src: string, project: string, preview: string, empty: string }>}
  */
-export async function buildFixtureSite({ outDir, ref, fixturesOnly = false } = {}) {
+function stageAndBuild({ outDir, ref, fixturesOnly = false } = {}) {
   if (typeof outDir !== "string" || outDir.trim() === "") throw fail("outDir must be a non-empty path", 2);
   if (ref !== undefined && ref !== null && (typeof ref !== "string" || ref.trim() === "")) {
     throw fail("--ref needs a revision", 2);
@@ -580,54 +709,49 @@ export async function buildFixtureSite({ outDir, ref, fixturesOnly = false } = {
   const emptySrc = path.join(out, "empty-src");
   const empty = path.join(out, "empty");
 
-  try {
-    fs.mkdirSync(src, { recursive: true });
+  fs.mkdirSync(src, { recursive: true });
 
-    // 1. Stage the allow-listed site source.
-    if (sha !== null) {
-      log(`staging the site source of ${sha.slice(0, 12)} into ${src}${fixturesOnly ? " (fixtures only)" : ""}`);
-      stageRevision(out, src, sha, revisionPaths);
-    } else {
-      log(`staging the working-tree site source into ${src}${fixturesOnly ? " (fixtures only)" : ""}`);
-      stageWorkingTree(src, paths);
-    }
-
-    // 2. Fixture articles and synthetic private content, in the staging copy only.
-    const fixtureCount = stageFixtures(src);
-    const futureFile = writeSyntheticContent(src);
-    log(`added ${fixtureCount} fixture articles, a synthetic draft with its image and _posts/${futureFile}`);
-
-    // 3. Project overlay: the github.io host for canonical and og:url.
-    writeNewFile(path.join(src, PROJECT_OVERLAY), `url: "${PROJECT_URL}"\n`);
-
-    // 4. project: the project-path deployment, CNAME removed, base path from the command line.
-    log(`building the project variant into ${project}`);
-    fs.cpSync(src, projectSrc, { recursive: true });
-    fs.rmSync(path.join(projectSrc, "CNAME"), { force: true });
-    jekyllBuild({
-      source: projectSrc,
-      destination: project,
-      configs: ["_config.yml", PROJECT_OVERLAY],
-      extra: ["--baseurl", PROJECT_BASEURL],
-    });
-
-    // 5. preview: drafts and their images, as the author's local preview renders them.
-    log(`building the preview variant into ${preview}`);
-    jekyllBuild({
-      source: src,
-      destination: preview,
-      configs: ["_config.yml", "_config.preview.yml"],
-      extra: ["--drafts"],
-    });
-
-    // 6. empty: no _posts/ at all, the launch state.
-    log(`building the empty variant into ${empty}`);
-    fs.cpSync(src, emptySrc, { recursive: true, filter: (p) => path.relative(src, p) !== POSTS_DIR });
-    jekyllBuild({ source: emptySrc, destination: empty, configs: ["_config.yml"] });
-  } catch (err) {
-    if (err && typeof err.exitCode === "number") throw err;
-    throw fail(`fixture build failed: ${err && err.message ? err.message : String(err)}`, 1);
+  // 1. Stage the allow-listed site source.
+  if (sha !== null) {
+    log(`staging the site source of ${sha.slice(0, 12)} into ${src}${fixturesOnly ? " (fixtures only)" : ""}`);
+    stageRevision(out, src, sha, revisionPaths);
+  } else {
+    log(`staging the working-tree site source into ${src}${fixturesOnly ? " (fixtures only)" : ""}`);
+    stageWorkingTree(src, paths);
   }
+
+  // 2. Fixture articles and synthetic private content, in the staging copy only.
+  const fixtureCount = stageFixtures(src);
+  const futureFile = writeSyntheticContent(src);
+  log(`added ${fixtureCount} fixture articles, a synthetic draft with its image and _posts/${futureFile}`);
+
+  // 3. Project overlay: the github.io host for canonical and og:url.
+  writeNewFile(src, path.join(src, PROJECT_OVERLAY), `url: "${PROJECT_URL}"\n`);
+
+  // 4. project: the project-path deployment, CNAME removed, base path from the command line.
+  log(`building the project variant into ${project}`);
+  fs.cpSync(src, projectSrc, { recursive: true });
+  fs.rmSync(path.join(projectSrc, "CNAME"), { force: true });
+  jekyllBuild({
+    source: projectSrc,
+    destination: project,
+    configs: ["_config.yml", PROJECT_OVERLAY],
+    extra: ["--baseurl", PROJECT_BASEURL],
+  });
+
+  // 5. preview: drafts and their images, as the author's local preview renders them.
+  log(`building the preview variant into ${preview}`);
+  jekyllBuild({
+    source: src,
+    destination: preview,
+    configs: ["_config.yml", "_config.preview.yml"],
+    extra: ["--drafts"],
+  });
+
+  // 6. empty: no _posts/ at all, the launch state.
+  log(`building the empty variant into ${empty}`);
+  fs.cpSync(src, emptySrc, { recursive: true, filter: (p) => path.relative(src, p) !== POSTS_DIR });
+  jekyllBuild({ source: emptySrc, destination: empty, configs: ["_config.yml"] });
 
   log("fixture sites built:");
   for (const [name, dir] of [
@@ -641,6 +765,37 @@ export async function buildFixtureSite({ outDir, ref, fixturesOnly = false } = {
     console.log(`  ${name.padEnd(12)} ${dir}`);
   }
   return Object.freeze({ src, project, preview, empty });
+}
+
+/* ------------------------------------------------------------------------ */
+/* Public API                                                                */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * Stages the site source and builds the project, preview and empty variants.
+ *
+ * @example
+ *   const { project } = await buildFixtureSite({ outDir: path.join(os.tmpdir(), "fx") });
+ *   // project === "<tmp>/fx/project/cabrillo-coast"; serve "<tmp>/fx/project" for /cabrillo-coast/
+ *
+ * @param {object} options
+ * @param {string} options.outDir Output folder: absent, or an empty folder, outside the repository.
+ * @param {string} [options.ref] Revision to take the site source from; the working tree when omitted.
+ * @param {boolean} [options.fixturesOnly=false] Leave the real `_posts/` out of the staged source.
+ * @returns {Promise<Readonly<{ src: string, project: string, preview: string, empty: string }>>}
+ *   Absolute paths of the staged source and the three built sites (`project` is the site
+ *   folder `<outDir>/project/cabrillo-coast`).
+ * @throws {Error} with `exitCode` 2 for a usage error, 1 for a copy or build failure.
+ */
+export async function buildFixtureSite(options = {}) {
+  try {
+    return stageAndBuild(options ?? {});
+  } catch (err) {
+    // The one normalization boundary, pre-flight checks included: tagged errors keep their exit code
+    // (usage errors stay 2), and anything else (EACCES, EIO, ELOOP, …) is a copy or build failure.
+    if (err && typeof err.exitCode === "number") throw err;
+    throw fail(`fixture build failed: ${err && err.message ? err.message : String(err)}`, 1);
+  }
 }
 
 /* ------------------------------------------------------------------------ */

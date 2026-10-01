@@ -25,8 +25,13 @@
  *     (`jsonify`, not `escape`); and the file stays inside its size budget,
  *     with raw and gzip sizes printed on every run.
  *   - AC-02 (index part): no entry belongs to the synthetic draft or the
- *     future-dated post, and neither marker string appears anywhere in the
- *     file. On the real build these checks are vacuous but still run.
+ *     future-dated post, and no slug, no marker string and no
+ *     `assets/drafts/` path appears anywhere in the file: not in its raw
+ *     text and not in any string value of the parsed index (every field of
+ *     every entry, nested ones included), which also catches text hidden
+ *     behind JSON escapes such as `assets\/drafts\/`. Both comparisons are
+ *     case-insensitive. On the real build these checks are vacuous but still
+ *     run.
  *
  * Environment (same handling as `built-pages.test.mjs`):
  *   SITE_DIR      Built site, resolved against the repository root (`_site`).
@@ -131,6 +136,18 @@ const FIXTURE_DATES = Object.freeze({
  */
 const UNDECODED_REFERENCES = Object.freeze(['&amp;', '&lt;', '&gt;', '&quot;', '&#39;']);
 
+/**
+ * Path prefix of every draft image (`assets/drafts/<slug>/…`), the AC-02
+ * draft-image reference: an index that names a draft image leaks its draft.
+ */
+const DRAFT_IMAGE_PREFIX = 'assets/drafts/';
+
+/**
+ * Text the index must never hold, in any field (AC-02): both synthetic slugs,
+ * the draft-image prefix and both markers.
+ */
+const PRIVATE_TEXTS = Object.freeze([DRAFT_SLUG, FUTURE_SLUG, DRAFT_IMAGE_PREFIX, DRAFT_MARKER, FUTURE_MARKER]);
+
 /* ------------------------------------------------------------------------ */
 /* Helpers                                                                   */
 /* ------------------------------------------------------------------------ */
@@ -207,6 +224,25 @@ function fixtureEntry(entries, slug) {
     `no index entry ends with ${suffix}; entries: ${JSON.stringify(entries.map((e) => e.url))}`,
   );
   return entry;
+}
+
+/**
+ * Every string inside a parsed JSON value, depth first, as `[where, string]`
+ * pairs. `where` names `value` itself; nested values extend it with `.key`
+ * or `[i]` (`entry 0 (/blog/x/).tags[1]`). Numbers, booleans and `null` hold
+ * no text and yield nothing; parsed JSON has no cycles.
+ * @param {unknown} value
+ * @param {string} where
+ * @returns {Generator<[string, string]>}
+ */
+function* stringValues(value, where) {
+  if (typeof value === 'string') {
+    yield [where, value];
+  } else if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i += 1) yield* stringValues(value[i], `${where}[${i}]`);
+  } else if (value !== null && typeof value === 'object') {
+    for (const [key, child] of Object.entries(value)) yield* stringValues(child, `${where}.${key}`);
+  }
 }
 
 /* ------------------------------------------------------------------------ */
@@ -319,11 +355,27 @@ function defineSuite() {
       assert.ok(!url.includes(DRAFT_SLUG), `the synthetic draft is indexed: ${url}`);
       assert.ok(!url.includes(FUTURE_SLUG), `the future-dated post is indexed: ${url}`);
     }
+    // Every decoded string of every entry, whatever its field: JSON escapes
+    // (`assets\/drafts\/`, `\u0066ixture-…`) can hide a needle from the raw text.
+    const leaks = entries.flatMap((entry, i) => {
+      const where = `entry ${i}${entry && typeof entry.url === 'string' ? ` (${entry.url})` : ''}`;
+      return [...stringValues(entry, where)].flatMap(([field, value]) => {
+        const lower = value.toLowerCase();
+        return PRIVATE_TEXTS.filter((needle) => lower.includes(needle.toLowerCase())).map(
+          (needle) => `${field}: ${needle}`,
+        );
+      });
+    });
+    assert.deepEqual(leaks, [], `private slugs, markers or draft-image paths in ${SEARCH_JSON}:\n${leaks.join('\n')}`);
     // The template lowercases every body (Liquid downcase), so a leaked marker
     // would appear in lower case: compare case-insensitively.
     const text = index.text.toLowerCase();
     for (const marker of [DRAFT_MARKER, FUTURE_MARKER]) {
       assert.ok(!text.includes(marker.toLowerCase()), `search.json contains the private marker ${marker}`);
+    }
+    // The raw text also covers what no string value holds, such as an object key.
+    for (const needle of [DRAFT_SLUG, FUTURE_SLUG, DRAFT_IMAGE_PREFIX]) {
+      assert.ok(!text.includes(needle.toLowerCase()), `search.json text contains ${needle}`);
     }
   });
 

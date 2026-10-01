@@ -1,8 +1,8 @@
-/* Cabrillo Coast blog search: ES5, no dependencies, text-only output. */
+/* Cabrillo Coast blog search: ES5, no deps, text-only output. */
 (function (window, document) {
   "use strict";
 
-  // Pure functions, exported before any DOM access.
+  // Pure, exported before DOM use.
   function normalize(text) {
     var s = String(text == null ? "" : text).toLowerCase();
     return typeof s.normalize === "function" ? s.normalize("NFD").replace(/[\u0300-\u036f]/g, "") : s;
@@ -29,10 +29,10 @@
     return out;
   }
 
-  // Literal match: no RegExp from user input.
+  // Literal match; no RegExp from input.
   function hit(f, t, w) { return (f || "").indexOf(t) !== -1 ? w : 0; }
 
-  // AND matching, weighted by field.
+  // AND match, field-weighted.
   function rank(prepared, query) {
     var terms = tokenize(query), hits = [], i, j, n, s, t, w;
     if (!terms.length) return null;
@@ -53,7 +53,6 @@
 
   window.CabrilloBlogSearch = { normalize: normalize, tokenize: tokenize, prepare: prepare, rank: rank };
 
-  // DOM wiring, guarded.
   function $(id) { return document.getElementById(id); }
   var form = $("blog-search"), input = $("blog-search-input"), status = $("blog-search-status"), list = $("post-list");
   if (!form || !input || !status || !list || typeof window.fetch !== "function") return;
@@ -67,27 +66,29 @@
   if (!items.length || !indexUrl) return;
   form.hidden = false;
 
-  var entries = null, started = false, failed = false, timer;
+  var entries = null, started = false, failed = false, moved, timer;
 
   function apply(raw) {
-    var q = String(raw).trim(), res, n = 0, j, li, quoted = "\u201c" + q + "\u201d";
-    if (!failed && !entries) { load(); return; } // load applies the value when done
+    var q = String(raw).trim(), res, n = 0, j, li, quoted = "\u201c" + q + "\u201d", f = document.activeElement;
+    if (!failed && !entries) { load(); return; } // load applies it when done
     res = failed ? null : rank(entries, q);
     for (j = 0; j < items.length; j++) {
       items[j].hidden = !!res;
-      if (!res) list.appendChild(items[j]); // original order
+      if (!res && moved) list.appendChild(items[j]); // original order
     }
+    moved = !!res;
     for (j = 0; res && j < res.length; j++) {
       li = byUrl[res[j].url];
       if (li) { li.hidden = false; list.appendChild(li); n++; }
     }
+    if (f && f !== document.activeElement) f.focus();
     list.hidden = !!res && !n;
     status.textContent = failed ? "Search is unavailable right now; all articles are listed below." :
       !res ? "" : n === 1 ? "1 article matches " + quoted + "." : n ? n + " articles match " + quoted + "." :
       "No articles match " + quoted + ". Try fewer or different words.";
   }
 
-  function load() { // once, never retried
+  function load() { // once; no retry
     if (started) return;
     started = true;
     window.fetch(indexUrl).then(function (r) {
@@ -102,11 +103,13 @@
     });
   }
 
-  function now() { // apply, then mirror into ?q=
+  function now() { // apply, sync ?q=
     var q = input.value.trim(), h = window.history, l = window.location;
     window.clearTimeout(timer);
     apply(q);
-    if (h && h.replaceState) h.replaceState(null, "", l.pathname + (q ? "?q=" + encodeURIComponent(q) : "") + l.hash);
+    try {
+      if (h && h.replaceState) h.replaceState(null, "", l.pathname + (q ? "?q=" + encodeURIComponent(q) : "") + l.hash);
+    } catch (err) { /* optional; URL kept */ }
   }
 
   input.addEventListener("focus", load);
@@ -115,12 +118,12 @@
     timer = window.setTimeout(now, 150);
   });
   input.addEventListener("keydown", function (e) {
-    if (e.key === "Escape" || e.key === "Esc" || e.keyCode === 27) { input.value = ""; now(); }
+    if (e.key === "Escape" || e.key === "Esc") { input.value = ""; now(); }
   });
   form.addEventListener("submit", function (e) { e.preventDefault(); now(); });
 
-  // ?q= loads at once; otherwise nothing loads before focus.
-  var m = /[?&]q=([^&#]*)/.exec(window.location.search), raw = m ? m[1].replace(/\+/g, " ") : "", q0;
+  // Nonblank ?q= loads now, else first focus/input.
+  var m = /(?:^\?|&)q=([^&#]*)/.exec(window.location.search), raw = m ? m[1].replace(/\+/g, " ") : "", q0;
   try { q0 = decodeURIComponent(raw); } catch (err) { q0 = raw; }
-  if (q0.trim()) { input.value = q0; load(); }
+  if (q0.trim()) { input.value = q0.replace(/[\r\n]+/g, " "); load(); }
 })(window, document);

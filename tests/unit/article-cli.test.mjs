@@ -10,6 +10,14 @@
  *   - guard --staged runs in temporary git repositories with the case's files
  *     staged; guard --pre-push additionally pushes to a local bare repository
  *     and receives on standard input the ref line git would pass the hook.
+ *   - failures part way through new, publish and unpublish use fault
+ *     injection: a `node --import` preload, written into the parent folder at
+ *     run time, makes chosen `node:fs` calls fail, write short or edit a file
+ *     mid-command, so rollback and retry are exercised without depending on
+ *     file permissions (the suite may run as root).
+ *   - two guard cases put a stand-in git first on PATH that kills itself with
+ *     SIGKILL on one command, so guard must refuse instead of reading the
+ *     missing answer as "no".
  *
  * Everything is written below one parent folder in `os.tmpdir()`, removed
  * after the run, so nothing is written inside this repository.
@@ -32,7 +40,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
 /* ------------------------------------------------------------------------ */
@@ -96,16 +104,18 @@ const PNG = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
 /* ------------------------------------------------------------------------ */
 
 /**
- * Runs `node scripts/article.mjs <args>` with `ENV`. Standard input is always
- * given (empty by default) so `guard` never waits on an open terminal.
+ * Runs `node [nodeArgs…] scripts/article.mjs <args>` with `ENV` plus `env`
+ * (a case that puts a stand-in git on PATH passes that PATH in `env`).
+ * Standard input is always given (empty by default) so `guard` never waits
+ * on an open terminal.
  *
  * @returns {{ status: number, stdout: string, stderr: string, out: string }}
  */
-function run(args, { cwd, input = '' } = {}) {
-  const result = spawnSync(process.execPath, [ARTICLE_MJS, ...args], {
+function run(args, { cwd, input = '', nodeArgs = [], env = {} } = {}) {
+  const result = spawnSync(process.execPath, [...nodeArgs, ARTICLE_MJS, ...args], {
     cwd,
     input,
-    env: ENV,
+    env: { ...ENV, ...env },
     encoding: 'utf8',
     timeout: 30000,
   });
@@ -141,6 +151,93 @@ function commit(repo, message) {
 /** The index mode (`100644`, `100755`, …) of a staged path. */
 function indexMode(repo, rel) {
   return git(repo, 'ls-files', '-s', '--', rel).split(' ')[0];
+}
+
+/* ------------------------------------------------------------------------ */
+/* Fault injection                                                           */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * A `node --import` preload that makes chosen `node:fs` calls of the tool
+ * misbehave, configured by the `ARTICLE_FAULTS` variable: a JSON list of
+ * rules `{ fn, path, action, code, file, text }`. Each rule applies once, to
+ * the first call of `fs[fn]` whose path contains `path`; for a call on a
+ * file descriptor (`writeSync`), the path the descriptor was opened with.
+ *   - `throw`: fail with error code `code` and do nothing;
+ *   - `short-write`: (`writeSync`) write half the bytes, then fail with `code`;
+ *   - `append-to-file`: append `text` to `file`, then make the call: an
+ *     editor saving while the tool runs;
+ *   - `run-tool`: run `node <argv…>` (with this preload, no rules and the
+ *     extra variables `env`) to completion in `cwd`, write its
+ *     `{ status, stdout, stderr }` to `out` as JSON, then make the call: a
+ *     competing run of the tool at that exact moment.
+ * `ARTICLE_FAKE_NOW` (an ISO time) fixes the clock, as for a run on the other
+ * side of UTC midnight. The tool calls `fs.<fn>` on the module's default
+ * export at call time, so the replaced functions are the ones it uses. The
+ * preload is written here at run time rather than committed, so nothing
+ * outside this suite can load it.
+ */
+const FAULT_PRELOAD = path.join(PARENT, 'fault-preload.mjs');
+fs.writeFileSync(FAULT_PRELOAD, `import fs from 'node:fs';
+import { spawnSync } from 'node:child_process';
+
+if (process.env.ARTICLE_FAKE_NOW) {
+  const RealDate = Date;
+  const now = new RealDate(process.env.ARTICLE_FAKE_NOW).getTime();
+  globalThis.Date = class extends RealDate {
+    constructor(...args) { super(...(args.length > 0 ? args : [now])); }
+    static now() { return now; }
+  };
+}
+const runTool = (rule) => {
+  const child = spawnSync(process.execPath, ['--import', import.meta.url, ...rule.argv], {
+    cwd: rule.cwd,
+    env: { ...process.env, ARTICLE_FAULTS: '[]', ...rule.env },
+    encoding: 'utf8',
+    timeout: 30000,
+  });
+  fs.writeFileSync(rule.out, JSON.stringify({ status: child.status, stdout: child.stdout, stderr: child.stderr }));
+};
+const rules = JSON.parse(process.env.ARTICLE_FAULTS || '[]').map((rule) => ({ ...rule, used: false }));
+const names = new Set(['openSync', 'closeSync', 'writeSync', ...rules.map((rule) => rule.fn)]);
+const original = Object.fromEntries([...names].map((name) => [name, fs[name]]));
+const fdPaths = new Map();
+const pathOf = (target) => (typeof target === 'number' ? fdPaths.get(target) || '' : String(target));
+const fault = (rule, name, target) => Object.assign(
+  new Error(rule.code + ': injected fault, ' + name + " '" + pathOf(target) + "'"),
+  { code: rule.code, syscall: name, path: pathOf(target) },
+);
+for (const name of names) {
+  fs[name] = function injected(target, ...rest) {
+    const rule = rules.find((r) => !r.used && r.fn === name && pathOf(target).includes(r.path));
+    if (rule) rule.used = true;
+    if (rule && rule.action === 'throw') throw fault(rule, name, target);
+    if (rule && rule.action === 'short-write') {
+      const [data, offset = 0, length = data.length - offset] = rest;
+      original.writeSync.call(fs, target, data, offset, Math.floor(length / 2));
+      throw fault(rule, name, target);
+    }
+    if (rule && rule.action === 'append-to-file') fs.appendFileSync(rule.file, rule.text);
+    if (rule && rule.action === 'run-tool') runTool(rule);
+    const result = original[name].call(fs, target, ...rest);
+    if (name === 'openSync') fdPaths.set(result, pathOf(target));
+    if (name === 'closeSync') fdPaths.delete(target);
+    return result;
+  };
+}
+`);
+const FAULT_PRELOAD_URL = pathToFileURL(FAULT_PRELOAD).href;
+
+/**
+ * Runs a tool command in a temporary root as `cli` does, with the fault-injection
+ * preload and the rules `faults` active.
+ */
+function cliWithFaults(root, faults, ...args) {
+  return run([...args, '--root', root], {
+    cwd: root,
+    nodeArgs: ['--import', FAULT_PRELOAD_URL],
+    env: { ARTICLE_FAULTS: JSON.stringify(faults) },
+  });
 }
 
 /* ------------------------------------------------------------------------ */
@@ -364,6 +461,34 @@ test('[AC-03][F-017] new refuses a slug already used by a draft or a post and le
   assert.equal(exists(root, 'assets/drafts/taken'), false);
 });
 
+test('[AC-03][F-017] new leaves no draft when its image folder cannot be created, and can be run again', async (t) => {
+  await t.test('[AC-03][F-017] new with a file at assets/drafts rolls the draft back and names the path', () => {
+    const root = makeRoot();
+    write(root, 'assets/drafts', 'a file, not a folder');
+    const failed = cli(root, 'new', 'blocked');
+    expectExit(failed, 1);
+    assert.match(failed.stderr, /cannot create assets\/drafts\/blocked\/ \(ENOTDIR/,
+      'the failing path and its error');
+    assert.match(failed.stderr, /every change was rolled back/);
+    assert.equal(exists(root, '_drafts/blocked.md'), false, 'no draft is left behind');
+    assert.equal(read(root, 'assets/drafts'), 'a file, not a folder', 'the existing file is untouched');
+
+    fs.rmSync(abs(root, 'assets/drafts'));
+    expectExit(cli(root, 'new', 'blocked'), 0);
+    assert.deepEqual(fs.readFileSync(abs(root, '_drafts/blocked.md')), fs.readFileSync(TEMPLATE));
+    assert.ok(fs.statSync(abs(root, 'assets/drafts/blocked')).isDirectory());
+  });
+  await t.test('[AC-03][F-017] new with a file at assets/drafts/<slug> refuses before writing anything', () => {
+    const root = makeRoot();
+    write(root, 'assets/drafts/occupied', 'a file, not a folder');
+    const refused = cli(root, 'new', 'occupied');
+    expectExit(refused, 1);
+    assert.match(refused.stderr, /assets\/drafts\/occupied is not a folder/);
+    assert.equal(exists(root, '_drafts'), false, 'nothing is written, not even _drafts/');
+    assert.equal(read(root, 'assets/drafts/occupied'), 'a file, not a folder', 'the existing file is untouched');
+  });
+});
+
 /* ------------------------------------------------------------------------ */
 /* check [files…]                                                            */
 /* ------------------------------------------------------------------------ */
@@ -391,6 +516,53 @@ test('[AC-03][F-017] check applies the schema to posts: an updated date is accep
   assert.match(hidden.stderr, /published/);
 });
 
+test('[AC-03][F-017] check reports a stray } in the tags list as a front-matter error instead of crashing', async (t) => {
+  for (const tags of [['}'], ['a', '}']]) {
+    await t.test(`[AC-03][F-017] check refuses tags: [${tags.join(', ')}]`, () => {
+      const root = makeRoot();
+      write(root, '_drafts/brace-tags.md', validArticle({ tags }));
+      const result = cli(root, 'check', '_drafts/brace-tags.md');
+      expectExit(result, 1);
+      assert.match(result.stderr, /_drafts\/brace-tags\.md: front matter line 4: unexpected "\}" in a flow list/);
+      assert.doesNotMatch(result.out, /TypeError|\n\s+at /, 'no exception or stack trace');
+    });
+  }
+});
+
+test('[AC-03][F-017] check refuses bare tags YAML reads as null, a boolean, a number or a date, and accepts them quoted', async (t) => {
+  const refused = [
+    ['null', 'null'],
+    ['on', 'a boolean'],
+    ['off', 'a boolean'],
+    ['0123', 'a number'],
+    ['2026', 'a number'],
+    ['2026-01-15', 'a date'],
+  ];
+  for (const [tag, kind] of refused) {
+    await t.test(`[AC-03][F-017] check refuses the bare tag ${tag}`, () => {
+      const root = makeRoot();
+      write(root, '_drafts/typed-tag.md', validArticle({ tags: ['testing', tag] }));
+      const result = cli(root, 'check', '_drafts/typed-tag.md');
+      expectExit(result, 1);
+      const message = `front matter line 4: bare ${tag} in a flow list is read by YAML as ${kind}, not text; write "${tag}"`;
+      assert.match(result.stderr, new RegExp(escapeRegExp(message)));
+    });
+  }
+  const accepted = [
+    ['"null"', '"on"', '"off"', '"0123"', '"2026"'],
+    ['"2026-01-15"', 'testing'],
+    ['2fa', '3d', '08', '100-days', '1e5'],
+    ['y', 'n', 'online', 'yes-no', 'null-safety'],
+  ];
+  for (const tags of accepted) {
+    await t.test(`[AC-03][F-017] check accepts tags: [${tags.join(', ')}]`, () => {
+      const root = makeRoot();
+      write(root, '_drafts/text-tags.md', validArticle({ tags }));
+      expectExit(cli(root, 'check', '_drafts/text-tags.md'), 0);
+    });
+  }
+});
+
 test('[AC-03][F-017] check warns about unwrapped Liquid inside code without failing, and not when it is wrapped in raw', () => {
   const root = makeRoot();
   const fence = ['```yaml', 'image: {{ x }}', '```'].join('\n');
@@ -405,6 +577,26 @@ test('[AC-03][F-017] check warns about unwrapped Liquid inside code without fail
   const wrapped = cli(root, 'check', '_drafts/code-wrapped.md');
   expectExit(wrapped, 0);
   assert.doesNotMatch(wrapped.stderr, /raw|liquid/i, 'no warning once the code is wrapped');
+});
+
+test('[AC-03][F-017] check warns about unwrapped Liquid in an inline code span that crosses a line break, and not when it is wrapped in raw', () => {
+  const root = makeRoot();
+  // kramdown closes the span on the next line of the paragraph; Liquid evaluates it first.
+  const span = 'Set `image: {{ .Values.image\n}}` in the chart values.';
+  const text = validArticle({ body: `A Helm values file:\n\n${span}` });
+  write(root, '_drafts/span-warn.md', text);
+  const line = text.split('\n').findIndex((t) => t.includes('.Values.image')) + 1;
+  assert.ok(line > 0);
+  const unwrapped = cli(root, 'check', '_drafts/span-warn.md');
+  expectExit(unwrapped, 0);
+  assert.match(unwrapped.stderr, /raw|liquid/i);
+  assert.match(unwrapped.stderr, new RegExp(`span-warn\\.md:${line}\\b`), `the warning names line ${line}`);
+
+  write(root, '_drafts/span-wrapped.md',
+    validArticle({ body: `A Helm values file:\n\n{% raw %}${span}{% endraw %}` }));
+  const wrapped = cli(root, 'check', '_drafts/span-wrapped.md');
+  expectExit(wrapped, 0);
+  assert.doesNotMatch(wrapped.stderr, /raw|liquid/i, 'no warning once the span is wrapped');
 });
 
 test('[AC-03][F-017] check rejects unsafe markup in prose but not the same markup shown as code', () => {
@@ -422,6 +614,38 @@ test('[AC-03][F-017] check rejects unsafe markup in prose but not the same marku
   write(root, '_drafts/code-script.md',
     validArticle({ body: 'This is what not to write:\n\n```html\n<script>alert(1)</script>\n```' }));
   expectExit(cli(root, 'check', '_drafts/code-script.md'), 0);
+});
+
+test('[AC-03][F-017] check reports every line of a multi-line tag that holds an event handler or a javascript: URL', async (t) => {
+  const cases = [
+    {
+      name: 'two event handlers',
+      slug: 'multi-handlers',
+      body: 'Intro.\n\n<span title="t"\n  onclick="a()"\n  onfocus="b()">x</span>',
+      marks: ['onclick=', 'onfocus='],
+    },
+    {
+      name: 'two javascript: URLs',
+      slug: 'multi-urls',
+      body: 'Intro.\n\n<a href="javascript:a()"\n  title="t"\n  data-x="javascript:b()">x</a>',
+      marks: ['href=', 'data-x='],
+    },
+  ];
+  for (const { name, slug, body, marks } of cases) {
+    await t.test(`[AC-03][F-017] check reports both lines of a tag with ${name}`, () => {
+      const root = makeRoot();
+      const text = validArticle({ body });
+      write(root, `_drafts/${slug}.md`, text);
+      const result = cli(root, 'check', `_drafts/${slug}.md`);
+      expectExit(result, 1);
+      for (const mark of marks) {
+        const line = text.split('\n').findIndex((l) => l.includes(mark)) + 1;
+        assert.ok(line > 0);
+        assert.match(result.stderr, new RegExp(`${escapeRegExp(slug)}\\.md:${line}: unsafe markup`),
+          `line ${line} (${mark}) is reported`);
+      }
+    });
+  }
 });
 
 test('[AC-03][F-017] check rejects external, data:, alt-less and missing images and accepts a local image with alt text', async (t) => {
@@ -471,6 +695,138 @@ test('[AC-03][F-017] check rejects external, data:, alt-less and missing images 
       validArticle({ body: `Figure:\n\n![A labelled figure](${image('img-ok', 'figure.png')})` }));
     expectExit(cli(root, 'check', '_drafts/img-ok.md'), 0);
   });
+});
+
+test('[AC-03][F-017] check validates the image source kramdown renders, not a different one', async (t) => {
+  // `figure.png` exists in every case's image folder; `missing.png` never does.
+  const cases = [
+    {
+      name: 'refuses an inline image with an empty destination',
+      slug: 'empty-dest',
+      body: () => '![Diagram]()',
+      message: /image has no source/,
+    },
+    {
+      name: 'refuses an inline image with an empty <> destination',
+      slug: 'empty-angle',
+      body: () => '![Diagram](<>)',
+      message: /image has no source/,
+    },
+    {
+      name: 'refuses an inline image with only a title',
+      slug: 'title-only',
+      body: () => '![Diagram]( "A caption")',
+      message: /image has no source/,
+    },
+    {
+      name: 'refuses an empty destination whose title holds quotes, on the image line',
+      slug: 'quoted-title',
+      body: () => '![Diagram]( "A "quoted" caption")',
+      message: /_drafts\/quoted-title\.md:\d+: image has no source/,
+    },
+    {
+      name: 'refuses an empty destination whose title runs to the last quote before )',
+      slug: 'two-titles',
+      body: () => '![Diagram]( "x" "title")',
+      message: /_drafts\/two-titles\.md:\d+: image has no source/,
+    },
+    {
+      name: 'accepts an empty-looking image split by a blank line, which renders as two paragraphs of text',
+      slug: 'split-dest',
+      body: () => '![Diagram](\n\n)',
+    },
+    {
+      name: 'accepts alt text split by a blank line, which renders as text',
+      slug: 'split-alt',
+      body: (s) => `![Dia\n\ngram](/assets/drafts/${s}/missing.png)`,
+    },
+    {
+      name: 'accepts an empty title, which kramdown renders as text',
+      slug: 'empty-title',
+      body: () => '![Diagram]( "")',
+    },
+    {
+      name: 'refuses a <…> destination that does not directly follow the parenthesis',
+      slug: 'spaced-angle',
+      body: (s) => `![Diagram]( </assets/drafts/${s}/figure.png> )`,
+      message: /page-relative/,
+    },
+    {
+      name: 'accepts a <…> destination directly after the parenthesis',
+      slug: 'tight-angle',
+      body: (s) => `![Diagram](</assets/drafts/${s}/figure.png>)`,
+    },
+    {
+      name: 'accepts a reference whose last duplicate definition names an existing file',
+      slug: 'redefined-ok',
+      body: (s) => `![Diagram][pic]\n\n[pic]: /assets/drafts/${s}/missing.png\n[PIC]: /assets/drafts/${s}/figure.png`,
+    },
+    {
+      name: 'refuses a reference whose last duplicate definition names a missing file',
+      slug: 'redefined-bad',
+      body: (s) => `![Diagram][pic]\n\n[pic]: /assets/drafts/${s}/figure.png\n[pic]: /assets/drafts/${s}/missing.png`,
+      message: /missing\.png does not exist/,
+    },
+    {
+      name: 'accepts a reference whose spaced label matches no definition, which renders as text',
+      slug: 'spaced-label',
+      body: (s) => `![Diagram][ pic ]\n\n[pic]: /assets/drafts/${s}/missing.png`,
+    },
+    {
+      name: 'refuses a reference whose label differs from its definition only by whitespace runs and case',
+      slug: 'folded-label',
+      body: (s) => `![Diagram][My\tPic]\n\n[my  pic]: /assets/drafts/${s}/missing.png`,
+      message: /missing\.png does not exist/,
+    },
+    {
+      name: 'accepts a . segment inside the image folder, which the browser drops',
+      slug: 'dot-segment',
+      body: (s) => `![Diagram](/assets/drafts/${s}/./figure.png)`,
+    },
+    {
+      name: 'refuses a .. segment that resolves back into the image folder',
+      slug: 'dotdot-segment',
+      body: (s) => `![Diagram](/assets/drafts/${s}/../${s}/figure.png)`,
+      message: /must not contain \.\. segments/,
+    },
+    {
+      name: 'refuses a . segment inside the folder prefix, which publish would not rewrite',
+      slug: 'dot-prefix',
+      body: (s) => `![Diagram](/assets/drafts/./${s}/figure.png)`,
+      message: /must be under/,
+    },
+  ];
+  for (const { name, slug, body, message } of cases) {
+    await t.test(`[AC-03][F-017] check ${name}`, () => {
+      const root = makeRoot();
+      write(root, `assets/drafts/${slug}/figure.png`, PNG);
+      write(root, `_drafts/${slug}.md`, validArticle({ body: `Figure:\n\n${body(slug)}` }));
+      const result = cli(root, 'check', `_drafts/${slug}.md`);
+      if (message === undefined) {
+        expectExit(result, 0);
+      } else {
+        expectExit(result, 1);
+        assert.match(result.stderr, message);
+      }
+    });
+  }
+  await t.test('[AC-03][F-017] guard --staged finds the tracked image behind a . segment', GIT_CASE, () => {
+    const repo = makeRepo();
+    const postRel = `_posts/${PAST}-dot-guard.md`;
+    write(repo, postRel, validArticle({ body: 'Figure:\n\n![Diagram](/assets/blog/dot-guard/./figure.png)' }));
+    write(repo, 'assets/blog/dot-guard/figure.png', PNG);
+    git(repo, 'add', postRel, 'assets/blog/dot-guard/figure.png');
+    expectExit(guardStaged(repo), 0);
+  });
+});
+
+test('[AC-03][F-017] check refuses a pile-up of unclosed <img> tags too large to read in full', () => {
+  const root = makeRoot();
+  // Every start ends at the same `>`; reading each one whole would take quadratic time.
+  write(root, '_drafts/img-pileup.md', validArticle({ body: `Figure:\n\n${'<img '.repeat(2000)}>` }));
+  const result = cli(root, 'check', '_drafts/img-pileup.md');
+  expectExit(result, 1);
+  assert.match(result.stderr, /too many overlapping <img> tags to check/);
 });
 
 /* ------------------------------------------------------------------------ */
@@ -553,6 +909,51 @@ test('[AC-03][F-017] publish refuses a draft that fails check and moves nothing'
   assert.equal(exists(root, 'assets/blog/bad-draft'), false);
 });
 
+test('[AC-03][F-017] publish checks the post it would write, so an updated date before the UTC publish date is refused', async (t) => {
+  /** A valid draft with one image, `updated` set to `updated`. */
+  const draftWithImage = (slug, updated) => validArticle({
+    updated,
+    body: `Figure:\n\n![A labelled figure]({{ '/assets/drafts/${slug}/figure.png' | relative_url }})`,
+  });
+
+  await t.test('[AC-03][F-017] publish refuses a draft whose updated date is yesterday (UTC) and moves nothing', () => {
+    const root = makeRoot();
+    const draftText = draftWithImage('stale', addDaysUtc(-1));
+    write(root, '_drafts/stale.md', draftText);
+    write(root, 'assets/drafts/stale/figure.png', PNG);
+    expectExit(cli(root, 'check', '_drafts/stale.md'), 0);
+
+    const result = cli(root, 'publish', 'stale');
+    expectExit(result, 1);
+    assert.match(result.stderr,
+      /_posts\/\d{4}-\d{2}-\d{2}-stale\.md: updated \d{4}-\d{2}-\d{2} is earlier than the post date/,
+      'the prospective post is reported by its path');
+    assert.match(result.stderr, /nothing was moved/);
+    assert.deepEqual(fs.readFileSync(abs(root, '_drafts/stale.md')), Buffer.from(draftText),
+      'the draft is unchanged');
+    assert.deepEqual(postsFor(root, 'stale'), [], 'no post is written');
+    assert.deepEqual(fs.readFileSync(abs(root, 'assets/drafts/stale/figure.png')), PNG,
+      'the image stays in assets/drafts/');
+    assert.equal(exists(root, 'assets/blog'), false, 'no published image folder');
+  });
+
+  await t.test('[AC-03][F-017] publish accepts a draft whose updated date is today (UTC)', (st) => {
+    const root = makeRoot();
+    const dateBefore = todayUtc();
+    write(root, '_drafts/fresh.md', draftWithImage('fresh', dateBefore));
+    write(root, 'assets/drafts/fresh/figure.png', PNG);
+    const result = cli(root, 'publish', 'fresh');
+    if (todayUtc() !== dateBefore) {
+      st.skip('the run crossed midnight UTC, so "today" changed under it');
+      return;
+    }
+    expectExit(result, 0);
+    assert.deepEqual(postsFor(root, 'fresh'), [`${dateBefore}-fresh.md`]);
+    assert.deepEqual(fs.readFileSync(abs(root, 'assets/blog/fresh/figure.png')), PNG);
+    expectExit(cli(root, 'check', `_posts/${dateBefore}-fresh.md`), 0);
+  });
+});
+
 /* ------------------------------------------------------------------------ */
 /* unpublish <slug>                                                          */
 /* ------------------------------------------------------------------------ */
@@ -606,6 +1007,85 @@ test('[AC-03][F-017] unpublish refuses while a post_url names the post, and succ
   assert.equal(exists(root, targetRel), false);
 });
 
+test('[AC-03][F-017] unpublish refuses while a post_url and an ordinary link name the post, and succeeds once both are gone', () => {
+  const root = makeRoot();
+  const targetRel = `_posts/${PAST}-target.md`;
+  const targetText = validArticle({ title: 'The target' });
+  write(root, targetRel, targetText);
+  const taggedRel = `_posts/${PAST}-tagged.md`;
+  const taggedText = validArticle({
+    title: 'Tagged referrer',
+    body: `Background first.\n\nRead [the target]({{ site.baseurl }}{% post_url ${PAST}-target %}) next.`,
+  });
+  const linkedRel = `_posts/${PAST}-linked.md`;
+  const linkedText = validArticle({
+    title: 'Linked referrer',
+    body: 'Intro.\n\nSee [the target article](/blog/target/).',
+  });
+  write(root, taggedRel, taggedText);
+  write(root, linkedRel, linkedText);
+  const lineOf = (text, needle) => text.split('\n').findIndex((line) => line.includes(needle)) + 1;
+  const taggedAt = new RegExp(`${escapeRegExp(taggedRel)}:${lineOf(taggedText, 'post_url')}: `);
+  const linkedAt = new RegExp(`${escapeRegExp(linkedRel)}:${lineOf(linkedText, '/blog/target/')}: `);
+  /** Asserts that nothing moved: the post is unchanged and no draft exists. */
+  const unmoved = () => {
+    assert.equal(read(root, targetRel), targetText, 'the post stays in _posts/ unchanged');
+    assert.equal(exists(root, '_drafts'), false, 'nothing is moved to _drafts/');
+  };
+
+  const both = cli(root, 'unpublish', 'target');
+  expectExit(both, 1);
+  assert.match(both.stderr, /2 references/);
+  assert.match(both.stderr, taggedAt, 'the post_url reference is named with its file and line');
+  assert.match(both.stderr, linkedAt, 'the ordinary link is named with its file and line');
+  unmoved();
+
+  write(root, linkedRel, validArticle({ title: 'Linked referrer', body: 'No link to the target any more.' }));
+  const one = cli(root, 'unpublish', 'target');
+  expectExit(one, 1);
+  assert.match(one.stderr, taggedAt, 'the remaining post_url still refuses');
+  assert.doesNotMatch(one.stderr, new RegExp(escapeRegExp(linkedRel)), 'the removed link is no longer listed');
+  unmoved();
+
+  write(root, taggedRel, validArticle({ title: 'Tagged referrer', body: 'No tag for the target any more.' }));
+  expectExit(cli(root, 'unpublish', 'target'), 0);
+  assert.equal(read(root, '_drafts/target.md'), targetText, 'the draft is the post unchanged');
+  assert.equal(exists(root, targetRel), false, 'the post is gone');
+});
+
+test('[AC-03][F-017] unpublish refuses while a post_url or link tag written with whitespace control names the post', async (t) => {
+  // Liquid strips a closing `-` before `%}`, so these tags all name the post and fail the build once it is gone.
+  const forms = [
+    `{% post_url ${PAST}-target-%}`,
+    `{%-post_url ${PAST}-target-%}`,
+    `{%- post_url ${PAST}-target -%}`,
+    `{% link _posts/${PAST}-target.md-%}`,
+  ];
+  for (const form of forms) {
+    await t.test(`[AC-03][F-017] unpublish refuses a reference written as ${form}`, () => {
+      const root = makeRoot();
+      const targetRel = `_posts/${PAST}-target.md`;
+      const referrerName = `${PAST}-referrer.md`;
+      const targetText = validArticle({ title: 'The target' });
+      write(root, targetRel, targetText);
+      const referrerText = validArticle({
+        title: 'The referrer',
+        body: `Background first.\n\nRead [the target]({{ site.baseurl }}${form}) next.`,
+      });
+      write(root, `_posts/${referrerName}`, referrerText);
+      const line = referrerText.split('\n').findIndex((text) => text.includes(form)) + 1;
+      assert.ok(line > 0);
+
+      const result = cli(root, 'unpublish', 'target');
+      expectExit(result, 1);
+      assert.match(result.stderr, new RegExp(`${escapeRegExp(referrerName)}[^\\n]*\\b${line}\\b`),
+        `the refusal names ${referrerName} and line ${line}`);
+      assert.equal(read(root, targetRel), targetText, 'the post stays in _posts/ unchanged');
+      assert.equal(exists(root, '_drafts'), false, 'nothing is moved to _drafts/');
+    });
+  }
+});
+
 test('[AC-03][F-017] unpublish refuses while another article links to the post in any URL form', async (t) => {
   const forms = [
     '/blog/target/',
@@ -654,6 +1134,476 @@ test('[AC-03][F-017] unpublish of an image-free post in a fresh clone moves only
   assert.equal(git(clone, 'diff', '--cached', '--name-only'), '', 'nothing is staged');
   assert.equal(git(clone, 'status', '--porcelain'), `D ${postRel}`,
     'the only change is the unstaged deletion; the git-ignored draft does not show');
+});
+
+/* ------------------------------------------------------------------------ */
+/* Failures part way: rollback and retry                                     */
+/* ------------------------------------------------------------------------ */
+
+/** Writes a valid draft of `slug` with one image in `assets/drafts/<slug>/`; returns the draft text. */
+function writeDraftWithImage(root, slug) {
+  const text = validArticle({
+    body: `Figure:\n\n![A labelled figure]({{ '/assets/drafts/${slug}/figure.png' | relative_url }})`,
+  });
+  write(root, `_drafts/${slug}.md`, text);
+  write(root, `assets/drafts/${slug}/figure.png`, PNG);
+  return text;
+}
+
+/**
+ * Writes a valid post of `slug`, dated `PAST`, with one image in
+ * `assets/blog/<slug>/`.
+ *
+ * @returns {{ rel: string, text: string }} The post's path and text.
+ */
+function writePostWithImage(root, slug) {
+  const rel = `_posts/${PAST}-${slug}.md`;
+  const text = validArticle({
+    body: `Figure:\n\n![A labelled figure]({{ '/assets/blog/${slug}/figure.png' | relative_url }})`,
+  });
+  write(root, rel, text);
+  write(root, `assets/blog/${slug}/figure.png`, PNG);
+  return { rel, text };
+}
+
+/** Asserts that a draft from `writeDraftWithImage` is exactly as it was: nothing published, nothing left over. */
+function assertStillDraft(root, slug, text) {
+  assert.equal(read(root, `_drafts/${slug}.md`), text, 'the draft is unchanged');
+  assert.deepEqual(fs.readFileSync(abs(root, `assets/drafts/${slug}/figure.png`)), PNG,
+    'the image is in assets/drafts/');
+  assert.deepEqual(postsFor(root, slug), [], 'no post is left in _posts/');
+  assert.equal(exists(root, `assets/blog/${slug}`), false, 'no published image folder is left');
+}
+
+/** Asserts that a post from `writePostWithImage` is exactly as it was: nothing unpublished, nothing left over. */
+function assertStillPost(root, slug, { rel, text }) {
+  assert.equal(read(root, rel), text, 'the post is unchanged');
+  assert.deepEqual(fs.readFileSync(abs(root, `assets/blog/${slug}/figure.png`)), PNG, 'the image is in assets/blog/');
+  assert.equal(exists(root, `_drafts/${slug}.md`), false, 'no draft is left in _drafts/');
+  assert.equal(exists(root, `assets/drafts/${slug}`), false, 'no draft image folder is left');
+}
+
+/** Asserts that `publish <slug>` now succeeds without faults: one post, its image published, the draft gone. */
+function assertRetryPublishes(root, slug) {
+  expectExit(cli(root, 'publish', slug), 0);
+  assert.equal(postsFor(root, slug).length, 1, 'the retry publishes one post');
+  assert.deepEqual(fs.readFileSync(abs(root, `assets/blog/${slug}/figure.png`)), PNG, 'the retry moves the image');
+  assert.equal(exists(root, `_drafts/${slug}.md`), false, 'the retry removes the draft');
+}
+
+/** Asserts that `unpublish <slug>` now succeeds without faults: the draft and its image back, the post gone. */
+function assertRetryUnpublishes(root, slug, { rel }) {
+  expectExit(cli(root, 'unpublish', slug), 0);
+  assert.ok(exists(root, `_drafts/${slug}.md`), 'the retry writes the draft');
+  assert.deepEqual(fs.readFileSync(abs(root, `assets/drafts/${slug}/figure.png`)), PNG, 'the retry moves the image');
+  assert.equal(exists(root, rel), false, 'the retry removes the post');
+}
+
+test('[AC-03][F-017] a short write leaves no partial file behind, and the command can then be run again', async (t) => {
+  const shortWrite = (pathPart) => [{ fn: 'writeSync', path: pathPart, action: 'short-write', code: 'ENOSPC' }];
+
+  await t.test('[AC-03][F-017] new: a short write of the draft leaves no _drafts/<slug>.md', () => {
+    const root = makeRoot();
+    const failed = cliWithFaults(root, shortWrite('_drafts/short.md'), 'new', 'short');
+    expectExit(failed, 1);
+    assert.match(failed.stderr, /new failed: cannot write _drafts\/short\.md \(ENOSPC/);
+    assert.match(failed.stderr, /every change was rolled back/);
+    assert.equal(exists(root, '_drafts/short.md'), false, 'no partial draft is left');
+    assert.equal(exists(root, 'assets/drafts/short'), false, 'no image folder is created');
+
+    expectExit(cli(root, 'new', 'short'), 0);
+    assert.deepEqual(fs.readFileSync(abs(root, '_drafts/short.md')), fs.readFileSync(TEMPLATE),
+      'the retry writes the whole template');
+  });
+
+  await t.test('[AC-03][F-017] publish: a short write of the post leaves no partial post', () => {
+    const root = makeRoot();
+    const text = writeDraftWithImage(root, 'short');
+    const failed = cliWithFaults(root, shortWrite('_posts/'), 'publish', 'short');
+    expectExit(failed, 1);
+    assert.match(failed.stderr, /publish failed: cannot write _posts\/\S+-short\.md \(ENOSPC/);
+    assert.match(failed.stderr, /every change was rolled back/);
+    assert.deepEqual(list(root, '_posts'), [], 'no partial post is left');
+    assertStillDraft(root, 'short', text);
+    assertRetryPublishes(root, 'short');
+  });
+
+  await t.test('[AC-03][F-017] unpublish: a short write of the draft leaves no partial draft', () => {
+    const root = makeRoot();
+    const post = writePostWithImage(root, 'short');
+    const failed = cliWithFaults(root, shortWrite('_drafts/short.md'), 'unpublish', 'short');
+    expectExit(failed, 1);
+    assert.match(failed.stderr, /unpublish failed: cannot write _drafts\/short\.md \(ENOSPC/);
+    assert.match(failed.stderr, /every change was rolled back/);
+    assert.deepEqual(list(root, '_drafts'), [], 'no partial draft is left');
+    assertStillPost(root, 'short', post);
+    assertRetryUnpublishes(root, 'short', post);
+  });
+});
+
+test('[AC-03][F-017] a failure removing the source undoes every earlier step, and the command can then be run again', async (t) => {
+  // The source is first set aside with a rename, then the set-aside copy is
+  // removed: a failure at either half of that commit point is undone.
+  const unlinkFault = (pathPart) => [{ fn: 'unlinkSync', path: pathPart, action: 'throw', code: 'EPERM' }];
+  const renameFault = (pathPart) => [{ fn: 'renameSync', path: pathPart, action: 'throw', code: 'EPERM' }];
+
+  await t.test('[AC-03][F-017] publish: when the draft cannot be removed, the post goes and the images return', () => {
+    const root = makeRoot();
+    const text = writeDraftWithImage(root, 'stuck');
+    const failed = cliWithFaults(root, unlinkFault('_drafts/.stuck.publishing'), 'publish', 'stuck');
+    expectExit(failed, 1);
+    assert.match(failed.stderr, /publish failed: cannot remove _drafts\/stuck\.md \(EPERM/);
+    assert.match(failed.stderr, /every change was rolled back and nothing was moved/);
+    assertStillDraft(root, 'stuck', text);
+    assert.equal(exists(root, '_drafts/.stuck.publishing'), false, 'no set-aside copy is left');
+    assertRetryPublishes(root, 'stuck');
+  });
+
+  await t.test('[AC-03][F-017] publish: when the set-aside copy cannot be removed at all, the draft is back and a retry clears the copy', () => {
+    const root = makeRoot();
+    const text = writeDraftWithImage(root, 'stuck');
+    const twice = [...unlinkFault('_drafts/.stuck.publishing'), ...unlinkFault('_drafts/.stuck.publishing')];
+    const failed = cliWithFaults(root, twice, 'publish', 'stuck');
+    expectExit(failed, 1);
+    assert.match(failed.stderr, /publish failed: cannot remove _drafts\/stuck\.md \(EPERM/);
+    assert.match(failed.stderr, /rollback failed: cannot remove the set-aside copy _drafts\/\.stuck\.publishing \(EPERM/);
+    assert.match(failed.stderr, /present: _drafts\/stuck\.md, assets\/drafts\/stuck\/, _drafts\/\.stuck\.publishing/);
+    assert.doesNotMatch(failed.stderr, /rolled back and/, 'no completed rollback is claimed');
+    assertStillDraft(root, 'stuck', text);
+    assert.equal(read(root, '_drafts/.stuck.publishing'), text, 'the leftover is an identical copy');
+
+    const retried = cli(root, 'publish', 'stuck');
+    expectExit(retried, 0);
+    assert.match(retried.stderr, /removed _drafts\/\.stuck\.publishing, an identical copy of _drafts\/stuck\.md/);
+    assert.equal(exists(root, '_drafts/.stuck.publishing'), false);
+    assert.equal(postsFor(root, 'stuck').length, 1);
+  });
+
+  await t.test('[AC-03][F-017] publish: when the draft cannot be set aside, the post goes and the images return', () => {
+    const root = makeRoot();
+    const text = writeDraftWithImage(root, 'stuck');
+    const failed = cliWithFaults(root, renameFault('_drafts/stuck.md'), 'publish', 'stuck');
+    expectExit(failed, 1);
+    assert.match(failed.stderr, /publish failed: cannot set _drafts\/stuck\.md aside as _drafts\/\.stuck\.publishing \(EPERM/);
+    assert.match(failed.stderr, /every change was rolled back and nothing was moved/);
+    assertStillDraft(root, 'stuck', text);
+    assertRetryPublishes(root, 'stuck');
+  });
+
+  await t.test('[AC-03][F-017] publish without images: the empty image folder made by new is restored', () => {
+    const root = makeRoot();
+    expectExit(cli(root, 'new', 'stuck'), 0);
+    const text = validArticle({ title: 'No images' });
+    write(root, '_drafts/stuck.md', text);
+    const failed = cliWithFaults(root, unlinkFault('_drafts/.stuck.publishing'), 'publish', 'stuck');
+    expectExit(failed, 1);
+    assert.match(failed.stderr, /every change was rolled back and nothing was moved/);
+    assert.equal(read(root, '_drafts/stuck.md'), text, 'the draft is unchanged');
+    assert.deepEqual(postsFor(root, 'stuck'), [], 'no post is left in _posts/');
+    assert.ok(fs.statSync(abs(root, 'assets/drafts/stuck')).isDirectory(), 'the empty image folder is back');
+
+    expectExit(cli(root, 'publish', 'stuck'), 0);
+    assert.equal(postsFor(root, 'stuck').length, 1);
+    assert.equal(exists(root, 'assets/drafts/stuck'), false);
+  });
+
+  await t.test('[AC-03][F-017] unpublish: when the post cannot be removed, its images stay published with it', () => {
+    const root = makeRoot();
+    const post = writePostWithImage(root, 'stuck');
+    const failed = cliWithFaults(root, unlinkFault('_drafts/.stuck.unpublishing'), 'unpublish', 'stuck');
+    expectExit(failed, 1);
+    assert.match(failed.stderr, new RegExp(`unpublish failed: cannot remove ${escapeRegExp(post.rel)} \\(EPERM`));
+    assert.match(failed.stderr, /every change was rolled back and nothing was moved/);
+    assertStillPost(root, 'stuck', post);
+    assert.equal(exists(root, '_drafts/.stuck.unpublishing'), false, 'no set-aside copy is left');
+    assertRetryUnpublishes(root, 'stuck', post);
+  });
+
+  await t.test('[AC-03][F-017] unpublish: when the post cannot be set aside, its images stay published with it', () => {
+    const root = makeRoot();
+    const post = writePostWithImage(root, 'stuck');
+    const failed = cliWithFaults(root, renameFault(post.rel), 'unpublish', 'stuck');
+    expectExit(failed, 1);
+    assert.match(failed.stderr, new RegExp(`unpublish failed: cannot set ${escapeRegExp(post.rel)} aside \\S+ \\S+ \\(EPERM`));
+    assert.match(failed.stderr, /every change was rolled back and nothing was moved/);
+    assertStillPost(root, 'stuck', post);
+    assertRetryUnpublishes(root, 'stuck', post);
+  });
+});
+
+test('[AC-03][F-017] a rollback that fails is reported with the original error and what remains, never as completed', async (t) => {
+  await t.test('[AC-03][F-017] publish: the image move fails, and so does removing the new post', () => {
+    const root = makeRoot();
+    writeDraftWithImage(root, 'tangle');
+    const failed = cliWithFaults(root, [
+      { fn: 'renameSync', path: 'assets/drafts/tangle', action: 'throw', code: 'EXDEV' },
+      { fn: 'unlinkSync', path: '_posts/', action: 'throw', code: 'EACCES' },
+    ], 'publish', 'tangle');
+    expectExit(failed, 1);
+    assert.match(failed.stderr,
+      /publish failed: cannot move assets\/drafts\/tangle\/ to assets\/blog\/tangle\/ \(EXDEV/,
+      'the original error is reported');
+    assert.match(failed.stderr, /rollback failed: cannot remove _posts\/\S+-tangle\.md \(EACCES/,
+      'the rollback error is reported');
+    assert.match(failed.stderr, /present: _drafts\/tangle\.md, _posts\/\S+-tangle\.md, assets\/drafts\/tangle\//,
+      'the files that remain are listed');
+    assert.match(failed.stderr, /missing: assets\/blog\/tangle\//);
+    assert.doesNotMatch(failed.stderr, /rolled back and/, 'no completed rollback is claimed');
+    assert.ok(exists(root, '_drafts/tangle.md'), 'the draft is kept');
+    assert.equal(postsFor(root, 'tangle').length, 1, 'the post the rollback could not remove remains, as reported');
+    assert.deepEqual(fs.readFileSync(abs(root, 'assets/drafts/tangle/figure.png')), PNG, 'the image never moved');
+  });
+
+  await t.test('[AC-03][F-017] unpublish: the image move fails, and so does removing the new draft', () => {
+    const root = makeRoot();
+    const post = writePostWithImage(root, 'tangle');
+    const failed = cliWithFaults(root, [
+      { fn: 'renameSync', path: 'assets/blog/tangle', action: 'throw', code: 'EXDEV' },
+      { fn: 'unlinkSync', path: '_drafts/', action: 'throw', code: 'EACCES' },
+    ], 'unpublish', 'tangle');
+    expectExit(failed, 1);
+    assert.match(failed.stderr,
+      /unpublish failed: cannot move assets\/blog\/tangle\/ to assets\/drafts\/tangle\/ \(EXDEV/,
+      'the original error is reported');
+    assert.match(failed.stderr, /rollback failed: cannot remove _drafts\/tangle\.md \(EACCES/,
+      'the rollback error is reported');
+    assert.match(failed.stderr,
+      new RegExp(`present: ${escapeRegExp(post.rel)}, _drafts/tangle\\.md, assets/blog/tangle/`),
+      'the files that remain are listed');
+    assert.match(failed.stderr, /missing: assets\/drafts\/tangle\//);
+    assert.doesNotMatch(failed.stderr, /rolled back and/, 'no completed rollback is claimed');
+    assert.equal(read(root, post.rel), post.text, 'the live post is untouched');
+    assert.deepEqual(fs.readFileSync(abs(root, 'assets/blog/tangle/figure.png')), PNG, 'its image never moved');
+  });
+});
+
+test('[AC-03][F-017] an edit saved while publish or unpublish runs is neither published unchecked nor lost', async (t) => {
+  const SCRIPT = '\n<script>alert(1)</script>\n';
+  /** Appends `text` to `file` when the tool opens a path containing `opened`, after it read the article. */
+  const editWhenOpened = (opened, file, text) => [
+    { fn: 'openSync', path: opened, action: 'append-to-file', file, text },
+  ];
+
+  await t.test('[AC-03][F-017] publish: a <script> saved into the draft after the check is refused and kept', () => {
+    const root = makeRoot();
+    const text = writeDraftWithImage(root, 'race');
+    const faults = editWhenOpened('_posts/', abs(root, '_drafts/race.md'), SCRIPT);
+    const failed = cliWithFaults(root, faults, 'publish', 'race');
+    expectExit(failed, 1);
+    assert.match(failed.stderr, /publish failed: _drafts\/race\.md changed while publishing; your edit is kept/);
+    assert.match(failed.stderr, /every change was rolled back/);
+    assert.equal(read(root, '_drafts/race.md'), text + SCRIPT, 'the draft holds the edit');
+    assert.deepEqual(postsFor(root, 'race'), [], 'nothing unchecked is published');
+    assert.deepEqual(fs.readFileSync(abs(root, 'assets/drafts/race/figure.png')), PNG,
+      'the image is back in assets/drafts/');
+    assert.equal(exists(root, 'assets/blog/race'), false);
+  });
+
+  await t.test('[AC-03][F-017] publish without images writes the checked bytes, and refuses an edit made after the check', () => {
+    const root = makeRoot();
+    const checked = Buffer.from(validArticle({
+      title: 'Café notes — naïve bytes',
+      body: 'Ünïcödé body, kept byte for byte.',
+    }));
+    write(root, '_drafts/exact.md', checked);
+    const faults = editWhenOpened('_posts/', abs(root, '_drafts/exact.md'), SCRIPT);
+    const failed = cliWithFaults(root, faults, 'publish', 'exact');
+    expectExit(failed, 1);
+    assert.match(failed.stderr, /_drafts\/exact\.md changed while publishing; your edit is kept/);
+    assert.deepEqual(fs.readFileSync(abs(root, '_drafts/exact.md')), Buffer.concat([checked, Buffer.from(SCRIPT)]),
+      'the draft holds the edit');
+    assert.deepEqual(postsFor(root, 'exact'), [], 'nothing unchecked is published');
+
+    write(root, '_drafts/exact.md', checked);
+    expectExit(cli(root, 'publish', 'exact'), 0);
+    const posts = postsFor(root, 'exact');
+    assert.equal(posts.length, 1);
+    assert.deepEqual(fs.readFileSync(abs(root, `_posts/${posts[0]}`)), checked,
+      'the post is exactly the checked bytes');
+  });
+
+  await t.test('[AC-03][F-017] unpublish: an edit saved into the post meanwhile keeps the post and its images', () => {
+    const root = makeRoot();
+    const post = writePostWithImage(root, 'race');
+    const edit = '\nA late correction.\n';
+    const failed = cliWithFaults(root, editWhenOpened('_drafts/race.md', abs(root, post.rel), edit), 'unpublish', 'race');
+    expectExit(failed, 1);
+    assert.match(failed.stderr,
+      new RegExp(`${escapeRegExp(post.rel)} changed while unpublishing; your edit is kept`));
+    assert.match(failed.stderr, /every change was rolled back/);
+    assertStillPost(root, 'race', { rel: post.rel, text: post.text + edit });
+  });
+});
+
+test('[AC-03][F-017] a save landing at the commit point is never deleted with the source', async (t) => {
+  const NEWER = 'A newer save from the editor.\n';
+  /** Saves `NEWER` at `file` (by path, as an editor does) when the tool calls `fn` on a path containing `at`. */
+  const saveWhen = (fn, at, file) => [{ fn, path: at, action: 'append-to-file', file, text: NEWER }];
+
+  await t.test('[AC-03][F-017] publish: a save after the draft is set aside, before its check, is refused and kept', () => {
+    const root = makeRoot();
+    const text = writeDraftWithImage(root, 'late');
+    const failed = cliWithFaults(root,
+      saveWhen('readFileSync', '_drafts/.late.publishing', abs(root, '_drafts/late.md')), 'publish', 'late');
+    expectExit(failed, 1);
+    assert.match(failed.stderr, /publish failed: _drafts\/late\.md was saved again while publishing; your edit is kept/);
+    assert.match(failed.stderr, /every change was rolled back and nothing was moved/);
+    assert.equal(read(root, '_drafts/late.md'), NEWER, 'the newer save is the draft');
+    assert.notEqual(read(root, '_drafts/late.md'), text);
+    assert.deepEqual(postsFor(root, 'late'), [], 'nothing is published');
+    assert.deepEqual(fs.readFileSync(abs(root, 'assets/drafts/late/figure.png')), PNG, 'the image is back');
+    assert.equal(exists(root, '_drafts/.late.publishing'), false, 'the superseded set-aside copy is removed');
+  });
+
+  await t.test('[AC-03][F-017] publish: a save after the check, as the set-aside copy is removed, is kept and reported', () => {
+    const root = makeRoot();
+    const text = writeDraftWithImage(root, 'late');
+    const result = cliWithFaults(root,
+      saveWhen('unlinkSync', '_drafts/.late.publishing', abs(root, '_drafts/late.md')), 'publish', 'late');
+    expectExit(result, 0);
+    assert.match(result.stderr, /_drafts\/late\.md was saved again as publishing finished/);
+    const posts = postsFor(root, 'late');
+    assert.equal(posts.length, 1, 'the checked text is published');
+    assert.equal(read(root, `_posts/${posts[0]}`), text.split('/assets/drafts/late/').join('/assets/blog/late/'));
+    assert.equal(read(root, '_drafts/late.md'), NEWER, 'the newer save is kept, not deleted');
+  });
+
+  await t.test('[AC-03][F-017] unpublish: a save of the post after it is set aside is refused and kept', () => {
+    const root = makeRoot();
+    writePostWithImage(root, 'late');
+    const postRel = `_posts/${PAST}-late.md`;
+    const failed = cliWithFaults(root,
+      saveWhen('readFileSync', '_drafts/.late.unpublishing', abs(root, postRel)), 'unpublish', 'late');
+    expectExit(failed, 1);
+    assert.match(failed.stderr,
+      new RegExp(`${escapeRegExp(postRel)} was saved again while unpublishing; your edit is kept`));
+    assert.match(failed.stderr, /every change was rolled back and nothing was moved/);
+    assert.equal(read(root, postRel), NEWER, 'the newer save is the post');
+    assert.deepEqual(fs.readFileSync(abs(root, 'assets/blog/late/figure.png')), PNG, 'its image stays published');
+    assert.equal(exists(root, '_drafts/late.md'), false, 'no draft is left');
+    assert.equal(exists(root, '_drafts/.late.unpublishing'), false, 'the superseded set-aside copy is removed');
+  });
+});
+
+test('[AC-03][F-017] a per-slug lock serializes new, publish and unpublish, and a stale lock never blocks a retry', async (t) => {
+  const lockRel = (slug) => `_drafts/.${slug}.lock`;
+
+  await t.test('[AC-03][F-017] a competing publish dated the next UTC day is refused while the first one runs', () => {
+    const root = makeRoot();
+    write(root, '_drafts/race.md', validArticle({ title: 'Race' }));
+    const out = path.join(root, '..', `${path.basename(root)}-competitor.json`);
+    const tomorrow = new Date(Date.now() + 86400000).toISOString();
+    const first = cliWithFaults(root, [{
+      fn: 'openSync',
+      path: '_posts/',
+      action: 'run-tool',
+      argv: [ARTICLE_MJS, 'publish', 'race', '--root', root],
+      cwd: root,
+      env: { ARTICLE_FAKE_NOW: tomorrow },
+      out,
+    }], 'publish', 'race');
+    const competitor = JSON.parse(fs.readFileSync(out, 'utf8'));
+    assert.equal(competitor.status, 1, `the competing run is refused:\n${competitor.stderr}`);
+    assert.match(competitor.stderr,
+      new RegExp(`another article\\.mjs run \\(process \\d+ on ${escapeRegExp(os.hostname())}\\) is changing slug race`));
+    expectExit(first, 0);
+    assert.equal(postsFor(root, 'race').length, 1, 'exactly one post, so the slug is published once');
+    assert.equal(exists(root, '_drafts/race.md'), false);
+    assert.equal(exists(root, lockRel('race')), false, 'the lock is released');
+    expectExit(cli(root, 'check'), 0);
+  });
+
+  await t.test('[AC-03][F-017] a lock left by a process that no longer runs is replaced', () => {
+    const root = makeRoot();
+    write(root, '_drafts/stale.md', validArticle({ title: 'Stale lock' }));
+    const gone = spawnSync(process.execPath, ['-e', ''], { encoding: 'utf8' });
+    assert.equal(gone.status, 0);
+    write(root, lockRel('stale'), `${gone.pid} ${os.hostname()}\n`);
+    const result = cli(root, 'publish', 'stale');
+    expectExit(result, 0);
+    assert.match(result.stderr, new RegExp(`replaced the stale lock ${escapeRegExp(lockRel('stale'))}`));
+    assert.equal(postsFor(root, 'stale').length, 1);
+    assert.equal(exists(root, lockRel('stale')), false, 'the lock is released');
+  });
+
+  await t.test('[AC-03][F-017] a lock held by a running process, or one that names no process, refuses and is kept', () => {
+    for (const held of [`${process.pid} ${os.hostname()}\n`, 'not a lock record']) {
+      const root = makeRoot();
+      const text = validArticle({ title: 'Held lock' });
+      write(root, '_drafts/held.md', text);
+      write(root, lockRel('held'), held);
+      for (const args of [['publish', 'held'], ['new', 'held'], ['unpublish', 'held']]) {
+        const result = cli(root, ...args);
+        expectExit(result, 1);
+        assert.match(result.stderr, /another article\.mjs run .*is changing slug held/);
+        assert.match(result.stderr, new RegExp(`delete ${escapeRegExp(lockRel('held'))} first`));
+      }
+      assert.equal(read(root, '_drafts/held.md'), text, 'the draft is untouched');
+      assert.deepEqual(postsFor(root, 'held'), [], 'nothing is published');
+      assert.equal(read(root, lockRel('held')), held, 'the other run\'s lock is kept');
+    }
+  });
+
+  await t.test('[AC-03][F-017] a set-aside copy left by an interrupted publish refuses before anything moves', () => {
+    const root = makeRoot();
+    const text = writeDraftWithImage(root, 'left');
+    write(root, '_drafts/.left.publishing', 'an earlier copy');
+    const result = cli(root, 'publish', 'left');
+    expectExit(result, 1);
+    assert.match(result.stderr, /_drafts\/\.left\.publishing is left from an interrupted publish/);
+    assertStillDraft(root, 'left', text);
+    assert.equal(read(root, '_drafts/.left.publishing'), 'an earlier copy', 'it is not overwritten');
+  });
+});
+
+/* ------------------------------------------------------------------------ */
+/* Next steps and --root                                                     */
+/* ------------------------------------------------------------------------ */
+
+test('[AC-03][F-017] the next steps start with a quoted cd to --root when the tool runs from another folder, and only then', () => {
+  const base = caseDir('elsewhere');
+  const root = path.join(base, "it's a $root");
+  write(root, '_templates/article.md', fs.readFileSync(TEMPLATE));
+  const fromBase = (...args) => run([...args, '--root', root], { cwd: base });
+  const cdLines = (result) => result.stdout.split('\n').filter((line) => line.startsWith('  cd '));
+  /** The folder a printed `cd` line lands in when pasted into a POSIX shell. */
+  const landsIn = (line) => {
+    const shell = spawnSync('sh', ['-c', `${line} && pwd -P`], { encoding: 'utf8', timeout: 30000 });
+    if (shell.error) throw shell.error;
+    return shell.stdout.trim();
+  };
+
+  const created = fromBase('new', 'away');
+  expectExit(created, 0);
+  const lines = cdLines(created);
+  assert.equal(lines.length, 1, `new prints one cd line:\n${created.stdout}`);
+  const [cdLine] = lines;
+  assert.match(created.stdout, /Next:\n {2}cd /, 'the cd line comes first');
+  assert.equal(landsIn(cdLine), root, 'the quoted cd reaches the root');
+  assert.ok(created.stderr.includes(`git -C ${cdLine.slice('  cd '.length)} config core.hooksPath .githooks`),
+    `the hooks hint names the root as well:\n${created.stderr}`);
+
+  write(root, '_drafts/away.md', validArticle());
+  const published = fromBase('publish', 'away');
+  expectExit(published, 0);
+  assert.deepEqual(cdLines(published), [cdLine]);
+  assert.match(published.stdout, /Next:\n {2}cd /);
+  const unpublished = fromBase('unpublish', 'away');
+  expectExit(unpublished, 0);
+  assert.deepEqual(cdLines(unpublished), [cdLine]);
+  assert.match(unpublished.stdout, /Next:\n {2}cd /);
+
+  const createdHere = cli(root, 'new', 'here');
+  expectExit(createdHere, 0);
+  assert.deepEqual(cdLines(createdHere), [], 'no cd line when run from the root');
+  assert.match(createdHere.stderr, /run: git config core\.hooksPath \.githooks/);
+  write(root, '_drafts/here.md', validArticle({ title: 'Here' }));
+  const publishedHere = cli(root, 'publish', 'here');
+  expectExit(publishedHere, 0);
+  assert.deepEqual(cdLines(publishedHere), []);
+  const unpublishedHere = cli(root, 'unpublish', 'here');
+  expectExit(unpublishedHere, 0);
+  assert.deepEqual(cdLines(unpublishedHere), []);
 });
 
 /* ------------------------------------------------------------------------ */
@@ -860,3 +1810,197 @@ test('[AC-03][F-017] guard --pre-push accepts a valid post', GIT_CASE, () => {
   expectExit(result, 0);
   assert.match(result.stdout, /\b1 commit\b/, 'exactly the one new commit is checked');
 });
+
+/* ------------------------------------------------------------------------ */
+/* Article analyses reused by blob id                                        */
+/* ------------------------------------------------------------------------ */
+
+test('[AC-03][F-017] guard --pre-push checks a recurring article blob in every commit, refusing only the one lacking its image', GIT_CASE, () => {
+  const { repo } = makeRemoteRepo();
+  const remoteSha = git(repo, 'rev-parse', 'HEAD');
+  const postRel = `_posts/${PAST}-recurring.md`;
+  const imageRel = 'assets/blog/recurring/fig.png';
+  const withFigure = validArticle({ body: "![Figure]({{ '/assets/blog/recurring/fig.png' | relative_url }})" });
+  const withoutFigure = validArticle({ body: 'This version has no figure.' });
+  /** Commits `text` as the post; each version is one blob however often it recurs. */
+  const commitPost = (text, message) => {
+    write(repo, postRel, text);
+    git(repo, 'add', postRel);
+    commit(repo, message);
+  };
+  write(repo, imageRel, PNG);
+  git(repo, 'add', imageRel);
+  commitPost(withFigure, 'Add the post and its image');
+  commitPost(withoutFigure, 'Change the post');
+  commitPost(withFigure, 'Restore the post');
+  git(repo, 'rm', '-q', imageRel);
+  commitPost(withoutFigure, 'Change the post again and delete the image');
+  commitPost(withFigure, 'Restore the post without its image');
+  const blobAt = (rev) => git(repo, 'rev-parse', `${rev}:${postRel}`);
+  assert.equal(blobAt('HEAD~4'), blobAt('HEAD'), 'the first and last commits hold the same blob');
+  assert.equal(blobAt('HEAD~2'), blobAt('HEAD'), 'the restoring commit holds it too');
+  assert.equal(blobAt('HEAD~3'), blobAt('HEAD~1'), 'the changed version recurs as well');
+
+  const result = prePush(repo, 'refs/heads/main', 'refs/heads/main', remoteSha);
+  expectExit(result, 1);
+  const tip = git(repo, 'rev-parse', 'HEAD').slice(0, 7);
+  const reported = result.stderr.split('\n').filter((line) => line.startsWith('error: '));
+  assert.deepEqual(reported, [`error: ${tip}: ${postRel}:7: image /assets/blog/recurring/fig.png does not exist`],
+    'the blob passes in the commits that hold its image and fails only in the one that does not');
+  assert.match(result.stderr, /push refused \(1 problem in 1 commit\)/);
+});
+
+test('[AC-03][F-017] checkTrackedContent reuses a cached analysis per id across trees and redoes it for changed text', async () => {
+  const { checkTrackedContent } = await import(new URL('../../scripts/lib/articles.mjs', import.meta.url));
+  const today = todayUtc();
+  const postPath = `_posts/${PAST}-cached.md`;
+  const copyPath = `_posts/${PAST}-cached-copy.md`;
+  // The template's closing placeholder line, an image and unsafe markup: a finding from each analysis.
+  const placeholder = fs.readFileSync(TEMPLATE, 'utf8').trimEnd().split('\n').pop();
+  const text = validArticle({
+    body: `![Figure](/assets/blog/cached/fig.png)\n\n${placeholder}\n\n<script>alert(1)</script>`,
+  });
+  const withImage = [postPath, 'assets/blog/cached/fig.png'];
+  const withoutImage = [postPath];
+  const check = (paths, articles, cache) => checkTrackedContent({ paths, articles, todayUtc: today, cache });
+  const plain = (...paths) => paths.map((p) => ({ path: p, text }));
+
+  const cache = new Map();
+  const first = check(withImage, [{ path: postPath, text, id: 'blob-a' }], cache);
+  assert.equal(cache.size, 1);
+  const entry = cache.get('blob-a');
+  const second = check(withoutImage, [{ path: postPath, text, id: 'blob-a' }], cache);
+  assert.equal(cache.size, 1);
+  assert.equal(cache.get('blob-a'), entry, 'the same id and text reuse the stored analysis');
+  assert.deepEqual(first, check(withImage, plain(postPath)), 'a reused analysis reports what a fresh one does');
+  assert.deepEqual(second, check(withoutImage, plain(postPath)));
+  const missing = `${postPath}:7: image /assets/blog/cached/fig.png does not exist`;
+  assert.equal(first.includes(missing), false, 'the image exists in the first tree');
+  assert.equal(second.includes(missing), true, 'existence is checked against the tree of each call');
+  assert.ok(second.some((e) => e.startsWith(`${postPath}:9: body still contains`)), 'placeholder line reported');
+  assert.ok(second.some((e) => e.startsWith(`${postPath}:11: unsafe markup`)), 'unsafe markup reported');
+
+  // One blob at two paths shares the analysis; each path keeps its own filename and folder rules.
+  const shared = [{ path: postPath, text, id: 'blob-a' }, { path: copyPath, text, id: 'blob-a' }];
+  const both = check([...withImage, copyPath], shared, cache);
+  assert.equal(cache.get('blob-a'), entry);
+  assert.deepEqual(both, check([...withImage, copyPath], plain(postPath, copyPath)));
+  assert.ok(both.some((e) => e.startsWith(`${copyPath}:7: `)), "the copy's image is outside the copy's own folder");
+
+  // Different text under a known id is analysed afresh and replaces the entry.
+  const edited = validArticle({ body: 'Edited body.' });
+  assert.deepEqual(check(withoutImage, [{ path: postPath, text: edited, id: 'blob-a' }], cache), []);
+  assert.equal(cache.size, 1);
+  assert.notEqual(cache.get('blob-a'), entry, 'the entry for the old text is replaced');
+
+  // A cache value checkTrackedContent did not make is never trusted.
+  const forged = new Map([['blob-b', {
+    text, data: {}, body: '', parseErrors: [], bodyStartLine: 1, unsafe: [],
+    bodyAnalysis: { lineAt: () => 1, todoLines: [], images: [] },
+  }]]);
+  assert.deepEqual(check(withoutImage, [{ path: postPath, text, id: 'blob-b' }], forged), second);
+
+  assert.throws(() => check(withoutImage, [], {}), { name: 'TypeError', message: /cache must be a Map/ });
+  for (const id of ['', 42]) {
+    assert.throws(() => check(withoutImage, [{ path: postPath, text, id }]),
+      { name: 'TypeError', message: /must be a non-empty string/ });
+  }
+});
+
+/* ------------------------------------------------------------------------ */
+/* guard when git itself does not answer                                     */
+/* ------------------------------------------------------------------------ */
+
+/** The shim is a POSIX shell script, which Windows cannot run as `git`. */
+const SHIM_CASE = { ...GIT_CASE, skip: process.platform === 'win32' ? 'the git shim needs a POSIX shell' : false };
+
+let realGitPath;
+
+/** Absolute path of the git on `ENV`'s PATH, resolved once, before any shim stands in front of it. */
+function realGit() {
+  if (realGitPath === undefined) {
+    const result = spawnSync('sh', ['-c', 'command -v git'], { env: ENV, encoding: 'utf8', timeout: 30000 });
+    if (result.error) throw result.error;
+    const found = result.stdout.trim();
+    assert.ok(path.isAbsolute(found), `command -v git found no git on PATH: ${JSON.stringify(result.stdout)}`);
+    realGitPath = found;
+  }
+  return realGitPath;
+}
+
+/** Quotes text as one POSIX shell word. */
+function shQuote(text) {
+  return `'${text.replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * A stand-in `git` first on PATH: a POSIX shell script that appends its
+ * arguments to a log, one call per line, and kills itself with SIGKILL when
+ * they start with `killPrefix`, as a git ended by a signal would end;
+ * otherwise it runs the real git.
+ *
+ * @returns {{ env: NodeJS.ProcessEnv, calls: () => string[] }} The tool's
+ *   environment, and the logged argument lines so far.
+ */
+function gitShim(killPrefix) {
+  const dir = caseDir('git-shim');
+  const log = path.join(dir, 'calls.log');
+  fs.writeFileSync(path.join(dir, 'git'), [
+    '#!/bin/sh',
+    `printf '%s\\n' "$*" >> ${shQuote(log)}`,
+    `case "$*" in ${shQuote(killPrefix)}*) kill -9 $$ ;; esac`,
+    `exec ${shQuote(realGit())} "$@"`,
+    '',
+  ].join('\n'), { mode: 0o755 });
+  return {
+    env: { ...ENV, PATH: `${dir}${path.delimiter}${ENV.PATH ?? ''}` },
+    calls: () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\n').filter((line) => line !== '') : []),
+  };
+}
+
+test('[AC-03][F-017] guard --staged refuses (fail closed) when git is killed by a signal', SHIM_CASE, () => {
+  const repo = makeRepo();
+  const postRel = `_posts/${PAST}-staged.md`;
+  write(repo, postRel, validArticle({ title: 'Staged article' }));
+  git(repo, 'add', postRel);
+  expectExit(guardStaged(repo), 0);
+
+  const shim = gitShim('diff --cached');
+  const result = run(['guard', '--staged'], { cwd: repo, env: shim.env });
+  expectExit(result, 1);
+  assert.match(result.stderr, /git diff --cached [^\n]*failed: was killed by SIGKILL/,
+    'the refusal names the git command and the signal');
+  assert.match(result.stderr, /fail closed/);
+  const calls = shim.calls();
+  assert.equal(calls.filter((call) => call.startsWith('diff --cached')).length, 1, `calls:\n${calls.join('\n')}`);
+  assert.ok(calls.at(-1).startsWith('diff --cached'),
+    `no git command runs after the killed one, so its missing answer steers nothing:\n${calls.join('\n')}`);
+});
+
+test('[AC-03][F-017] guard --pre-push refuses (fail closed) when the probe for the remote tip is killed, without widening the range', SHIM_CASE, () => {
+  const { repo } = makeRemoteRepo();
+  const remoteSha = git(repo, 'rev-parse', 'HEAD');
+  const postRel = `_posts/${PAST}-pushed.md`;
+  write(repo, postRel, validArticle({ title: 'Pushed article' }));
+  git(repo, 'add', postRel);
+  commit(repo, 'Publish: Pushed article');
+  expectExit(prePush(repo, 'refs/heads/main', 'refs/heads/main', remoteSha), 0);
+
+  const shim = gitShim('cat-file -e');
+  const localSha = git(repo, 'rev-parse', 'HEAD');
+  const result = run(['guard', '--pre-push'], {
+    cwd: repo,
+    env: shim.env,
+    input: `refs/heads/main ${localSha} refs/heads/main ${remoteSha}\n`,
+  });
+  expectExit(result, 1);
+  assert.match(result.stderr,
+    new RegExp(`git cat-file -e ${escapeRegExp(`${remoteSha}^{commit}`)} failed: was killed by SIGKILL`),
+    'the refusal names the probe and the signal');
+  assert.match(result.stderr, /fail closed/);
+  const calls = shim.calls();
+  assert.ok(calls.some((call) => call.startsWith('cat-file -e')), `the probe ran:\n${calls.join('\n')}`);
+  assert.equal(calls.some((call) => call.startsWith('rev-list')), false,
+    `a killed probe is not read as an unknown remote tip, so no range is listed:\n${calls.join('\n')}`);
+});
+

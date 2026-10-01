@@ -18,10 +18,22 @@
  * one run, so no baseline image is ever committed.
  *
  * Base revision: `--base <ref>`, or the branch's upstream (`@{upstream}`,
- * what is already pushed), or `HEAD` when there is no upstream.
+ * what is already pushed), or `HEAD` when git answers there is no upstream.
+ *
+ * Deadlines: every child and request has a finite deadline from `DEADLINES`
+ * in scripts/lib/subprocess.mjs: `gitQuery` for each git query, `gitLog`
+ * for the commit messages, the fixture builder's own deadlines for each
+ * build, `playwrightRun` for each Playwright run (SIGTERM, then SIGKILL, then
+ * given up on) and `httpRequest` for each pre-flight request, body included.
+ * Only a git that exited by itself gives an answer. The skip below needs git
+ * to confirm that the base has no `_layouts/post.html`; a probe that was
+ * killed, timed out or could not read the base fails the run instead. The
+ * commit messages are streamed and git is stopped at the first trailer, so
+ * the size of `<base>..HEAD` is never limited; a log that exceeds its
+ * deadline or is killed fails the run too.
  *
  * Outcomes and exit codes:
- *   0  The 12 screenshots are identical; or the base has no
+ *   0  The 12 screenshots are identical; or git confirms the base has no
  *      `_layouts/post.html` (the comparison is skipped with a notice); or the
  *      pages differ and the change is declared intended, either with
  *      `VISUAL_CHANGE_INTENDED=1` or with a `Visual-Change: intended` trailer
@@ -29,16 +41,31 @@
  *      included). Declared differences are still reported.
  *   1  The pages differ and the change is not declared; or a build, the
  *      pre-flight page check, the baseline run or the comparison run failed
- *      for any reason other than a screenshot difference. Such failures are
- *      never accepted as an intended change.
- *   2  Usage error, or the base revision cannot be resolved.
- *   130 / 143  Interrupted by SIGINT / SIGTERM.
+ *      for any reason other than a screenshot difference, a Playwright run
+ *      exceeded its deadline included; or git gave no answer about the base
+ *      or its commit messages (it could not start, was killed, timed out or
+ *      could not read the base commit's tree); or the temporary workspace
+ *      could not be removed. Such failures are never accepted as an intended
+ *      change. A comparison run that was interrupted (Playwright's exit 130),
+ *      was killed or exited other than 0 or 1 is incomplete and fails. A run
+ *      that exited 1 is classified case by case from its JSON results
+ *      (`compare-results.json` in the workspace): intent is accepted only
+ *      when all 12 cases ran and every failed case is solely a screenshot
+ *      size or pixel difference with its actual image. Mixed or unknown
+ *      failures, and results that cannot be read, fail whatever was
+ *      declared, and each problem is printed with its case.
+ *   2  Usage error, or git answers that the base revision names no commit.
+ *   130 / 143  Interrupted by SIGINT / SIGTERM, also when the workspace then
+ *      cannot be removed.
  *
  * Output: the temporary workspace (`blog-visual-*` under `os.tmpdir()`) is
- * always removed. The Playwright report (`tests/visual/report/`) and test
- * artefacts (`tests/visual/test-results/`, with actual, expected and diff
- * images) are left in place for inspection and for the blog-checks workflow,
- * which uploads the report when verification fails. Both are git-ignored.
+ * removed at the end of every run. One that cannot be removed is reported
+ * on stderr with its path and fails a run that would have exited 0 (a
+ * failing run keeps its own code). The Playwright report
+ * (`tests/visual/report/`) and test artefacts (`tests/visual/test-results/`,
+ * with actual, expected and diff images) are left in place for inspection
+ * and for the blog-checks workflow, which uploads the report when
+ * verification fails. Both are git-ignored.
  *
  * Consumer: `scripts/verify.mjs` runs this as its last step, with inherited
  * output, `VISUAL_CHANGE_INTENDED` passed through and `JEKYLL_ENV` removed,
@@ -50,9 +77,10 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { spawn, spawnSync } from "node:child_process";
+import { pipeline } from "node:stream";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import { DEADLINES, describeResult, formatDuration, runSync, spawnSupervised } from "../../scripts/lib/subprocess.mjs";
 import { buildFixtureSite } from "../fixtures/build-fixture-site.mjs";
 
 /* ------------------------------------------------------------------------ */
@@ -73,6 +101,28 @@ const TEST_RESULTS = path.join(REPO, "tests", "visual", "test-results");
 /** Listing and one article × 3 widths × 2 colour schemes (blog-visual.spec.mjs). */
 const EXPECTED_SCREENSHOTS = 12;
 
+/** Playwright Test's exit code for an interrupted, incomplete run. */
+const PLAYWRIGHT_INTERRUPTED = 130;
+
+/** Colour sequences in Playwright's error messages. */
+const ANSI_SEQUENCE = /\u001b\[[0-9;]*m/g;
+
+/*
+ * A `toHaveScreenshot` failure that is solely a screenshot difference: the
+ * matcher header followed directly by the size difference, the pixel-count
+ * difference, or both, ending the line. A timed-out matcher puts a
+ * `Timeout: <n>ms` line in between, and every other failure ("Failed to take
+ * two consecutive stable screenshots.", a missing snapshot, a page or
+ * assertion error) reads differently, so none of those match.
+ */
+const SCREENSHOT_MISMATCH = new RegExp(
+  "^Error: expect\\(page\\)\\.toHaveScreenshot\\(expected\\) failed\\n\\n  " +
+    "(?:Expected an image \\d+px by \\d+px, received \\d+px by \\d+px\\. " +
+    "(?:\\d+ pixels \\(ratio \\d+(?:\\.\\d+)? of all image pixels\\) are different\\.)?" +
+    "|\\d+ pixels \\(ratio \\d+(?:\\.\\d+)? of all image pixels\\) are different\\.)" +
+    "(?:\\n|$)",
+);
+
 /** The builder writes `<side>/project/cabrillo-coast/`; the server root is `<side>/project`. */
 const MOUNT = "/cabrillo-coast";
 
@@ -89,11 +139,14 @@ const REQUIRED_OUTPUTS = Object.freeze([
 const BASE_LAYOUT = "_layouts/post.html";
 
 /*
- * Commit-message trailer that declares an intended visual change. `[ \t]`
- * rather than `\s`, so the key and value must sit on one line as a git
- * trailer does; a trailing `\r` is tolerated for messages written on Windows.
+ * Key and value of the commit-message trailer that declares an intended
+ * visual change, in lower case, as the bytes `createTrailerScanner` compares.
  */
-const INTENDED_TRAILER = /^Visual-Change:[ \t]*intended[ \t\r]*$/im;
+const TRAILER_KEY = Buffer.from("visual-change:", "latin1");
+const TRAILER_VALUE = Buffer.from("intended", "latin1");
+
+/** Most of `git log`'s standard error a warning quotes; the rest is cut. */
+const GIT_LOG_STDERR_LIMIT = 4096;
 
 /** A full commit id: SHA-1 (40) or SHA-256 (64) hexadecimal digits. */
 const COMMIT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
@@ -122,6 +175,9 @@ const CONTENT_TYPES = Object.freeze({
 });
 const DEFAULT_CONTENT_TYPE = "application/octet-stream";
 
+/** Error codes that only mean a file's transfer was cut short: the client went away, or cleanup stopped it. */
+const CLIENT_ABORTS = Object.freeze(["ERR_STREAM_PREMATURE_CLOSE", "ECONNRESET", "EPIPE"]);
+
 /* ------------------------------------------------------------------------ */
 /* Session state shared with the signal handlers and cleanup                 */
 /* ------------------------------------------------------------------------ */
@@ -136,6 +192,8 @@ const session = {
   tmp: null,
   /** @type {http.Server[]} */
   servers: [],
+  /** File streams the servers are still sending. @type {Set<fs.ReadStream>} */
+  streams: new Set(),
   /** @type {import("node:child_process").ChildProcess | null} */
   child: null,
   /** @type {string | null} */
@@ -162,19 +220,34 @@ function errorMessage(err) {
 }
 
 /**
- * Read-only git command in the repository. Arguments are an array and never
- * pass through a shell.
+ * Environment of every git command: the caller's, with `GIT_OPTIONAL_LOCKS=0`
+ * so a read-only command never writes even an opportunistic index refresh.
+ */
+function gitEnv() {
+  return { ...process.env, GIT_OPTIONAL_LOCKS: "0" };
+}
+
+/**
+ * Read-only git command in the repository, with captured output and the
+ * `DEADLINES.gitQuery` deadline. Arguments are an array and never pass
+ * through a shell.
  * @param {string[]} args
- * @returns {{ status: number | null, stdout: string, stderr: string }}
- * @throws {Error} when git cannot be started at all.
+ * @returns {{ status: number, stdout: string, stderr: string }} the outcome
+ *   of a git that exited by itself, zero or not.
+ * @throws {Error} when git cannot be started, is killed by a signal, exceeds
+ *   its deadline or overflows its capture limit: none of these is an answer.
  */
 function git(args) {
-  const result = spawnSync("git", args, { cwd: REPO, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  const result = runSync("git", args, { cwd: REPO, env: gitEnv(), timeoutMs: DEADLINES.gitQuery });
   if (result.error) {
     const reason = result.error.code === "ENOENT" ? "git not found on PATH" : errorMessage(result.error);
-    throw new Error(`${LOG_PREFIX} git could not be started: ${reason}`);
+    throw new Error(`git could not be started: ${reason}`);
   }
-  return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+  if (!result.completed) {
+    const stderr = result.stderr.trim();
+    throw new Error(`git ${args.join(" ")} ${describeResult(result)}${stderr === "" ? "" : `: ${stderr}`}`);
+  }
+  return { status: result.status, stdout: result.stdout, stderr: result.stderr };
 }
 
 /**
@@ -246,7 +319,12 @@ export function parseCliArgs(argv) {
 /* Base revision and declared intent                                         */
 /* ------------------------------------------------------------------------ */
 
-/** The default base: what is already pushed, or `HEAD` when the branch has no upstream. */
+/**
+ * The default base: what is already pushed, or `HEAD` when git answers that
+ * the branch has no upstream.
+ * @throws {Error} when git gives no answer (see `git`), so a probe that never
+ *   finished cannot make the run compare unpushed changes against themselves.
+ */
 function defaultBase() {
   return git(["rev-parse", "--verify", "-q", "@{upstream}"]).status === 0 ? "@{upstream}" : "HEAD";
 }
@@ -254,7 +332,9 @@ function defaultBase() {
 /**
  * Resolves a revision to its full commit id. A value starting with `-` is
  * refused before git sees it, so a revision can never be read as an option.
- * @returns {string | null} the commit id, or null when it does not resolve to a commit.
+ * @returns {string | null} the commit id, or null when git answers that it
+ *   does not resolve to a commit.
+ * @throws {Error} when git gives no answer (see `git`).
  */
 function resolveCommit(ref) {
   if (ref.startsWith("-")) return null;
@@ -264,19 +344,225 @@ function resolveCommit(ref) {
 }
 
 /**
- * Where an intended visual change was declared, or null when it was not.
+ * True when the base commit has `_layouts/post.html`, false when git
+ * confirms it has not: the only evidence the skip rule accepts.
+ *
+ * `git ls-tree -z --full-tree <sha> -- <path>` lists the entry when it
+ * exists and exits 0 with no output when it does not, so absence is an
+ * answer rather than an error. A bad or unreadable object exits non-zero,
+ * which is a failure: it must never skip a base that has the layout.
  * @param {string} sha Base commit id.
- * @returns {string | null}
+ * @returns {boolean}
+ * @throws {Error} when git gives no answer or exits non-zero.
  */
-function declaredIntent(sha) {
-  if (process.env.VISUAL_CHANGE_INTENDED === "1") return "VISUAL_CHANGE_INTENDED=1";
-  const messages = git(["log", "--format=%B", `${sha}..HEAD`]);
-  if (messages.status !== 0) {
-    // Fail safe: without the commit messages no trailer can be credited.
-    warn(`cannot read the commit messages in ${sha.slice(0, 12)}..HEAD (${messages.stderr.trim()}); no trailer counted`);
-    return null;
+function baseHasLayout(sha) {
+  const args = ["--literal-pathspecs", "ls-tree", "-z", "--full-tree", sha, "--", BASE_LAYOUT];
+  const result = git(args);
+  if (result.status !== 0) {
+    const stderr = result.stderr.trim();
+    throw new Error(
+      `cannot tell whether base ${sha} has ${BASE_LAYOUT}: git ${args.join(" ")} exited with status ` +
+        `${result.status}${stderr === "" ? "" : `: ${stderr}`}`,
+    );
   }
-  return INTENDED_TRAILER.test(messages.stdout) ? `a "Visual-Change: intended" trailer in ${sha.slice(0, 12)}..HEAD` : null;
+  // Records are `<mode> <type> <object>\t<path>`, each ended by NUL.
+  return result.stdout.split("\0").some((record) => {
+    const tab = record.indexOf("\t");
+    return tab !== -1 && record.slice(tab + 1) === BASE_LAYOUT;
+  });
+}
+
+/**
+ * Recognises the trailer that declares an intended visual change in a
+ * stream of commit-message bytes, fed chunk by chunk, in constant memory.
+ *
+ * A line counts when it is exactly
+ *   `Visual-Change:` [ \t]* `intended` [ \t]*
+ * with the key and value in any ASCII letter case. Space and tab only, not
+ * any white space, so the key and value sit on one line as a git trailer's
+ * do. A line ends at LF, at CR (so CRLF line ends from Windows count), at
+ * U+2028 or U+2029 (bytes E2 80 A8 and E2 80 A9), or at the end of the
+ * stream, which `end()` marks. Any other byte, a non-ASCII one included,
+ * means the line cannot match. These are exactly the lines that
+ * `/^Visual-Change:[ \t]*intended[ \t\r]*$/im` matches in the UTF-8 text:
+ * its `m` flag ends lines at the same four characters, and without the `u`
+ * flag its `i` flag folds ASCII letters only. Bytes are never decoded or
+ * kept, and a chunk may end anywhere, inside the trailer or a line end too.
+ *
+ * @example
+ *   const scanner = createTrailerScanner();
+ *   stream.on("data", (chunk) => { if (scanner.push(chunk)) stop(); });
+ *   // once the stream has ended in full:
+ *   const declared = scanner.found || scanner.end();
+ *
+ * @returns {{ push(chunk: Uint8Array): boolean, end(): boolean, readonly found: boolean }}
+ *   `push` scans the next bytes and `end` marks the end of the stream; each
+ *   returns whether a trailer line has been found, which then stays true.
+ *   `push` after `end` is a programming error and throws.
+ */
+export function createTrailerScanner() {
+  const LF = 0x0a;
+  const CR = 0x0d;
+  const SPACE = 0x20;
+  const TAB = 0x09;
+  const LS_PS_LEAD = 0xe2;
+  const LS_PS_MIDDLE = 0x80;
+  const LS_LAST = 0xa8;
+  const PS_LAST = 0xa9;
+
+  // Where the current line stands: inside the key, in the blanks after it,
+  // inside the value, in the blanks after the value, or past matching.
+  const KEY = 0;
+  const GAP = 1;
+  const VALUE = 2;
+  const TAIL = 3;
+  const DEAD = 4;
+
+  let phase = KEY;
+  /** Bytes of the key or the value matched so far. */
+  let index = 0;
+  /** Bytes of a possible U+2028 or U+2029 seen so far: 0, 1 (E2) or 2 (E2 80). */
+  let pending = 0;
+  let found = false;
+  let ended = false;
+
+  const endLine = () => {
+    if (phase === TAIL) found = true;
+    phase = KEY;
+    index = 0;
+  };
+
+  // One byte that ends no line.
+  const step = (byte) => {
+    const folded = byte >= 0x41 && byte <= 0x5a ? byte + 0x20 : byte;
+    if (phase === KEY) {
+      if (folded !== TRAILER_KEY[index]) {
+        phase = DEAD;
+        return;
+      }
+      index += 1;
+      if (index === TRAILER_KEY.length) phase = GAP;
+    } else if (phase === GAP) {
+      if (byte === SPACE || byte === TAB) return;
+      if (folded === TRAILER_VALUE[0]) {
+        phase = VALUE;
+        index = 1;
+      } else {
+        phase = DEAD;
+      }
+    } else if (phase === VALUE) {
+      if (folded !== TRAILER_VALUE[index]) {
+        phase = DEAD;
+        return;
+      }
+      index += 1;
+      if (index === TRAILER_VALUE.length) phase = TAIL;
+    } else if (phase === TAIL && byte !== SPACE && byte !== TAB) {
+      phase = DEAD;
+    }
+  };
+
+  const feed = (byte) => {
+    if (pending === 1) {
+      if (byte === LS_PS_MIDDLE) {
+        pending = 2;
+        return;
+      }
+      // E2 not followed by 80 is an ordinary non-ASCII character.
+      pending = 0;
+      phase = DEAD;
+    } else if (pending === 2) {
+      pending = 0;
+      if (byte === LS_LAST || byte === PS_LAST) {
+        endLine();
+        return;
+      }
+      phase = DEAD;
+    }
+    if (byte === LF || byte === CR) endLine();
+    else if (byte === LS_PS_LEAD) pending = 1;
+    else step(byte);
+  };
+
+  return {
+    push(chunk) {
+      if (ended) throw new Error("createTrailerScanner: push() after end()");
+      for (let i = 0; i < chunk.length && !found; i += 1) feed(chunk[i]);
+      return found;
+    },
+    end() {
+      if (!ended) {
+        ended = true;
+        // The last line counts without a line end; an unfinished E2 or E2 80
+        // is an ordinary character, which leaves the line unmatched.
+        if (!found && pending === 0 && phase === TAIL) found = true;
+      }
+      return found;
+    },
+    get found() {
+      return found;
+    },
+  };
+}
+
+/**
+ * Where an intended visual change was declared, or null when it was not.
+ *
+ * `git log --format=%B <base>..HEAD` is streamed through
+ * `createTrailerScanner`, so a range of any size is read in constant memory,
+ * and git is stopped at the first trailer; that stop is a finished scan, and
+ * the trailer counts because its bytes were git's own output.
+ *
+ * A log that gave no answer is an operational failure and throws, whatever
+ * it printed: its `DEADLINES.gitLog` deadline expired, it was left running
+ * after SIGKILL, it was killed by a signal this runner did not send, or it
+ * could not start. A git that exited by itself with an error status did
+ * answer; that fails safe, with a warning and no trailer counted.
+ * @param {string} sha Base commit id.
+ * @returns {Promise<string | null>}
+ * @throws {Error} when the log gave no answer; `main` exits 1.
+ */
+async function declaredIntent(sha) {
+  if (process.env.VISUAL_CHANGE_INTENDED === "1") return "VISUAL_CHANGE_INTENDED=1";
+  const range = `${sha.slice(0, 12)}..HEAD`;
+  const run = spawnSupervised("git", ["log", "--format=%B", `${sha}..HEAD`], {
+    cwd: REPO,
+    env: gitEnv(),
+    stdio: ["ignore", "pipe", "pipe"],
+    timeoutMs: DEADLINES.gitLog,
+  });
+  const scanner = createTrailerScanner();
+  const stderrParts = [];
+  let stderrBytes = 0;
+  let stderrCut = false;
+  // A null child was refused by the operating system; `done` already carries why.
+  if (run.child !== null) {
+    run.child.stdout.on("data", (chunk) => {
+      if (!scanner.found && scanner.push(chunk)) run.stop();
+    });
+    run.child.stderr.on("data", (chunk) => {
+      const room = GIT_LOG_STDERR_LIMIT - stderrBytes;
+      if (chunk.length > room) stderrCut = true;
+      if (room <= 0) return;
+      const part = chunk.subarray(0, room);
+      stderrParts.push(part);
+      stderrBytes += part.length;
+    });
+  }
+  const result = await run.done;
+  const stderr = Buffer.concat(stderrParts).toString("utf8").trim();
+  const detail = stderr === "" ? "" : `: ${stderr}${stderrCut ? " […]" : ""}`;
+  // `stop()` after a trailer is the only ending without an exit status that is a finished scan.
+  const scanFinished = result.completed || (result.stopped && scanner.found);
+  if (!scanFinished || result.abandoned) {
+    throw new Error(`git log --format=%B ${range} ${describeResult(result)}${detail}`);
+  }
+  // `end()` only after a complete read: the last bytes of a log cut short are not the end of a line.
+  if (scanner.found || (result.ok && scanner.end())) return `a "Visual-Change: intended" trailer in ${range}`;
+  if (result.ok) return null;
+  // Fail safe: git answered with an error, so no trailer can be credited.
+  warn(`cannot read the commit messages in ${range} (git log ${describeResult(result)}${detail}); no trailer counted`);
+  return null;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -373,12 +659,14 @@ async function handleRequest(root, req, res) {
     res.end();
     return;
   }
+  // pipeline, not pipe: a response closed early destroys the file stream and
+  // releases its descriptor, and a read error destroys the response.
   const stream = fs.createReadStream(target);
-  stream.on("error", (err) => {
-    warn(`cannot read ${target}: ${errorMessage(err)}`);
-    res.destroy(err);
+  session.streams.add(stream);
+  stream.once("close", () => session.streams.delete(stream));
+  pipeline(stream, res, (err) => {
+    if (err && !CLIENT_ABORTS.includes(err.code)) warn(`cannot send ${target}: ${errorMessage(err)}`);
   });
-  stream.pipe(res);
 }
 
 /**
@@ -420,18 +708,23 @@ export function startServer(root, label = "site") {
 /**
  * Confirms that both screenshotted pages answer 200 before Playwright runs,
  * so a page missing from a build fails as a build failure and can never be
- * accepted as an intended visual difference.
+ * accepted as an intended visual difference. Each request, its body
+ * included, has the `DEADLINES.httpRequest` deadline.
  * @returns {Promise<string | null>} the first problem found, or null.
  */
 async function preflight(port) {
   for (const page of PREFLIGHT_PAGES) {
     const url = `http://127.0.0.1:${port}${MOUNT}${page}`;
     try {
-      const response = await fetch(url, { redirect: "manual" });
+      // The signal also aborts the body read below.
+      const response = await fetch(url, { redirect: "manual", signal: AbortSignal.timeout(DEADLINES.httpRequest) });
       // Drain the body so the keep-alive connection is released.
       await response.arrayBuffer();
       if (response.status !== 200) return `${url} answered ${response.status}`;
     } catch (err) {
+      if (err && err.name === "TimeoutError") {
+        return `${url} did not answer within ${formatDuration(DEADLINES.httpRequest)}`;
+      }
       return `${url} could not be fetched: ${errorMessage(err)}`;
     }
   }
@@ -444,31 +737,47 @@ async function preflight(port) {
 
 /**
  * Runs the spec through Playwright Test against one served build and
- * resolves when the child closes. `spawn`, never `spawnSync`: the static
- * servers live in this process's event loop and must keep answering while
- * the browser loads pages.
+ * resolves when the child closes. Supervised and asynchronous, never
+ * `spawnSync`: the static servers live in this process's event loop and must
+ * keep answering while the browser loads pages. At `DEADLINES.playwrightRun`
+ * the child is sent SIGTERM, then SIGKILL, and is given up on if it still
+ * runs, so a stalled run cannot keep the servers and the workspace alive.
  *
  * @param {"all" | "none"} mode `all` writes the baseline; `none` only compares,
  *   so a missing baseline fails instead of being written.
  * @param {number} port Port of the server to screenshot.
  * @param {string} baselineDir Folder the config writes and reads baselines in.
- * @returns {Promise<{ code: number | null, signal: string | null }>}
+ * @param {string} [resultsFile] Where the config's JSON reporter writes the
+ *   run's results; without it no JSON report is written.
+ * @returns {Promise<{ code: number | null, signal: string | null, timedOut: boolean }>}
+ *   `timedOut` is true when the deadline ended the run; its code and signal
+ *   then say nothing about the screenshots.
  */
-function runPlaywright(mode, port, baselineDir) {
+function runPlaywright(mode, port, baselineDir, resultsFile) {
   const env = {
     ...process.env,
     VISUAL_BASE_URL: `http://127.0.0.1:${port}${MOUNT}`,
     VISUAL_BASELINE_DIR: baselineDir,
+    VISUAL_RESULTS_FILE: resultsFile ?? "",
   };
   delete env.JEKYLL_ENV;
+  // Playwright prefers this variable to the config's outputFile; an inherited
+  // value would send the results somewhere this runner never reads.
+  delete env.PLAYWRIGHT_JSON_OUTPUT_FILE;
   const args = [CLI, "test", "--config", CONFIG, `--update-snapshots=${mode}`];
   const shown = args.map((a) => (path.isAbsolute(a) ? path.relative(REPO, a) : a)).join(" ");
   log(`$ VISUAL_BASE_URL=${env.VISUAL_BASE_URL} node ${shown}`);
 
   return new Promise((resolve) => {
     let settled = false;
-    const child = spawn(process.execPath, args, { cwd: REPO, stdio: "inherit", env });
-    session.child = child;
+    const run = spawnSupervised(process.execPath, args, {
+      cwd: REPO,
+      stdio: "inherit",
+      env,
+      timeoutMs: DEADLINES.playwrightRun,
+    });
+    // Null when the operating system refused to create the process; `done` then carries the error.
+    session.child = run.child;
     const finish = (outcome) => {
       if (settled) return;
       settled = true;
@@ -476,12 +785,116 @@ function runPlaywright(mode, port, baselineDir) {
       // While an interrupt is in progress the signal handler owns the exit.
       if (session.stopping === null) resolve(outcome);
     };
-    child.once("error", (err) => {
-      warn(`Playwright could not be started: ${errorMessage(err)}`);
-      finish({ code: 1, signal: null });
+    run.done.then((result) => {
+      if (result.error) {
+        warn(`Playwright could not be started: ${errorMessage(result.error)}`);
+        finish({ code: 1, signal: null, timedOut: false });
+        return;
+      }
+      const timedOut = result.timedOut || result.abandoned;
+      if (timedOut) warn(`Playwright ${describeResult(result)}`);
+      finish({ code: result.status, signal: result.signal, timedOut });
     });
-    child.once("close", (code, signal) => finish({ code, signal }));
   });
+}
+
+/* ------------------------------------------------------------------------ */
+/* Comparison results                                                        */
+/* ------------------------------------------------------------------------ */
+
+/** First line of an error message, without colour sequences. */
+function firstLine(message) {
+  const text = typeof message === "string" ? message.replace(ANSI_SEQUENCE, "").trim() : "";
+  return text === "" ? "(no message)" : text.split("\n")[0];
+}
+
+/** True when `message` is solely a screenshot size or pixel difference (SCREENSHOT_MISMATCH). */
+function isScreenshotMismatch(message) {
+  return typeof message === "string" && SCREENSHOT_MISMATCH.test(message.replace(ANSI_SEQUENCE, ""));
+}
+
+/** True when a result attached the captured screenshot (`<name>-actual.png`). */
+function hasActualImage(result) {
+  const attachments = Array.isArray(result.attachments) ? result.attachments : [];
+  return attachments.some((attachment) => typeof attachment?.name === "string" && attachment.name.endsWith("-actual.png"));
+}
+
+/**
+ * Every test of a JSON report's suites, nested suites included, with the
+ * title of the spec it belongs to.
+ * @param {unknown} suites
+ * @param {{ title: string, test: any }[]} [cases] Accumulator for the recursion.
+ * @returns {{ title: string, test: any }[]}
+ */
+function collectCases(suites, cases = []) {
+  for (const suite of Array.isArray(suites) ? suites : []) {
+    for (const spec of Array.isArray(suite?.specs) ? suite.specs : []) {
+      const title = typeof spec?.title === "string" && spec.title !== "" ? spec.title : "(untitled case)";
+      for (const test of Array.isArray(spec?.tests) ? spec.tests : []) cases.push({ title, test });
+    }
+    collectCases(suite?.suites, cases);
+  }
+  return cases;
+}
+
+/**
+ * Sorts the comparison run's results, read from Playwright's JSON report,
+ * into screenshot mismatches and every other kind of failure. It reads
+ * nothing but `report`.
+ *
+ * A failed result is a mismatch when it has at least one error, every error
+ * is solely a `toHaveScreenshot` size or pixel difference, and it attached
+ * its `<name>-actual.png`. Each of these is a problem instead: a report
+ * without a `suites` or an `errors` list, a run-level error, fewer than
+ * EXPECTED_SCREENSHOTS cases, a case with no result, a result neither passed
+ * nor failed (timed out, interrupted, skipped), and a failed result with no
+ * error, any other error or no actual image.
+ *
+ * @example
+ *   const { mismatched, problems } = classifyComparison(JSON.parse(fs.readFileSync(resultsFile, "utf8")));
+ *   // A declared change is accepted only when problems is empty and mismatched is not.
+ *
+ * @param {unknown} report Parsed Playwright JSON report of the comparison run.
+ * @returns {{ mismatched: string[], problems: string[] }} the titles of the
+ *   mismatched cases, and one line per problem naming the case and the first
+ *   line of its message.
+ */
+export function classifyComparison(report) {
+  const mismatched = [];
+  const problems = [];
+  if (report === null || typeof report !== "object" || !Array.isArray(report.suites) || !Array.isArray(report.errors)) {
+    problems.push("the results are not a Playwright JSON report");
+    return { mismatched, problems };
+  }
+  for (const error of report.errors) problems.push(`the run reported an error: ${firstLine(error?.message)}`);
+
+  const cases = collectCases(report.suites);
+  if (cases.length < EXPECTED_SCREENSHOTS) {
+    problems.push(`only ${cases.length} of ${EXPECTED_SCREENSHOTS} cases were reported`);
+  }
+  for (const { title, test } of cases) {
+    const results = Array.isArray(test?.results) ? test.results : [];
+    if (results.length === 0) {
+      problems.push(`${title}: did not run`);
+      continue;
+    }
+    for (const result of results) {
+      const status = result?.status;
+      if (status === "passed") continue;
+      const errors = Array.isArray(result?.errors) ? result.errors : [];
+      if (status !== "failed") {
+        const detail = errors.length > 0 ? `: ${firstLine(errors[0]?.message)}` : "";
+        problems.push(`${title}: ${typeof status === "string" ? status : "no status"}${detail}`);
+        continue;
+      }
+      const other = errors.find((error) => !isScreenshotMismatch(error?.message));
+      if (errors.length === 0) problems.push(`${title}: failed without an error message`);
+      else if (other !== undefined) problems.push(`${title}: ${firstLine(other?.message)}`);
+      else if (!hasActualImage(result)) problems.push(`${title}: failed without an actual screenshot (*-actual.png)`);
+      else if (!mismatched.includes(title)) mismatched.push(title);
+    }
+  }
+  return { mismatched, problems };
 }
 
 /* ------------------------------------------------------------------------ */
@@ -489,23 +902,28 @@ function runPlaywright(mode, port, baselineDir) {
 /* ------------------------------------------------------------------------ */
 
 /**
- * Closes every server (dropping kept-alive connections) and removes the
- * temporary workspace. Safe to call more than once.
+ * Closes every server (dropping kept-alive connections), releases any file
+ * stream still being sent and removes the temporary workspace. Safe to call
+ * more than once: `session.tmp` is cleared only once the workspace is gone,
+ * so a later call retries a failed removal.
+ * @returns {boolean} true when no temporary workspace remains.
  */
 function cleanup() {
   for (const server of session.servers.splice(0)) {
     server.close();
     server.closeAllConnections();
   }
-  if (session.tmp !== null) {
-    const tmp = session.tmp;
-    session.tmp = null;
-    try {
-      fs.rmSync(tmp, { recursive: true, force: true });
-    } catch (err) {
-      warn(`could not remove ${tmp}: ${errorMessage(err)}`);
-    }
+  for (const stream of session.streams) stream.destroy();
+  session.streams.clear();
+  if (session.tmp === null) return true;
+  try {
+    fs.rmSync(session.tmp, { recursive: true, force: true });
+  } catch (err) {
+    warn(`could not remove ${session.tmp}: ${errorMessage(err)}`);
+    return false;
   }
+  session.tmp = null;
+  return true;
 }
 
 /** Resolves true once `child` has exited, or false after `ms`. */
@@ -522,8 +940,9 @@ function waitForExit(child, ms) {
 
 /**
  * Stops a running Playwright child (it may already have the signal from the
- * terminal's process group), cleans up and exits 130 or 143. A second signal
- * during the grace period kills the child at once.
+ * terminal's process group), cleans up and exits 130 or 143, also when the
+ * workspace cannot be removed (cleanup names it). A second signal during the
+ * grace period kills the child at once.
  */
 async function onSignal(signal) {
   const code = SIGNAL_EXIT[signal];
@@ -604,25 +1023,35 @@ async function main(argv) {
     return 0;
   }
 
-  // 1. Resolve the base revision.
-  const ref = args.base ?? defaultBase();
-  const sha = resolveCommit(ref);
-  if (sha === null) {
-    console.error(`Cannot resolve base revision "${ref}"`);
-    return 2;
+  // Steps 1 to 3 rest on git's own answers. A git that could not start, was
+  // killed or timed out gives none, and fails the run: it must never pass as
+  // "no upstream", an unresolvable base or a base without the layout.
+  let sha;
+  let intent;
+  try {
+    // 1. Resolve the base revision.
+    const ref = args.base ?? defaultBase();
+    sha = resolveCommit(ref);
+    if (sha === null) {
+      console.error(`Cannot resolve base revision "${ref}"`);
+      return 2;
+    }
+    log(`base ${ref} is ${sha}`);
+
+    // 2. A base without the article layout predates the blog: nothing to compare with.
+    if (!baseHasLayout(sha)) {
+      console.log(`Visual comparison skipped: base ${sha} has no ${BASE_LAYOUT}`);
+      return 0;
+    }
+
+    // 3. Declared intent, read before the slow work so it is printed up front.
+    intent = await declaredIntent(sha);
+    if (intent !== null) log(`intended visual change declared by ${intent}`);
+  } catch (err) {
+    console.error(`Visual comparison failed: ${errorMessage(err)}`);
+    return 1;
   }
   const short = sha.slice(0, 12);
-  log(`base ${ref} is ${sha}`);
-
-  // 2. A base without the article layout predates the blog: nothing to compare with.
-  if (git(["cat-file", "-e", `${sha}:${BASE_LAYOUT}`]).status !== 0) {
-    console.log(`Visual comparison skipped: base ${sha} has no ${BASE_LAYOUT}`);
-    return 0;
-  }
-
-  // 3. Declared intent, read before the slow work so it is printed up front.
-  const intent = declaredIntent(sha);
-  if (intent !== null) log(`intended visual change declared by ${intent}`);
 
   // Preconditions, checked before the slow builds.
   if (!fs.existsSync(CLI)) {
@@ -674,6 +1103,13 @@ async function main(argv) {
     fs.mkdirSync(baselineDir, { recursive: true });
     log(`recording the baseline from base ${short}…`);
     const baseline = await runPlaywright("all", ports.base, baselineDir);
+    if (baseline.timedOut) {
+      console.error(
+        `Visual comparison failed: the baseline run exceeded its ${formatDuration(DEADLINES.playwrightRun)} deadline`,
+      );
+      printReportHint(console.error);
+      return 1;
+    }
     const recorded = countFiles(baselineDir, (name) => name.endsWith(".png"));
     if (baseline.code !== 0 || recorded < EXPECTED_SCREENSHOTS) {
       console.error(`Visual comparison failed: baseline run did not produce ${EXPECTED_SCREENSHOTS} screenshots`);
@@ -683,7 +1119,16 @@ async function main(argv) {
 
     // 7. Compare the working tree against it.
     log("comparing the working tree with the baseline…");
-    const compare = await runPlaywright("none", ports["working-tree"], baselineDir);
+    const resultsFile = path.join(tmp, "compare-results.json");
+    const compare = await runPlaywright("none", ports["working-tree"], baselineDir, resultsFile);
+    // A run its deadline ended is never a screenshot difference, so it can never be accepted as intended.
+    if (compare.timedOut) {
+      console.error(
+        `Visual comparison failed: the comparison run exceeded its ${formatDuration(DEADLINES.playwrightRun)} deadline`,
+      );
+      printReportHint(console.error);
+      return 1;
+    }
 
     // 8. Outcome.
     if (compare.code === 0) {
@@ -692,28 +1137,64 @@ async function main(argv) {
     }
 
     /*
-     * Only a captured screenshot that differs from its baseline is a visual
-     * difference: Playwright writes `<name>-actual.png` for each one. A run
-     * that failed without one (killed, crashed, a page error) is a failure
-     * whatever was declared, so it can never pass as an intended change.
+     * Only a screenshot difference can be declared intended, and only one
+     * this run proves case by case. Playwright must have exited 1 by itself:
+     * 130 is an interrupted run with cases left unrun, and a signal or any
+     * other code is abnormal. At least one `<name>-actual.png` must have been
+     * written. The run's JSON results must then list every case, each passed
+     * or failed solely on a `toHaveScreenshot` size or pixel difference with
+     * its actual image attached. Any other failure in the run (a navigation,
+     * page, browser or assertion error, a timeout, a skipped case, a run-level
+     * error, unreadable results) fails it whatever was declared.
      */
+    if (compare.signal !== null || compare.code !== 1) {
+      const how =
+        compare.signal !== null
+          ? `was killed by ${compare.signal}`
+          : compare.code === PLAYWRIGHT_INTERRUPTED
+            ? `was interrupted (exit ${PLAYWRIGHT_INTERRUPTED})`
+            : `exited ${compare.code}`;
+      console.error(`Visual comparison failed: the working-tree run ${how}, so the comparison is incomplete`);
+      printReportHint(console.error);
+      return 1;
+    }
     const differing = countFiles(TEST_RESULTS, (name) => name.endsWith("-actual.png"));
-    if (compare.signal !== null || differing === 0) {
-      const how = compare.signal ? `was killed by ${compare.signal}` : `exited ${compare.code}`;
-      console.error(`Visual comparison failed: the working-tree run ${how} without a screenshot difference`);
+    if (differing === 0) {
+      console.error("Visual comparison failed: the working-tree run failed without a screenshot difference");
+      printReportHint(console.error);
+      return 1;
+    }
+    let report;
+    try {
+      report = JSON.parse(fs.readFileSync(resultsFile, "utf8"));
+    } catch (err) {
+      console.error(`Visual comparison failed: the working-tree run's results cannot be read: ${errorMessage(err)}`);
+      printReportHint(console.error);
+      return 1;
+    }
+    const { mismatched, problems } = classifyComparison(report);
+    if (problems.length > 0) {
+      console.error("Visual comparison failed: the working-tree run failed for reasons other than a screenshot difference");
+      for (const problem of problems) console.error(`  ${problem}`);
+      if (intent !== null) console.error(`The declared intent (${intent}) covers screenshot differences only.`);
+      printReportHint(console.error);
+      return 1;
+    }
+    if (mismatched.length === 0) {
+      console.error("Visual comparison failed: the working-tree run exited 1 but reported no failed case");
       printReportHint(console.error);
       return 1;
     }
     if (intent !== null) {
       console.log(
-        `Visual comparison: ${differing} of ${EXPECTED_SCREENSHOTS} screenshots differ from base ${short}; ` +
+        `Visual comparison: ${mismatched.length} of ${EXPECTED_SCREENSHOTS} screenshots differ from base ${short}; ` +
           `the differences are reported and accepted as intended (${intent})`,
       );
       printReportHint();
       return 0;
     }
     console.error(`Visual comparison failed: blog pages differ from base ${short}`);
-    console.error(`${differing} of ${EXPECTED_SCREENSHOTS} screenshots differ.`);
+    console.error(`${mismatched.length} of ${EXPECTED_SCREENSHOTS} screenshots differ.`);
     printReportHint(console.error);
     console.error(
       "If the change is intended, add a `Visual-Change: intended` trailer to a commit message " +
@@ -723,6 +1204,20 @@ async function main(argv) {
   } finally {
     cleanup();
   }
+}
+
+/**
+ * The comparison, then the workspace check: a temporary workspace that could
+ * not be removed fails an otherwise successful run, and a failed run keeps
+ * its own exit code.
+ * @param {string[]} argv Arguments after the script path.
+ * @returns {Promise<number>} The exit code.
+ */
+async function run(argv) {
+  const code = await main(argv);
+  if (session.tmp === null) return code;
+  console.error(`Visual comparison failed: the temporary workspace ${session.tmp} could not be removed`);
+  return code === 0 ? 1 : code;
 }
 
 /**
@@ -740,10 +1235,11 @@ function isMainModule() {
 
 if (isMainModule()) {
   // process.exit, not exitCode: kept-alive fetch connections must not hold the run open.
-  main(process.argv.slice(2)).then(
+  run(process.argv.slice(2)).then(
     (code) => process.exit(code),
     (err) => {
       console.error(err);
+      // A retry: a workspace the run could not remove is still recorded.
       cleanup();
       process.exit(1);
     },

@@ -9,8 +9,9 @@
  * Playwright twice with this file: first in update mode against the base
  * build, which writes the baseline, then in compare mode against the
  * working-tree build. Snapshot updating is chosen on that command line, never
- * here. It passes the baseline directory in `VISUAL_BASELINE_DIR` and the
- * served site in `VISUAL_BASE_URL`.
+ * here. It passes the baseline directory in `VISUAL_BASELINE_DIR`, the
+ * served site in `VISUAL_BASE_URL` and, for the comparison run, the JSON
+ * results file in `VISUAL_RESULTS_FILE`.
  *
  * Baselines are written to a temporary directory outside the repository and
  * are never committed: both sides are rendered by the same browser build on
@@ -48,6 +49,20 @@ if (typeof baselineEnv !== "string" || baselineEnv.trim() === "") {
  */
 const baselineDir = path.resolve(baselineEnv);
 
+/*
+ * The comparison run's machine-readable results. run-visual.mjs sets
+ * `VISUAL_RESULTS_FILE` for the comparison run only and reads the file to
+ * classify every failed case: a declared intended change is accepted only
+ * when each failure is solely a screenshot mismatch. Added to the reporters
+ * here rather than with `--reporter`, which would replace the list and html
+ * reporters below.
+ */
+const resultsEnv = process.env.VISUAL_RESULTS_FILE;
+const resultsReporters =
+  typeof resultsEnv === "string" && resultsEnv.trim() !== ""
+    ? [["json", { outputFile: path.resolve(resultsEnv) }]]
+    : [];
+
 export default defineConfig({
   testDir: here,
 
@@ -74,6 +89,7 @@ export default defineConfig({
   reporter: [
     ["list"],
     ["html", { outputFolder: path.join(here, "report"), open: "never" }],
+    ...resultsReporters,
   ],
 
   /*

@@ -17,8 +17,12 @@ layout: null
   each listing item's data-url attribute; search.js joins index entries to listing items on
   it, and it carries the base path in both deployment modes.
 
-  No filtering happens here: drafts and future-dated posts never reach site.posts, because
-  Jekyll does not build them (future: false in _config.yml).
+  No filtering happens here. In every build without --drafts (GitHub Pages, the CI build and
+  local builds) drafts never reach site.posts. The local --drafts preview, and the fixture
+  builder's preview variant, do add drafts to site.posts and so to this index; that is
+  acceptable because the preview is served only on the author's machine and neither output
+  is published. Future-dated posts are left out of every build, the preview included, by
+  future: false in _config.yml.
 
   body is the full rendered article text, code samples included:
     1. strip_html removes the markup but keeps the character references kramdown emits.

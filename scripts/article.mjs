@@ -31,7 +31,15 @@
  * git, and only read-only commands (`config --get`, `ls-files`, `diff`,
  * `rev-parse`, `hash-object` without `-w`, `cat-file`, `rev-list`, `ls-tree`,
  * `diff-tree`), spawned without a shell and with `GIT_OPTIONAL_LOCKS=0` so
- * not even an opportunistic index refresh is written.
+ * not even an opportunistic index refresh is written. Every git command runs
+ * under a one-minute deadline (`DEADLINES.gitQuery` in `./lib/subprocess.mjs`)
+ * and is killed with SIGKILL when it exceeds it; `guard` then refuses with
+ * exit 1, and `new` warns.
+ *
+ * Changing files: `new`, `publish` and `unpublish` hold a per-slug lock,
+ * `_drafts/.<slug>.lock`, while they change files, and undo every completed
+ * step when a later one fails, so a failed run leaves the files as it found
+ * them and can simply be run again.
  *
  * Exit codes: 0 success, 1 validation failure (details on stderr), 2 usage
  * error. Unwrapped Liquid inside code is a warning and never changes the
@@ -39,10 +47,11 @@
  */
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
-import { spawnSync } from 'node:child_process';
 
+import { DEADLINES, describeResult, runSync } from './lib/subprocess.mjs';
 import {
   SLUG_RE,
   SLUG_MAX,
@@ -118,6 +127,9 @@ class UsageError extends Error {}
 /** A git command that failed; `guard` treats it as a refusal (fail closed). */
 class GitError extends Error {}
 
+/** The article being moved was edited or removed while `publish` or `unpublish` ran; its message says which. */
+class SourceChanged extends Error {}
+
 /** Progress and next-step commands go to stdout. */
 function say(message = '') {
   process.stdout.write(`${message}\n`);
@@ -139,12 +151,27 @@ function plural(count, word) {
 }
 
 /**
- * Quotes a commit message for the printed next-step command so that copying
- * it into a POSIX shell is safe whatever the article title contains.
+ * Quotes a commit message or a folder for the printed next-step commands so
+ * that copying them into a POSIX shell is safe whatever the article title or
+ * the path contains.
  */
 function shellQuote(text) {
   if (/^[^"$`\\!]*$/.test(text)) return `"${text}"`;
   return `'${text.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * True when the command runs outside the repository root it was given with
+ * `--root`, so the printed next steps must first change to it: their paths
+ * are repository-relative. A working directory that no longer exists counts
+ * as outside.
+ */
+function runsOutsideRoot(root) {
+  try {
+    return path.resolve(process.cwd()) !== root;
+  } catch {
+    return true;
+  }
 }
 
 /* ------------------------------------------------------------------------ */
@@ -175,7 +202,8 @@ function toPosix(nativePath) {
 
 /** Absolute native path of a repository-relative POSIX path. */
 function inRoot(root, relPath) {
-  return path.join(root, ...relPath.split('/'));
+  // Empty segments are dropped, as path.join drops empty arguments, so a trailing slash is ignored.
+  return path.join(root, relPath.split('/').filter((segment) => segment !== '').join(path.sep));
 }
 
 /**
@@ -268,7 +296,7 @@ function makeImageExists(root) {
     if (typeof publicPath !== 'string' || !publicPath.startsWith('/') || publicPath.includes('\0')) return false;
     const segments = publicPath.slice(1).split('/');
     if (segments.some((s) => s === '' || s === '.' || s === '..')) return false;
-    const target = path.join(root, ...segments);
+    const target = path.join(root, segments.join(path.sep));
     const relative = path.relative(root, target);
     if (relative === '' || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
       return false;
@@ -318,34 +346,29 @@ function slugConflicts(root, relPath, kind) {
 }
 
 /**
- * Runs the full article check on one file on disk.
+ * Runs the full article check on the text of one article.
  *
- * Parse errors, `validateArticle` (schema, dates, `TODO:` markers, images
- * resolved against the working tree), slug uniqueness and `scanUnsafeMarkup`
- * are errors; `findUnrawLiquidInCode` findings are warnings. Every message
- * starts with `relPath` and body findings carry their file line.
+ * Parse errors, `validateArticle` (schema, dates, leftover template
+ * placeholders, images resolved against the working tree), slug uniqueness
+ * and `scanUnsafeMarkup` are errors; `findUnrawLiquidInCode` findings are
+ * warnings. Every message starts with `relPath` and body findings carry their
+ * file line.
  *
  * @param {string} root Absolute repository root.
  * @param {string} relPath Repository-relative POSIX path of the article.
  * @param {'draft' | 'post'} kind Which folder rules apply.
- * @param {string} [today] Today as `YYYY-MM-DD` in UTC, read once per command.
+ * @param {string} today Today as `YYYY-MM-DD` in UTC, read once per command.
+ * @param {string} text The article's text, as read from `relPath`.
  * @returns {{ errors: string[], warnings: string[], text: string, data: Record<string, unknown> }}
  */
-function checkFile(root, relPath, kind, today = todayUtc()) {
+function checkText(root, relPath, kind, today, text) {
   const errors = [];
   const warnings = [];
-  let text;
-  try {
-    text = fs.readFileSync(inRoot(root, relPath), 'utf8');
-  } catch (err) {
-    errors.push(`${relPath}: cannot read the file (${err.code ?? err.message})`);
-    return { errors, warnings, text: '', data: {} };
-  }
   const { data, body, errors: parseErrors } = parseArticle(text);
   for (const message of parseErrors) errors.push(`${relPath}: ${message}`);
   // The body is the exact suffix of the text, so this is the file line on which it starts.
   const bodyStartLine = text.slice(0, text.length - body.length).split('\n').length;
-  errors.push(...validateArticle({
+  const articleErrors = validateArticle({
     path: relPath,
     data,
     body,
@@ -353,8 +376,9 @@ function checkFile(root, relPath, kind, today = todayUtc()) {
     todayUtc: today,
     imageExists: makeImageExists(root),
     bodyStartLine,
-  }));
-  errors.push(...slugConflicts(root, relPath, kind));
+  });
+  for (const message of articleErrors) errors.push(message);
+  for (const message of slugConflicts(root, relPath, kind)) errors.push(message);
   for (const finding of scanUnsafeMarkup(body)) {
     errors.push(`${relPath}:${bodyStartLine + finding.line - 1}: unsafe markup "${finding.text}"`);
   }
@@ -363,6 +387,27 @@ function checkFile(root, relPath, kind, today = todayUtc()) {
       + 'wrap it in {% raw %}…{% endraw %}');
   }
   return { errors, warnings, text, data };
+}
+
+/**
+ * Runs `checkText` on one file on disk; a file that cannot be read is
+ * reported as an error.
+ *
+ * @param {string} root Absolute repository root.
+ * @param {string} relPath Repository-relative POSIX path of the article.
+ * @param {'draft' | 'post'} kind Which folder rules apply.
+ * @param {string} [today] Today as `YYYY-MM-DD` in UTC, read once per command.
+ * @returns {{ errors: string[], warnings: string[], text: string, data: Record<string, unknown> }}
+ */
+function checkFile(root, relPath, kind, today = todayUtc()) {
+  let text;
+  try {
+    text = fs.readFileSync(inRoot(root, relPath), 'utf8');
+  } catch (err) {
+    const errors = [`${relPath}: cannot read the file (${err.code ?? err.message})`];
+    return { errors, warnings: [], text: '', data: {} };
+  }
+  return checkText(root, relPath, kind, today, text);
 }
 
 /**
@@ -390,27 +435,40 @@ function kindOf(root, absFile) {
  * `GIT_INDEX_FILE`, which points `git commit -a` and partial commits at the
  * index actually being committed.
  *
+ * Deadline: every command gets one minute (`DEADLINES.gitQuery`) and is
+ * killed with SIGKILL when it exceeds it. A stuck git, filesystem or
+ * filesystem monitor cannot ignore that signal, so no commit or push waits
+ * longer than that per command.
+ *
+ * Only a git that exited by itself has answered. One that could not start,
+ * was killed by a signal, ran out of time or overflowed the capture limit has
+ * not, so this throws instead of returning `ok: false`, which the probes in
+ * `guard` would read as "no". `guard` then refuses with exit 1 (fail closed);
+ * `new`, whose only git read is advisory, warns instead.
+ *
  * @returns {{ ok: boolean, stdout: Buffer, stderr: string, detail: string }}
+ *   The exit of a git that ran to its end; when `ok` is false, `detail` is
+ *   git's trimmed stderr, or its exit status when stderr is empty.
+ * @throws {GitError} naming the command and how it ended, when git did not run to its end.
  */
 function runGit(cwd, args, input) {
-  const options = {
+  const result = runSync('git', args, {
     cwd,
+    input,
     encoding: 'buffer',
     maxBuffer: GIT_MAX_BUFFER,
     env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
-  };
-  if (input !== undefined) options.input = input;
-  const result = spawnSync('git', args, options);
-  const stdout = result.stdout ?? Buffer.alloc(0);
-  const stderr = result.stderr ? result.stderr.toString('utf8').trim() : '';
-  const ok = result.error === undefined && result.status === 0;
-  let detail = '';
-  if (!ok) {
-    if (result.error) detail = result.error.code === 'ENOENT' ? 'git is not installed or not on PATH' : result.error.message;
-    else if (result.signal) detail = `terminated by ${result.signal}`;
-    else detail = stderr || `exit status ${result.status}`;
+    timeoutMs: DEADLINES.gitQuery,
+  });
+  if (!result.completed) {
+    const detail = result.error?.code === 'ENOENT'
+      ? 'git is not installed or not on PATH'
+      : describeResult(result, GIT_MAX_BUFFER);
+    throw new GitError(`git ${args.join(' ')} failed: ${detail}`);
   }
-  return { ok, stdout, stderr, detail };
+  const stderr = result.stderr.trim();
+  const detail = result.ok ? '' : stderr || `exit status ${result.status}`;
+  return { ok: result.ok, stdout: result.stdout, stderr, detail };
 }
 
 /** Runs a git command and returns its stdout, or throws `GitError` naming the command. */
@@ -445,7 +503,10 @@ function gitToplevel(root) {
  * Reads a blob's exact bytes by object id and decodes them as UTF-8, caching
  * by id so a blob shared by several commits is read once. Reading by id with
  * `cat-file blob` returns the stored content with no textconv or filter
- * applied, so the checks always see exactly what would be published.
+ * applied, so the checks always see exactly what would be published. Each
+ * article also carries this id to `checkTrackedContent`, which caches the
+ * blob's parse and text analysis under it (`guard --pre-push` shares one
+ * cache across all its commits), so such a blob is also parsed once.
  */
 function makeBlobReader(cwd) {
   const cache = new Map();
@@ -456,16 +517,443 @@ function makeBlobReader(cwd) {
 }
 
 /* ------------------------------------------------------------------------ */
+/* File transactions (new, publish, unpublish)                               */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * Creates `absPath` holding exactly `bytes`, never overwriting anything:
+ * opening with `wx` fails with `EEXIST` when the path is taken, and then this
+ * call created nothing and removes nothing. When a write or the close fails,
+ * the partial file this call created is removed again, so a retry is not
+ * refused by a leftover. The original error is rethrown; a failure to close
+ * or remove the partial file is attached to it as `cleanupErrors`.
+ *
+ * @param {string} absPath Absolute path of the file to create.
+ * @param {Buffer} bytes Its complete content.
+ */
+function createExclusive(absPath, bytes) {
+  const fd = fs.openSync(absPath, 'wx');
+  let open = true;
+  try {
+    let written = 0;
+    while (written < bytes.length) {
+      const count = fs.writeSync(fd, bytes, written, bytes.length - written);
+      if (count <= 0) {
+        throw Object.assign(new Error(`EIO: write made no progress, write '${absPath}'`), { code: 'EIO' });
+      }
+      written += count;
+    }
+    // Closed once only, even when closing fails: the descriptor is released either way.
+    open = false;
+    fs.closeSync(fd);
+  } catch (err) {
+    const cleanupErrors = [];
+    if (open) {
+      try {
+        fs.closeSync(fd);
+      } catch (closeErr) {
+        cleanupErrors.push(closeErr);
+      }
+    }
+    try {
+      fs.unlinkSync(absPath);
+    } catch (unlinkErr) {
+      if (unlinkErr.code !== 'ENOENT') cleanupErrors.push(unlinkErr);
+    }
+    if (cleanupErrors.length > 0) err.cleanupErrors = cleanupErrors;
+    throw err;
+  }
+}
+
+/**
+ * The compensations for the steps a command has completed, so a failure part
+ * way leaves the files as the command found them. A step's undo is recorded
+ * only once the step has succeeded.
+ */
+class UndoLog {
+  constructor() {
+    /** @type {Array<{ description: string, undo: () => void }>} */
+    this.steps = [];
+  }
+
+  /**
+   * Records how to undo a completed step.
+   *
+   * @param {string} description What the undo does, phrased after "cannot", for a failure report.
+   * @param {() => void} undo The compensation; it throws when it cannot complete.
+   */
+  push(description, undo) {
+    this.steps.push({ description, undo });
+  }
+
+  /**
+   * Runs every recorded undo, newest first. Each failure is caught on its
+   * own, so one failing undo never stops the others; this never throws.
+   *
+   * @returns {string[]} One message per undo that failed; empty when everything was undone.
+   */
+  rollback() {
+    const failures = [];
+    while (this.steps.length > 0) {
+      const { description, undo } = this.steps.pop();
+      try {
+        undo();
+      } catch (err) {
+        failures.push(`cannot ${description} (${err?.message ?? String(err)})`);
+      }
+    }
+    return failures;
+  }
+}
+
+/**
+ * Undo of a file the command created: removes `rel` only while it still holds
+ * exactly `bytes` and `sourceRel`, the copy it was made from, still exists.
+ * Rolling back therefore never deletes the last copy of an article, nor an
+ * edit made since the file was written; either refusal throws, so it is
+ * reported as a rollback failure. A file already gone counts as undone.
+ */
+function removeCreated(root, rel, bytes, sourceRel) {
+  const absPath = inRoot(root, rel);
+  let current;
+  try {
+    current = fs.readFileSync(absPath);
+  } catch (err) {
+    if (err.code === 'ENOENT') return;
+    throw err;
+  }
+  if (!current.equals(bytes)) throw new Error(`${rel} was edited after it was written, so it is kept`);
+  if (!pathExists(inRoot(root, sourceRel))) {
+    throw new Error(`${sourceRel} is missing, so ${rel} is kept as the only copy`);
+  }
+  fs.unlinkSync(absPath);
+}
+
+/** Every folder below `absDir` (itself excluded), each parent before its children, as absolute paths. */
+function listFolders(absDir) {
+  const folders = [];
+  for (const entry of fs.readdirSync(absDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const child = path.join(absDir, entry.name);
+    folders.push(child);
+    for (const folder of listFolders(child)) folders.push(folder);
+  }
+  return folders;
+}
+
+/**
+ * Where `publish` or `unpublish` sets the article it is moving aside at its
+ * commit point: `_drafts/.<slug>.publishing` or `_drafts/.<slug>.unpublishing`.
+ * The folder is git-ignored, and the leading dot keeps Jekyll and `check`
+ * from reading the file.
+ */
+function asideRelFor(slug, command) {
+  return `_drafts/.${slug}.${command}ing`;
+}
+
+/**
+ * First half of the commit point of `publish` and `unpublish`: moves the
+ * source article to `asideRel` with one atomic rename. From then on an editor
+ * saving the article writes a new file at `sourceRel`, never into the copy
+ * about to be deleted. A source already gone throws `SourceChanged`.
+ */
+function setAside(root, sourceRel, asideRel, command) {
+  try {
+    fs.renameSync(inRoot(root, sourceRel), inRoot(root, asideRel));
+  } catch (err) {
+    if (err.code === 'ENOENT') throw new SourceChanged(`${sourceRel} disappeared while ${command}ing`);
+    throw err;
+  }
+}
+
+/**
+ * Second half of the commit point: throws `SourceChanged` unless the
+ * set-aside copy holds exactly `snapshot`, the bytes the command read,
+ * checked and copied, and nothing has been saved at `sourceRel` since it was
+ * set aside. The undo of `setAside` then keeps the edit.
+ */
+function assertAsideUnchanged(root, asideRel, sourceRel, snapshot, command) {
+  const kept = `your edit is kept; check it and ${command} again`;
+  if (!fs.readFileSync(inRoot(root, asideRel)).equals(snapshot)) {
+    throw new SourceChanged(`${sourceRel} changed while ${command}ing; ${kept}`);
+  }
+  if (pathExists(inRoot(root, sourceRel))) {
+    throw new SourceChanged(`${sourceRel} was saved again while ${command}ing; ${kept}`);
+  }
+}
+
+/**
+ * First undo of `setAside`: copies the set-aside article back to `sourceRel`
+ * without overwriting anything. When a newer save already occupies
+ * `sourceRel` there is nothing to put back; `removeAside` then decides what
+ * happens to the set-aside copy.
+ */
+function putBack(root, asideRel, sourceRel) {
+  try {
+    createExclusive(inRoot(root, sourceRel), fs.readFileSync(inRoot(root, asideRel)));
+  } catch (err) {
+    if (err.code !== 'EEXIST') throw err;
+  }
+}
+
+/**
+ * Second undo of `setAside`, run after `putBack`: deletes the set-aside copy
+ * only while it is redundant, that is when `sourceRel` holds the same bytes
+ * (it was put back) or when it is `snapshot`, the checked version a newer
+ * save at `sourceRel` replaced. Otherwise it is the only copy of the source,
+ * or an edit of its own, so it is kept and the undo throws naming it.
+ */
+function removeAside(root, asideRel, sourceRel, snapshot) {
+  const asideAbs = inRoot(root, asideRel);
+  let bytes;
+  try {
+    bytes = fs.readFileSync(asideAbs);
+  } catch (err) {
+    // Already gone: nothing to remove.
+    if (err.code === 'ENOENT') return;
+    throw err;
+  }
+  let source;
+  try {
+    source = fs.readFileSync(inRoot(root, sourceRel));
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+    throw new Error(`${sourceRel} is missing, so ${asideRel} is kept as the only copy`);
+  }
+  if (!source.equals(bytes) && !bytes.equals(snapshot)) {
+    throw new Error(`${sourceRel} was saved again meanwhile, so the earlier edit is kept in ${asideRel}`);
+  }
+  fs.unlinkSync(asideAbs);
+}
+
+/**
+ * Refuses a run that finds the set-aside copy `asideRel` of an interrupted
+ * run. A copy byte-identical to `sourceRel` is redundant, so it is removed
+ * with a warning and the run goes on; any other copy may be the only one of
+ * some edit, so the run is refused. Returns `false` once a refusal is reported.
+ */
+function clearLeftoverAside(root, asideRel, sourceRel, command) {
+  const asideAbs = inRoot(root, asideRel);
+  if (!pathExists(asideAbs)) return true;
+  try {
+    if (isFile(inRoot(root, sourceRel))
+      && fs.readFileSync(asideAbs).equals(fs.readFileSync(inRoot(root, sourceRel)))) {
+      fs.unlinkSync(asideAbs);
+      warn(`removed ${asideRel}, an identical copy of ${sourceRel} left by an interrupted ${command}`);
+      return true;
+    }
+  } catch (err) {
+    fail(`cannot clear ${asideRel}, left by an interrupted ${command} (${err.message}); delete it by hand, `
+      + `then ${command} again; nothing was moved`);
+    return false;
+  }
+  fail(`${asideRel} is left from an interrupted ${command} and may hold a copy of the article; compare it `
+    + `with ${sourceRel}, delete it, then ${command} again; nothing was moved`);
+  return false;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Per-slug lock (new, publish, unpublish)                                   */
+/* ------------------------------------------------------------------------ */
+
+/** True unless process `pid` is known to be gone; one owned by another user counts as running. */
+function processRunning(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code !== 'ESRCH';
+  }
+}
+
+/** Removes the folder `rel` if this run made it and it is empty again; a failure is only a warning. */
+function removeMadeFolder(root, rel) {
+  const absPath = inRoot(root, rel);
+  try {
+    if (fs.readdirSync(absPath).length === 0) fs.rmdirSync(absPath);
+  } catch (err) {
+    if (err.code !== 'ENOENT') warn(`cannot remove the empty ${rel}/ made for the lock (${err.message})`);
+  }
+}
+
+/** Releases a lock taken by `acquireSlugLock`; a failure is only a warning, as the next run replaces a stale lock. */
+function releaseSlugLock(root, rel, owner, madeDrafts) {
+  const absPath = inRoot(root, rel);
+  try {
+    if (fs.readFileSync(absPath).equals(owner)) fs.unlinkSync(absPath);
+    else warn(`${rel} no longer holds this run's lock, so it is left in place`);
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
+      warn(`cannot remove the lock ${rel} (${err.message}); the next run replaces it, or delete it by hand`);
+    }
+  }
+  if (madeDrafts) removeMadeFolder(root, '_drafts');
+}
+
+/**
+ * Takes the lock `_drafts/.<slug>.lock` for one run of `new`, `publish` or
+ * `unpublish`, so two runs for the same slug never interleave. Exclusive
+ * creation of the dated post alone cannot serialize them: two runs on either
+ * side of UTC midnight write different filenames. The lock file names its
+ * holder as `<pid> <host>`. A lock whose holder ran on this host and is no
+ * longer running is stale and is replaced with a warning, so a killed run
+ * never blocks a retry; any other existing lock refuses the run and names
+ * the file to delete once no run is active. Two runs replacing the same
+ * stale lock at the same instant could both proceed; the window is the gap
+ * between reading and removing the stale file.
+ *
+ * A `_drafts/` folder made for the lock is removed again on release when
+ * empty, so a refused command still writes nothing.
+ *
+ * @returns {{ release: () => void } | null} The held lock, or `null` once the refusal is reported.
+ */
+function acquireSlugLock(root, slug, command) {
+  const rel = `_drafts/.${slug}.lock`;
+  const owner = Buffer.from(`${process.pid} ${os.hostname()}\n`, 'utf8');
+  let madeDrafts;
+  try {
+    madeDrafts = fs.mkdirSync(inRoot(root, '_drafts'), { recursive: true }) !== undefined;
+  } catch (err) {
+    fail(`${command} failed: cannot create the _drafts/ folder for its lock (${err.message}); nothing was changed`);
+    return null;
+  }
+  if (takeLockFile(root, rel, owner, slug, command)) {
+    return { release: () => releaseSlugLock(root, rel, owner, madeDrafts) };
+  }
+  if (madeDrafts) removeMadeFolder(root, '_drafts');
+  return null;
+}
+
+/**
+ * Creates the lock file `rel` holding `owner`, replacing a stale one (see
+ * `acquireSlugLock`). Returns `false` once the reason it cannot is reported.
+ */
+function takeLockFile(root, rel, owner, slug, command) {
+  const absPath = inRoot(root, rel);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      createExclusive(absPath, owner);
+      return true;
+    } catch (err) {
+      if (err.code !== 'EEXIST') {
+        fail(`${command} failed: cannot create the lock ${rel} (${err.message}); nothing was changed`);
+        return false;
+      }
+    }
+    let held;
+    try {
+      held = fs.readFileSync(absPath);
+    } catch (err) {
+      // Released between the attempt and this read: try again.
+      if (err.code === 'ENOENT') continue;
+      fail(`${command} failed: cannot read the lock ${rel} (${err.message}); nothing was changed`);
+      return false;
+    }
+    const holder = /^(\d+) (\S+)\n$/.exec(held.toString('utf8'));
+    if (holder !== null && holder[2] === os.hostname() && !processRunning(Number(holder[1]))) {
+      try {
+        if (fs.readFileSync(absPath).equals(held)) fs.unlinkSync(absPath);
+      } catch (err) {
+        if (err.code !== 'ENOENT') {
+          fail(`${command} failed: cannot remove the stale lock ${rel} (${err.message}); delete it by hand`);
+          return false;
+        }
+      }
+      warn(`replaced the stale lock ${rel}: process ${holder[1]}, which held it, is no longer running`);
+      continue;
+    }
+    const who = holder === null ? '' : ` (process ${holder[1]} on ${holder[2]})`;
+    fail(`another article.mjs run${who} is changing slug ${slug}; wait for it to finish, then run ${command} `
+      + `again. If no such run is active, delete ${rel} first; nothing was changed`);
+    return false;
+  }
+  fail(`${command} failed: the lock ${rel} kept changing while it was being taken; run ${command} again`);
+  return false;
+}
+
+/**
+ * Runs `body` while holding the slug's lock and returns its exit code; the
+ * lock is released however `body` ends. Returns 1 when the lock is held by
+ * another run.
+ */
+function withSlugLock(root, slug, command, body) {
+  const lock = acquireSlugLock(root, slug, command);
+  if (lock === null) return EXIT_INVALID;
+  try {
+    return body();
+  } finally {
+    lock.release();
+  }
+}
+
+/**
+ * Reports a failed step of `new`, `publish` or `unpublish` and rolls back the
+ * steps completed before it. Prints the failing step with its error, each
+ * cleanup error attached to it and each rollback failure. Then it either says
+ * that every change was rolled back (only when that is true), or lists which
+ * of `paths` now exist and which are missing, for the author to fix by hand.
+ *
+ * @param {object} args
+ * @param {'new' | 'publish' | 'unpublish'} args.command The command that failed.
+ * @param {string} args.root Absolute repository root.
+ * @param {string} args.step What the failing step does, phrased after "cannot".
+ * @param {unknown} args.err What the step threw; a `SourceChanged` message is printed as it is.
+ * @param {UndoLog} args.undo The completed steps' compensations.
+ * @param {string[]} args.paths Repository-relative paths the command works on (folders end in `/`).
+ * @param {string[]} [args.leftovers] Paths that exist only part way, such as the set-aside copy;
+ *   listed only when present.
+ * @param {string} args.untouched What a complete rollback leaves, such as `nothing was moved`.
+ * @returns {number} Exit code 1.
+ */
+function reportFailure({ command, root, step, err, undo, paths, leftovers = [], untouched }) {
+  if (err instanceof SourceChanged) fail(`${command} failed: ${err.message}`);
+  else fail(`${command} failed: cannot ${step} (${err?.message ?? String(err)})`);
+  const cleanupErrors = Array.isArray(err?.cleanupErrors) ? err.cleanupErrors : [];
+  for (const cleanupErr of cleanupErrors) fail(`cleanup failed: ${cleanupErr?.message ?? String(cleanupErr)}`);
+  const failures = undo.rollback();
+  for (const message of failures) fail(`rollback failed: ${message}`);
+  if (cleanupErrors.length === 0 && failures.length === 0) {
+    fail(`every change was rolled back and ${untouched}; fix the cause and run ${command} again`);
+    return EXIT_INVALID;
+  }
+  const present = [];
+  const missing = [];
+  const unknown = [];
+  for (const rel of [...paths, ...leftovers]) {
+    try {
+      if (pathExists(inRoot(root, rel.replace(/\/$/, '')))) present.push(rel);
+      else if (paths.includes(rel)) missing.push(rel);
+    } catch (statErr) {
+      unknown.push(`${rel} (${statErr?.code ?? statErr?.message ?? String(statErr)})`);
+    }
+  }
+  fail('not every change could be rolled back; fix these paths by hand:');
+  process.stderr.write(`  present: ${present.join(', ') || 'none'}\n`);
+  process.stderr.write(`  missing: ${missing.join(', ') || 'none'}\n`);
+  if (unknown.length > 0) process.stderr.write(`  cannot tell: ${unknown.join(', ')}\n`);
+  return EXIT_INVALID;
+}
+
+/* ------------------------------------------------------------------------ */
 /* new <slug>                                                                */
 /* ------------------------------------------------------------------------ */
 
 /**
  * True when `core.hooksPath` points at this clone's `.githooks/`. Git resolves
  * a relative value against the working-tree root, so `.githooks`,
- * `./.githooks` and the absolute path are all accepted.
+ * `./.githooks` and the absolute path are all accepted. The check is
+ * advisory: when git cannot answer (not installed, killed, out of time), the
+ * cause is warned about and the hooks are reported as not enabled.
  */
 function hooksEnabled(root) {
-  const result = runGit(root, ['config', '--get', 'core.hooksPath']);
+  let result;
+  try {
+    result = runGit(root, ['config', '--get', 'core.hooksPath']);
+  } catch (err) {
+    if (!(err instanceof GitError)) throw err;
+    warn(`cannot read core.hooksPath (${err.message})`);
+    return false;
+  }
   if (!result.ok) return false;
   const value = result.stdout.toString('utf8').trim();
   return value !== '' && path.resolve(root, value) === path.resolve(root, '.githooks');
@@ -473,11 +961,23 @@ function hooksEnabled(root) {
 
 function cmdNew(root, slug) {
   if (!isValidSlug(slug)) return refuseSlug(slug);
+  return withSlugLock(root, slug, 'new', () => createDraft(root, slug));
+}
+
+/** `new <slug>` once the slug's lock is held. */
+function createDraft(root, slug) {
   const draftRel = `_drafts/${slug}.md`;
   const used = [...findDrafts(root, slug), ...findPosts(root, slug)];
   if (pathExists(inRoot(root, draftRel)) && !used.includes(draftRel)) used.unshift(draftRel);
   if (used.length > 0) {
     fail(`slug ${slug} is already used by ${used.join(', ')}; choose another slug`);
+    return EXIT_INVALID;
+  }
+  const draftImagesRel = `assets/drafts/${slug}`;
+  const draftImagesAbs = inRoot(root, draftImagesRel);
+  if (pathExists(draftImagesAbs) && !isRealDirectory(draftImagesAbs)) {
+    fail(`${draftImagesRel} is not a folder (or is a symbolic link); move it aside and run new again; `
+      + 'nothing was created');
     return EXIT_INVALID;
   }
 
@@ -489,23 +989,42 @@ function cmdNew(root, slug) {
     return EXIT_INVALID;
   }
 
-  fs.mkdirSync(inRoot(root, '_drafts'), { recursive: true });
+  // The draft's undo is recorded once it exists, so a failure creating its
+  // image folder (a file where assets/drafts/ should be, say) removes the
+  // draft again and the slug stays free for a retry. A `_drafts/` folder this
+  // run made is removed with the lock when it is empty again.
+  const undo = new UndoLog();
+  let step = 'create the _drafts/ folder';
   try {
-    // 'wx' never overwrites: a draft created since the check above is kept.
-    fs.writeFileSync(inRoot(root, draftRel), template, { flag: 'wx' });
+    fs.mkdirSync(inRoot(root, '_drafts'), { recursive: true });
+    // Exclusive creation never overwrites: a draft created since the check above is kept.
+    step = `write ${draftRel}`;
+    createExclusive(inRoot(root, draftRel), template);
+    undo.push(`remove ${draftRel}`, () => removeCreated(root, draftRel, template, '_templates/article.md'));
+    step = `create ${draftImagesRel}/`;
+    fs.mkdirSync(draftImagesAbs, { recursive: true });
   } catch (err) {
-    fail(err.code === 'EEXIST' ? `${draftRel} already exists` : `cannot write ${draftRel} (${err.message})`);
-    return EXIT_INVALID;
+    return reportFailure({
+      command: 'new',
+      root,
+      step,
+      err,
+      undo,
+      paths: [draftRel, `${draftImagesRel}/`],
+      untouched: 'no draft was created',
+    });
   }
-  fs.mkdirSync(inRoot(root, `assets/drafts/${slug}`), { recursive: true });
 
   say(`Created ${draftRel} from _templates/article.md, and assets/drafts/${slug}/ for its images.`);
   say('Both folders are git-ignored: the draft stays on this machine until you publish it.');
+  const outside = runsOutsideRoot(root);
   if (!hooksEnabled(root)) {
-    warn('git hooks are not enabled for this clone; run: git config core.hooksPath .githooks');
+    warn(`git hooks are not enabled for this clone; run: git ${outside ? `-C ${shellQuote(root)} ` : ''}`
+      + 'config core.hooksPath .githooks');
   }
   say();
   say('Next:');
+  if (outside) say(`  cd ${shellQuote(root)}`);
   say(`  1. Edit ${draftRel}. Put images in assets/drafts/${slug}/ and reference them as`);
   say(`     {{ '/assets/drafts/${slug}/figure.png' | relative_url }}`);
   say('  2. Preview: bundle exec jekyll serve --drafts --config _config.yml,_config.preview.yml');
@@ -576,25 +1095,74 @@ function replaceAllText(text, from, to) {
 }
 
 /**
- * Writes `target` without ever overwriting it: the rewritten text when there
- * is one, otherwise a byte-for-byte copy of `source`.
+ * Checks the post `publish` is about to write, before anything moves. The
+ * draft check cannot vouch for it: the post rules add the filename date (an
+ * `updated` date earlier than the publish date is refused, for one), and the
+ * image paths may have been rewritten. Its images are looked up where they
+ * still are: `/assets/blog/<slug>/<file>` exists when
+ * `assets/drafts/<slug>/<file>` does. Slug uniqueness is left to the draft
+ * check, which already reports every post and other draft with the slug,
+ * whereas a post check would count the draft being published; the Liquid
+ * warnings were printed by the draft check.
+ *
+ * @param {string} root Absolute repository root.
+ * @param {string} postRel Repository-relative path the post will have.
+ * @param {string} slug The article's slug.
+ * @param {string} today The UTC date the post filename carries.
+ * @param {string} postText The text the post will hold.
+ * @returns {string[]} Errors, each starting with `postRel`.
  */
-function writeExclusive(source, target, rewritten) {
-  if (rewritten === null) fs.copyFileSync(source, target, fs.constants.COPYFILE_EXCL);
-  else fs.writeFileSync(target, rewritten, { encoding: 'utf8', flag: 'wx' });
+function checkProspectivePost(root, postRel, slug, today, postText) {
+  const { data, body, errors: parseErrors } = parseArticle(postText);
+  const errors = parseErrors.map((message) => `${postRel}: ${message}`);
+  const bodyStartLine = postText.slice(0, postText.length - body.length).split('\n').length;
+  const draftImageExists = makeImageExists(root);
+  const blogPrefix = `/assets/blog/${slug}/`;
+  const imageExists = (publicPath) => typeof publicPath === 'string' && publicPath.startsWith(blogPrefix)
+    && draftImageExists(`/assets/drafts/${slug}/${publicPath.slice(blogPrefix.length)}`);
+  const postErrors = validateArticle({
+    path: postRel,
+    data,
+    body,
+    kind: 'post',
+    todayUtc: today,
+    imageExists,
+    bodyStartLine,
+  });
+  for (const message of postErrors) errors.push(message);
+  for (const finding of scanUnsafeMarkup(body)) {
+    errors.push(`${postRel}:${bodyStartLine + finding.line - 1}: unsafe markup "${finding.text}"`);
+  }
+  return errors;
 }
 
 function cmdPublish(root, slug) {
   if (!isValidSlug(slug)) return refuseSlug(slug);
-  const today = todayUtc();
   const draftRel = `_drafts/${slug}.md`;
-  const draftAbs = inRoot(root, draftRel);
-  if (!isFile(draftAbs)) {
+  if (!isFile(inRoot(root, draftRel))) {
     fail(`${draftRel} does not exist; start a draft with: node scripts/article.mjs new ${slug}`);
     return EXIT_INVALID;
   }
+  return withSlugLock(root, slug, 'publish', () => publishDraft(root, slug));
+}
 
-  const { errors, warnings, text, data } = checkFile(root, draftRel, 'draft', today);
+/** `publish <slug>` once the slug's lock is held; the date is read under the lock as well. */
+function publishDraft(root, slug) {
+  const today = todayUtc();
+  const draftRel = `_drafts/${slug}.md`;
+  const draftAbs = inRoot(root, draftRel);
+  const asideRel = asideRelFor(slug, 'publish');
+  if (!clearLeftoverAside(root, asideRel, draftRel, 'publish')) return EXIT_INVALID;
+
+  // One read: the post is written from exactly the bytes checked here.
+  let snapshot;
+  try {
+    snapshot = fs.readFileSync(draftAbs);
+  } catch (err) {
+    fail(`${draftRel}: cannot read the file (${err.code ?? err.message}); nothing was moved`);
+    return EXIT_INVALID;
+  }
+  const { errors, warnings, text, data } = checkText(root, draftRel, 'draft', today, snapshot.toString('utf8'));
   for (const message of warnings) warn(message);
   if (errors.length > 0) {
     for (const message of errors) fail(message);
@@ -625,47 +1193,92 @@ function cmdPublish(root, slug) {
     return EXIT_INVALID;
   }
 
-  // The image paths change only when the folder moves with the article.
-  const rewritten = moveImages
+  // The image paths change only when the folder moves with the article;
+  // otherwise the post is the checked bytes themselves.
+  const postText = moveImages
     ? replaceAllText(text, `/assets/drafts/${slug}/`, `/assets/blog/${slug}/`)
-    : null;
-
-  // Order: write the post, then move the images, then remove the draft. A
-  // failure at any step leaves at least one complete copy of the article.
-  fs.mkdirSync(inRoot(root, '_posts'), { recursive: true });
-  try {
-    writeExclusive(draftAbs, postAbs, rewritten);
-  } catch (err) {
-    fail(`cannot write ${postRel} (${err.code === 'EEXIST' ? 'it already exists' : err.message}); nothing was moved`);
+    : text;
+  const postBytes = moveImages ? Buffer.from(postText, 'utf8') : snapshot;
+  const postErrors = checkProspectivePost(root, postRel, slug, today, postText);
+  if (postErrors.length > 0) {
+    for (const message of postErrors) fail(message);
+    fail(`publish refused (${plural(postErrors.length, 'problem')}): the post would fail check; nothing was moved`);
     return EXIT_INVALID;
   }
+
+  // Order: write the post, then move the images, then retire the draft. Each
+  // step records its undo once it has succeeded, and any failure undoes the
+  // steps before it, newest first, so a failed publish can simply be run
+  // again. Retiring the draft is the commit point: it is the last step, and
+  // the draft is untouched until then. Folders made on the way (`_posts/`,
+  // `assets/blog/`) stay: an empty folder is invisible to git and to a retry.
+  //
+  // Concurrency: competing new, publish and unpublish runs for this slug wait
+  // on its lock, held by the caller. An editor saving the draft meanwhile is
+  // handled at the commit point: the draft is set aside with one rename, its
+  // bytes must still be the checked snapshot, and nothing may have been saved
+  // in its place; otherwise everything is undone and the edit is kept.
+  const undo = new UndoLog();
+  let step = 'create the _posts/ folder';
   try {
+    fs.mkdirSync(inRoot(root, '_posts'), { recursive: true });
+    step = `write ${postRel}`;
+    createExclusive(postAbs, postBytes);
+    undo.push(`remove ${postRel}`, () => removeCreated(root, postRel, postBytes, draftRel));
     if (moveImages) {
+      step = 'create the assets/blog/ folder';
       fs.mkdirSync(inRoot(root, 'assets/blog'), { recursive: true });
+      step = `move ${draftImagesRel}/ to ${blogImagesRel}/`;
       fs.renameSync(draftImagesAbs, blogImagesAbs);
+      undo.push(`move ${blogImagesRel}/ back to ${draftImagesRel}/`,
+        () => fs.renameSync(blogImagesAbs, draftImagesAbs));
     } else if (imageFolder) {
-      // Only empty folders remain inside, so an article without images creates no image folder.
+      // Only empty folders remain inside, so an article without images creates
+      // no image folder. Recreating folders is harmless where they still
+      // exist, so this undo is recorded first: it also repairs a removal that
+      // stopped part way.
+      step = `remove the empty ${draftImagesRel}/`;
+      const folders = [draftImagesAbs, ...listFolders(draftImagesAbs)];
+      undo.push(`recreate the empty ${draftImagesRel}/`, () => {
+        for (const folder of folders) fs.mkdirSync(folder, { recursive: true });
+      });
       fs.rmSync(draftImagesAbs, { recursive: true });
     }
+    step = `set ${draftRel} aside as ${asideRel}`;
+    setAside(root, draftRel, asideRel, 'publish');
+    undo.push(`remove the set-aside copy ${asideRel}`, () => removeAside(root, asideRel, draftRel, snapshot));
+    undo.push(`put ${draftRel} back from ${asideRel}`, () => putBack(root, asideRel, draftRel));
+    step = `check that ${draftRel} is unchanged`;
+    assertAsideUnchanged(root, asideRel, draftRel, snapshot, 'publish');
+    // The commit point; nothing can fail after it. The draft is no longer at
+    // its path, so a save landing now creates a new draft rather than being
+    // deleted with this copy; it is reported below.
+    step = `remove ${draftRel}`;
+    fs.unlinkSync(inRoot(root, asideRel));
   } catch (err) {
-    fs.rmSync(postAbs, { force: true });
-    fail(`cannot ${moveImages ? `move ${draftImagesRel}/ to ${blogImagesRel}/` : `remove the empty ${draftImagesRel}/`} `
-      + `(${err.message}); ${postRel} was removed again and the draft is unchanged`);
-    return EXIT_INVALID;
-  }
-  try {
-    fs.unlinkSync(draftAbs);
-  } catch (err) {
-    fail(`published ${postRel}, but cannot remove ${draftRel} (${err.message}); delete it by hand`);
-    return EXIT_INVALID;
+    return reportFailure({
+      command: 'publish',
+      root,
+      step,
+      err,
+      undo,
+      paths: [draftRel, postRel, `${draftImagesRel}/`, `${blogImagesRel}/`],
+      leftovers: [asideRel],
+      untouched: 'nothing was moved',
+    });
   }
 
+  if (pathExists(draftAbs)) {
+    warn(`${draftRel} was saved again as publishing finished: ${postRel} holds the checked text, and your `
+      + `newer save is kept in ${draftRel}. Both use slug ${slug}; copy the edit into the post, then delete the draft`);
+  }
   say(`Published ${draftRel} as ${postRel}.`);
   if (moveImages) say(`Moved ${draftImagesRel}/ to ${blogImagesRel}/ and rewrote the image paths.`);
   else if (imageFolder) say(`Removed the empty ${draftImagesRel}/.`);
   const title = typeof data.title === 'string' ? data.title : slug;
   say();
   say('Next:');
+  if (runsOutsideRoot(root)) say(`  cd ${shellQuote(root)}`);
   say('  node scripts/verify.mjs');
   say(`  git add ${postRel}${moveImages ? ` ${blogImagesRel}` : ''}`);
   say(`  git commit -m ${shellQuote(`Publish: ${title}`)}`);
@@ -680,6 +1293,11 @@ function cmdPublish(root, slug) {
 
 function cmdUnpublish(root, slug) {
   if (!isValidSlug(slug)) return refuseSlug(slug);
+  return withSlugLock(root, slug, 'unpublish', () => unpublishPost(root, slug));
+}
+
+/** `unpublish <slug>` once the slug's lock is held. */
+function unpublishPost(root, slug) {
   const posts = findPosts(root, slug);
   if (posts.length === 0) {
     fail(`no published article with slug ${slug} in _posts/`);
@@ -698,12 +1316,14 @@ function cmdUnpublish(root, slug) {
   const blogImagesRel = `assets/blog/${slug}`;
   const draftImagesAbs = inRoot(root, draftImagesRel);
   const blogImagesAbs = inRoot(root, blogImagesRel);
+  const asideRel = asideRelFor(slug, 'unpublish');
   for (const [rel, abs] of [[draftRel, draftAbs], [`${draftImagesRel}/`, draftImagesAbs]]) {
     if (pathExists(abs)) {
       fail(`${rel} already exists; move it aside so unpublishing overwrites nothing`);
       return EXIT_INVALID;
     }
   }
+  if (!clearLeftoverAside(root, asideRel, postRel, 'unpublish')) return EXIT_INVALID;
   if (pathExists(blogImagesAbs) && !isRealDirectory(blogImagesAbs)) {
     fail(`${blogImagesRel} is not a folder (or is a symbolic link); fix it before unpublishing`);
     return EXIT_INVALID;
@@ -727,40 +1347,72 @@ function cmdUnpublish(root, slug) {
   // In a fresh clone an image-free article has no image folder (git keeps no
   // empty folders), so the post moves alone.
   const moveImages = isRealDirectory(blogImagesAbs);
-  const rewritten = moveImages
-    ? replaceAllText(fs.readFileSync(postAbs, 'utf8'), `/assets/blog/${slug}/`, `/assets/drafts/${slug}/`)
-    : null;
-
-  // Order: write the draft, then move the images, then remove the post.
-  fs.mkdirSync(inRoot(root, '_drafts'), { recursive: true });
+  // One read: the draft is written from exactly these bytes, and the post is
+  // removed only while it still holds them.
+  let snapshot;
   try {
-    writeExclusive(postAbs, draftAbs, rewritten);
+    snapshot = fs.readFileSync(postAbs);
   } catch (err) {
-    fail(`cannot write ${draftRel} (${err.code === 'EEXIST' ? 'it already exists' : err.message}); nothing was moved`);
+    fail(`${postRel}: cannot read the file (${err.code ?? err.message}); nothing was moved`);
     return EXIT_INVALID;
   }
-  if (moveImages) {
-    try {
+  const draftBytes = moveImages
+    ? Buffer.from(replaceAllText(snapshot.toString('utf8'), `/assets/blog/${slug}/`, `/assets/drafts/${slug}/`))
+    : snapshot;
+
+  // Order: write the draft, then move the images, then retire the post, with
+  // the same undo log, lock and commit point as publish; the post is set
+  // aside in the git-ignored _drafts/ folder. A failure therefore never
+  // leaves the live post with its images moved to the git-ignored
+  // assets/drafts/.
+  const undo = new UndoLog();
+  let step = 'create the _drafts/ folder';
+  try {
+    fs.mkdirSync(inRoot(root, '_drafts'), { recursive: true });
+    step = `write ${draftRel}`;
+    createExclusive(draftAbs, draftBytes);
+    undo.push(`remove ${draftRel}`, () => removeCreated(root, draftRel, draftBytes, postRel));
+    if (moveImages) {
+      step = 'create the assets/drafts/ folder';
       fs.mkdirSync(inRoot(root, 'assets/drafts'), { recursive: true });
+      step = `move ${blogImagesRel}/ to ${draftImagesRel}/`;
       fs.renameSync(blogImagesAbs, draftImagesAbs);
-    } catch (err) {
-      fs.rmSync(draftAbs, { force: true });
-      fail(`cannot move ${blogImagesRel}/ to ${draftImagesRel}/ (${err.message}); ${draftRel} was removed `
-        + 'again and the post is unchanged');
-      return EXIT_INVALID;
+      undo.push(`move ${draftImagesRel}/ back to ${blogImagesRel}/`,
+        () => fs.renameSync(draftImagesAbs, blogImagesAbs));
     }
-  }
-  try {
-    fs.unlinkSync(postAbs);
+    step = `set ${postRel} aside as ${asideRel}`;
+    setAside(root, postRel, asideRel, 'unpublish');
+    undo.push(`remove the set-aside copy ${asideRel}`, () => removeAside(root, asideRel, postRel, snapshot));
+    undo.push(`put ${postRel} back from ${asideRel}`, () => putBack(root, asideRel, postRel));
+    step = `check that ${postRel} is unchanged`;
+    assertAsideUnchanged(root, asideRel, postRel, snapshot, 'unpublish');
+    // The commit point, as in publish: a save landing now recreates the post
+    // rather than being deleted with this copy; it is reported below.
+    step = `remove ${postRel}`;
+    fs.unlinkSync(inRoot(root, asideRel));
   } catch (err) {
-    fail(`wrote ${draftRel}, but cannot remove ${postRel} (${err.message}); delete it by hand`);
-    return EXIT_INVALID;
+    return reportFailure({
+      command: 'unpublish',
+      root,
+      step,
+      err,
+      undo,
+      paths: [postRel, draftRel, `${blogImagesRel}/`, `${draftImagesRel}/`],
+      leftovers: [asideRel],
+      untouched: 'nothing was moved',
+    });
   }
 
+  if (pathExists(postAbs)) {
+    warn(`${postRel} was saved again as unpublishing finished: ${draftRel} holds the unpublished text, and `
+      + `your newer save is kept in ${postRel}. Both use slug ${slug}; copy the edit into the draft, then delete `
+      + 'the post');
+  }
   say(`Unpublished ${postRel}; it is now the draft ${draftRel}.`);
   if (moveImages) say(`Moved ${blogImagesRel}/ to ${draftImagesRel}/ and rewrote the image paths.`);
   say();
   say('Next:');
+  if (runsOutsideRoot(root)) say(`  cd ${shellQuote(root)}`);
   say(`  git add -A -- ${postRel}${moveImages ? ` ${blogImagesRel}` : ''}`);
   say(`  git commit -m "Unpublish: ${slug}"`);
   say('  git push origin main');
@@ -803,7 +1455,10 @@ function stagedChanges(top) {
   return splitNul(git(top, [...args, emptyTree]));
 }
 
-/** Reads the given articles from tree or index entries; a submodule in an article path is an error. */
+/**
+ * Reads the given articles from tree or index entries, each with its blob id
+ * as `id`; a submodule in an article path is an error.
+ */
 function readArticles(changedPaths, entryFor, readBlob, errors) {
   const articles = [];
   for (const p of changedPaths) {
@@ -814,7 +1469,7 @@ function readArticles(changedPaths, entryFor, readBlob, errors) {
       errors.push(`${p}: a submodule cannot be an article`);
       continue;
     }
-    articles.push({ path: p, text: readBlob(entry.oid) });
+    articles.push({ path: p, text: readBlob(entry.oid), id: entry.oid });
   }
   return articles;
 }
@@ -840,7 +1495,7 @@ function cmdGuardStaged(root) {
 
   const readBlob = makeBlobReader(top);
   const articles = readArticles(stagedChanges(top), (p) => entries.get(p), readBlob, errors);
-  errors.push(...checkTrackedContent({ paths, articles, todayUtc: today }));
+  for (const message of checkTrackedContent({ paths, articles, todayUtc: today })) errors.push(message);
 
   if (errors.length > 0) {
     for (const message of errors) fail(message);
@@ -939,6 +1594,8 @@ function cmdGuardPrePush(root) {
   const today = todayUtc();
   const commits = commitsToPush(top, lines);
   const readBlob = makeBlobReader(top);
+  // Text analyses by blob id for this run: path, date and image rules still run per commit.
+  const analyses = new Map();
 
   const problems = [];
   let refusedCommits = 0;
@@ -954,7 +1611,8 @@ function cmdGuardPrePush(root) {
     ]));
     const errors = [];
     const articles = readArticles(changed, (p) => tree.get(p), readBlob, errors);
-    errors.push(...checkTrackedContent({ paths: [...tree.keys()], articles, todayUtc: today }));
+    const content = checkTrackedContent({ paths: [...tree.keys()], articles, todayUtc: today, cache: analyses });
+    for (const message of content) errors.push(message);
     if (errors.length > 0) {
       refusedCommits += 1;
       const short = commit.slice(0, 7);

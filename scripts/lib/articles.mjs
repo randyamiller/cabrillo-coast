@@ -141,9 +141,9 @@ const TAG_START_RE = /<[a-zA-Z][a-zA-Z0-9-]*(?=[\s/>])/g;
 /** Start of a kramdown attribute list (`{: …}`, `{:#id}`, ALDs). */
 const IAL_START_RE = /\{:/g;
 
-/** Event-handler attribute inside a tag, and inside an attribute list. */
-const TAG_EVENT_ATTR_RE = /[\s"'/]on[a-z]+\s*=/i;
-const IAL_EVENT_ATTR_RE = /[\s"'/:]on[a-z]+\s*=/i;
+/** Event-handler attribute inside a tag, and inside an attribute list (`g`: every one is reported). */
+const TAG_EVENT_ATTR_RE = /[\s"'/]on[a-z]+\s*=/gi;
+const IAL_EVENT_ATTR_RE = /[\s"'/:]on[a-z]+\s*=/gi;
 
 /**
  * The `javascript` scheme. Browsers remove tabs and line breaks anywhere in a
@@ -168,27 +168,52 @@ const JS_URL_MARKDOWN_RE = new RegExp(`(?:\\]\\(\\s*<?|\\]:\\s*<?|<)[\\s\\u0000-
 /** Link text as kramdown counts brackets in it, one level of nesting deep. */
 const BRACKETED_TEXT = '(?:[^\\[\\]]|\\[[^\\[\\]]*\\])*';
 
-/** `javascript:` after `=` (optionally quoted), applied inside tags and attribute lists only. */
-const JS_URL_ATTR_RE = new RegExp(`=\\s*["']?[\\s\\u0000-\\u001f]*${JS_SCHEME}`, 'i');
+/**
+ * `javascript:` after `=` (optionally quoted), applied inside tags and
+ * attribute lists only (`g`: every one is reported).
+ */
+const JS_URL_ATTR_RE = new RegExp(`=\\s*["']?[\\s\\u0000-\\u001f]*${JS_SCHEME}`, 'gi');
 
 /**
- * Markdown inline image `![alt](dest "title")` as kramdown's link parser reads
- * it: the alt text may hold bracketed text, `dest` may be a Liquid
- * expression, an `<…>` URL, or a URL holding spaces (except before a quote,
- * which starts the title) and balanced parentheses (kramdown has no
- * parenthesised titles; verified). Groups: 1 alt, 2 destination. The
+ * Start of a Markdown inline image `![alt](dest "title")` as kramdown's link
+ * parser reads it, through the end of `dest`; `inlineImageEnd` then reads the
+ * optional title and the closing `)`. The alt text may hold bracketed text.
+ * `dest` takes one of two forms:
+ *   - an `<…>` URL, recognised only when `<` directly follows `(`. `>` must
+ *     then be followed directly by `)`, or by a title and `)`; otherwise the
+ *     whole image is literal text;
+ *   - otherwise a Liquid expression, or a URL holding spaces (except before a
+ *     quote, which starts the title) and balanced parentheses, and surrounding
+ *     whitespace, which kramdown strips. A quote directly after `(` belongs to
+ *     the URL. `dest` may be empty or whitespace, which kramdown renders as
+ *     an image with an empty source, so `()`, `( )` and `( "title")` are
+ *     images too, as is `(<>)` in the first form.
+ * kramdown has no parenthesised titles (verified). Groups: 1 alt, 2 `<…>`
+ * destination, 3 any other destination (exactly one of 2 and 3 is set). The
  * captures are possessive, as no shorter match could succeed.
  */
-const IMG_INLINE_RE = new RegExp(
-  `!\\[(?=(${BRACKETED_TEXT}))\\1\\]\\(\\s*`
-  + `(?=(\\{\\{[\\s\\S]*?\\}\\}[^\\s)]*|<[^>\\n]*>|(?:[^\\s()]|[ \\t]+(?=[^\\s"')])|\\([^()\\n]*\\))+))\\2`
-  + `(?:\\s+(?:"[^"]*"|'[^']*'))?\\s*\\)`,
-  'g',
+const IMG_INLINE_HEAD_RE = new RegExp(
+  `!\\[(?=(${BRACKETED_TEXT}))\\1\\]\\(`
+  + `(?:(?=(<[^>\\n]*>))\\2`
+  + `|(?!<[^>\\n]*>)(?=(\\s*(?:\\{\\{[\\s\\S]*?\\}\\}[^\\s)]*`
+  + `|(?!(?<=\\s)["'])(?:[^\\s()]|[ \\t]+(?=[^\\s"')])|\\([^()\\n]*\\))*)))\\3)`,
+  'gd',
 );
+
+/**
+ * A quote that can close an inline image title: kramdown's title pattern
+ * `\s*?(["'])(.+?)\1\s*?\)` ends the title at the first matching quote that
+ * only (Ruby) whitespace separates from `)`.
+ */
+const TITLE_CLOSE_RE = /["'](?=[ \t\n\v\f\r]*\))/g;
+
+/** A line kramdown reads as blank: Ruby whitespace only. */
+const RUBY_BLANK_LINE_RE = /^[ \t\v\f\r]*$/;
 
 /**
  * Markdown reference image `![alt][id]`, `![alt][]` or shortcut `![alt]`;
  * kramdown allows any whitespace, a line break included, before `[id]`.
+ * Matched within one paragraph (`paragraphSpans`).
  */
 const IMG_REFERENCE_RE = new RegExp(`!\\[(${BRACKETED_TEXT})\\](?:\\s*?\\[([^\\]]*)\\])?`, 'g');
 
@@ -200,6 +225,15 @@ const LINK_DEFINITION_RE = /^ {0,3}\[([^\]\n]+)\]:[ \t]*\n?[ \t]*(<[^>\n]*>|[^\n
 
 /** Raw HTML `<img …>` start. */
 const IMG_TAG_START_RE = /<img(?=[\s/>])/gi;
+
+/**
+ * Tag text `collectImages` may read from `<img>` tags, per character of the
+ * body and in all. Tags that do not overlap total at most the body's length;
+ * unclosed starts (`'<img '.repeat(n)`) all end at the same `>`, and reading
+ * each of them would take quadratic time.
+ */
+const IMAGE_TAG_WORK_PER_CHAR = 4;
+const IMAGE_TAG_WORK_BASE = 65536;
 
 /** One attribute inside a tag: name, then a double-quoted, single-quoted or bare value. */
 const ATTR_RE = /([^\s"'<>/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
@@ -213,8 +247,14 @@ const RAW_CLOSE_RE = /\{%-?\s*endraw\s*-?%\}/g;
 const RAW_TAG_AT_RE = /\{%-?\s*(?:end)?raw\s*-?%\}/y;
 const LIQUID_IN_CODE_RE = /\{\{|\{%/g;
 
-const POST_URL_TAG_RE = /\{%-?\s*post_url\s+([^\s%]+)\s*-?%\}/g;
-const LINK_TAG_RE = /\{%-?\s*link\s+([^\s%]+)\s*-?%\}/g;
+/**
+ * `post_url` and `link` tags. Liquid 4.0.4 (`BlockBody::FullToken`) reads a
+ * tag's markup lazily before the optional closing `-`, so the argument is
+ * captured lazily too: in `{% post_url 2026-01-15-foo-%}` it is
+ * `2026-01-15-foo`, not `2026-01-15-foo-`.
+ */
+const POST_URL_TAG_RE = /\{%-?\s*post_url\s+([^\s%]+?)\s*-?%\}/g;
+const LINK_TAG_RE = /\{%-?\s*link\s+([^\s%]+?)\s*-?%\}/g;
 
 const NAMED_ENTITIES = {
   amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", colon: ':', tab: '\t', newline: '\n',
@@ -362,6 +402,22 @@ function escapeRegExp(s) {
 }
 
 /**
+ * The passes of `decodeEntities`, applied in order, each to the output of
+ * the one before: hexadecimal and decimal references (the semicolon is
+ * optional, as browsers allow), then the named references in
+ * `NAMED_ENTITIES`. Each decoder returns the reference unchanged when it
+ * names nothing. `decodeEntitiesMapped` applies the same passes.
+ */
+const ENTITY_PASSES = [
+  [/&#[xX]([0-9a-fA-F]+);?/g, (all, hex) => codePointText(Number.parseInt(hex, 16), all)],
+  [/&#(\d+);?/g, (all, dec) => codePointText(Number.parseInt(dec, 10), all)],
+  [/&([a-zA-Z]+);/g, (all, name) => {
+    const key = name.toLowerCase();
+    return Object.hasOwn(NAMED_ENTITIES, key) ? NAMED_ENTITIES[key] : all;
+  }],
+];
+
+/**
  * Decodes the HTML character references a browser would decode in an
  * attribute value: numeric references (the semicolon is optional, as browsers
  * allow) and the named references that can spell a URL scheme. Used only to
@@ -369,13 +425,40 @@ function escapeRegExp(s) {
  * comes from the original source.
  */
 function decodeEntities(s) {
-  return s
-    .replace(/&#[xX]([0-9a-fA-F]+);?/g, (all, hex) => codePointText(Number.parseInt(hex, 16), all))
-    .replace(/&#(\d+);?/g, (all, dec) => codePointText(Number.parseInt(dec, 10), all))
-    .replace(/&([a-zA-Z]+);/g, (all, name) => {
-      const key = name.toLowerCase();
-      return Object.hasOwn(NAMED_ENTITIES, key) ? NAMED_ENTITIES[key] : all;
-    });
+  return ENTITY_PASSES.reduce((text, [re, decode]) => text.replace(re, decode), s);
+}
+
+/**
+ * `decodeEntities(s)` as `{ text, from }`, where `from[k]` is the offset in
+ * `s` that character `k` of `text` comes from: a decoded reference maps to
+ * the first character of the reference it was decoded from (through every
+ * pass), any other character to itself. It runs the same passes, so `text`
+ * always equals `decodeEntities(s)`.
+ */
+function decodeEntitiesMapped(s) {
+  let text = s;
+  let from = Array.from({ length: s.length }, (_, k) => k);
+  for (const [re, decode] of ENTITY_PASSES) {
+    let out = '';
+    const map = [];
+    let pos = 0;
+    const keep = (end) => {
+      out += text.slice(pos, end);
+      for (let k = pos; k < end; k += 1) map.push(from[k]);
+    };
+    for (const m of text.matchAll(re)) {
+      const value = decode(m[0], m[1]);
+      if (value === m[0]) continue;
+      keep(m.index);
+      out += value;
+      for (let k = 0; k < value.length; k += 1) map.push(from[m.index]);
+      pos = m.index + m[0].length;
+    }
+    keep(text.length);
+    text = out;
+    from = map;
+  }
+  return { text, from };
 }
 
 function codePointText(cp, fallback) {
@@ -469,11 +552,22 @@ const LAZY_END_HTML_START_RE = new RegExp(
 );
 /** kramdown `BLOCK_EXTENSIONS_START`. */
 const BLOCK_EXTENSION_RE = /^ {0,3}\{::([a-zA-Z]\w*)(?:\s[^}\n]*?)?(\/)?\}/;
+/** A line ending block extensions: `{:/}` ends any, `{:/name}` (group 1) those named `name`. */
+const EXTENSION_STOP_RE = /^ {0,3}\{:\/([a-zA-Z]\w*)?\}[ \t\r\f\v]*$/;
 const OPTIONS_EXTENSION_RE = /\{::options\b/;
 const RAW_EXTENSIONS = new Set(['comment', 'nomarkdown']);
 const MATH_BLOCK_RE = /^ {0,3}\\?\$\$/;
 /** Above this many open readings the model stops masking for the rest of the body. */
 const MAX_HYPOTHESES = 64;
+/**
+ * Lines that searches for the end of a fence or block extension inside list
+ * items may read, per line of the body and in all. Such a search reads the
+ * lines through the item's extraction, which top-level indexes cannot
+ * answer, so a body of unclosed openers would otherwise take quadratic time;
+ * once the budget is spent the model stops masking for the rest of the body.
+ */
+const LOOKAHEAD_PER_LINE = 64;
+const LOOKAHEAD_BASE = 65536;
 /** Scanning allowed to the inline-code walk, per character of text and in all. */
 const SPAN_WORK_PER_CHAR = 32;
 const SPAN_WORK_BASE = 65536;
@@ -655,7 +749,10 @@ function blockView(texts, index, items, depth) {
  * is the opening line as its block sees it; `next(j)` returns line `j` the
  * same way (`null` once the block has ended), and `misses`, given only when
  * every reading sees the same lines (the top level), remembers closing
- * patterns no later line matches.
+ * patterns no later line matches. `charge`, given where no `misses` can be
+ * kept (inside list items), is called before each line test and returns
+ * false once the lookahead budget is spent; the result is then `null`
+ * (unknown).
  *
  * kramdown's fence run `([~`]){3,}` can backtrack: a run of N characters may
  * act as a shorter run of k (3 ≤ k ≤ N) with the rest taken as info, so
@@ -663,7 +760,7 @@ function blockView(texts, index, items, depth) {
  * first line holding the k-character prefix, more of its last character and
  * nothing else closes the fence.
  */
-function kramdownFenceClose(view, index, lineCount, next, misses = null) {
+function kramdownFenceClose(view, index, lineCount, next, misses = null, charge = null) {
   const m = FENCE_START_RE.exec(view);
   if (!m) return -1;
   const run = m[1];
@@ -687,6 +784,7 @@ function kramdownFenceClose(view, index, lineCount, next, misses = null) {
     const missFrom = misses?.get(close.source);
     if (missFrom !== undefined && index + 1 >= missFrom) continue;
     for (let i = 0; ; i += 1) {
+      if (charge !== null && !charge()) return null;
       const v = viewAt(i);
       if (v === null) {
         // No line from here on closes such a fence; the same holds for any
@@ -696,6 +794,80 @@ function kramdownFenceClose(view, index, lineCount, next, misses = null) {
       }
       if (close.test(v)) return index + 1 + i;
     }
+  }
+  return -1;
+}
+
+/**
+ * Charges one line read by a search inside list items to the body's
+ * lookahead budget (`LOOKAHEAD_PER_LINE`); false once it is spent, and from
+ * then on, with `ctx.exhausted` set.
+ */
+function chargeLookahead(ctx) {
+  ctx.lookahead -= 1;
+  if (ctx.lookahead < 0) ctx.exhausted = true;
+  return !ctx.exhausted;
+}
+
+/**
+ * Lines of `texts` that can end a block extension at the top level, where
+ * every line reads as written: `{ generic, named }`, the ascending indexes of
+ * the `{:/}` lines and, per name, of the `{:/name}` lines.
+ */
+function extensionStopLines(texts) {
+  const generic = [];
+  const named = new Map();
+  for (let j = 0; j < texts.length; j += 1) {
+    const m = EXTENSION_STOP_RE.exec(texts[j]);
+    if (m === null) continue;
+    if (m[1] === undefined) {
+      generic.push(j);
+    } else {
+      if (!named.has(m[1])) named.set(m[1], []);
+      named.get(m[1]).push(j);
+    }
+  }
+  return { generic, named };
+}
+
+/** The first entry of the ascending `list` greater than `index`, or -1. */
+function firstAfter(list, index) {
+  let lo = 0;
+  let hi = list.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (list[mid] <= index) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo < list.length ? list[lo] : -1;
+}
+
+/**
+ * Line of the first `{:/}` or `{:/name}` line after line `index` that ends
+ * the block extension `name` opened there, reading the lines as the block
+ * holding the opener (the first `depth` open `items`) sees them, or -1 when
+ * none does before that block ends; `null` when the lookahead budget ran out
+ * first. At the top level every line reads as written, so the answer comes
+ * from an index of such lines built once per body (`ctx.extensionStops`)
+ * and searched in O(log n); inside list items each line read is charged to
+ * the budget.
+ */
+function extensionClose(ctx, name, index, items, depth) {
+  const { texts } = ctx;
+  if (depth === 0) {
+    if (ctx.extensionStops === null) ctx.extensionStops = extensionStopLines(texts);
+    const generic = firstAfter(ctx.extensionStops.generic, index);
+    const named = firstAfter(ctx.extensionStops.named.get(name) ?? [], index);
+    if (generic === -1) return named;
+    return named === -1 || generic < named ? generic : named;
+  }
+  const stop = new RegExp(`^ {0,3}\\{:/(?:${escapeRegExp(name)})?\\}[ \\t\\r\\f\\v]*$`);
+  const next = blockView(texts, index, items, depth);
+  for (let j = index + 1; j < texts.length; j += 1) {
+    if (!chargeLookahead(ctx)) return null;
+    const v = next(j);
+    if (v === null) return -1;
+    if (stop.test(v)) return j;
   }
   return -1;
 }
@@ -949,11 +1121,11 @@ function enterLine(w, p) {
 }
 
 /**
- * Returns `b`, the end of a construct starting at `a` that hides the text it
- * spans, after stopping the walk when the construct crosses a line break or
- * leaves the current text.
+ * Returns `b`, the end of a construct that hides the text it spans, after
+ * stopping the walk when the construct crosses a line break or leaves the
+ * current text (ends after `to`).
  */
-function consumeSpan(w, a, b, to) {
+function consumeSpan(w, b, to) {
   if (b > to || b >= w.lineEnd) w.stopped = true;
   return b;
 }
@@ -1051,7 +1223,7 @@ function spanAngle(w, to, p) {
   const t = w.text;
   KD_AUTOLINK_RE.lastIndex = p;
   const auto = KD_AUTOLINK_RE.exec(t);
-  if (auto !== null && p + auto[0].length <= to) return consumeSpan(w, p, p + auto[0].length, to);
+  if (auto !== null && p + auto[0].length <= to) return consumeSpan(w, p + auto[0].length, to);
   const after = p + 1 < to ? String.fromCodePoint(t.codePointAt(p + 1)) : '';
   if (!(SPAN_HTML_NEXT_RE.test(after) || t.startsWith('!--', p + 1))) {
     // Not HTML: `<<` is a typographic symbol, which hides its second `<`.
@@ -1059,19 +1231,19 @@ function spanAngle(w, to, p) {
   }
   if (t.startsWith('<!--', p)) {
     const close = findIn(w, '-->', p + 4, to);
-    return close === -1 ? p + 1 : consumeSpan(w, p, close + 3, to);
+    return close === -1 ? p + 1 : consumeSpan(w, close + 3, to);
   }
   if (t.startsWith('<?', p)) {
     const close = findIn(w, '?>', p + 2, to);
-    return close === -1 ? p + 1 : consumeSpan(w, p, close + 2, to);
+    return close === -1 ? p + 1 : consumeSpan(w, close + 2, to);
   }
   KD_TAG_CLOSE_RE.lastIndex = p;
   const close = KD_TAG_CLOSE_RE.exec(t);
-  if (close !== null) return consumeSpan(w, p, p + close[0].length, to);
+  if (close !== null) return consumeSpan(w, p + close[0].length, to);
   KD_TAG_RE.lastIndex = p;
   const tag = KD_TAG_RE.exec(t);
   if (tag === null) return p + 1;
-  const tagEnd = consumeSpan(w, p, p + tag[0].length, to);
+  const tagEnd = consumeSpan(w, p + tag[0].length, to);
   if (w.stopped) return tagEnd;
   const name = kramdownName(tag[1]);
   // Block-level tags are written out as text; void and self-closed tags have
@@ -1089,7 +1261,7 @@ function spanAngle(w, to, p) {
     w.stopped = true;
     return tagEnd;
   }
-  return consumeSpan(w, p, end, to);
+  return consumeSpan(w, end, to);
 }
 
 /**
@@ -1191,7 +1363,7 @@ function spanLinkTail(w, to, p) {
 /** kramdown `parse_inline_math` at `$$`. */
 function spanMath(w, to, p) {
   const close = findIn(w, '$$', p + 2, to);
-  return close === -1 ? p + 1 : consumeSpan(w, p, close + 2, to);
+  return close === -1 ? p + 1 : consumeSpan(w, close + 2, to);
 }
 
 /** kramdown `parse_span_extensions` at `{:`. */
@@ -1236,7 +1408,7 @@ function spanStrike(w, to, p) {
     return p + 1;
   }
   if (m.index + 3 > to) return p + 1;
-  const end = consumeSpan(w, p, m.index + 3, to);
+  const end = consumeSpan(w, m.index + 3, to);
   if (!w.stopped) walkSpans(w, p + 2, end - 2);
   return end;
 }
@@ -1336,7 +1508,8 @@ function tableRowCodes(text, codes) {
     let value = original.slice(n, original.length - n);
     if (n > 1 && value.startsWith(' ')) value = value.slice(1);
     if (n > 1 && value.endsWith(' ')) value = value.slice(0, -1);
-    const longest = Math.max(0, ...(value.match(/`+/g) ?? []).map((run) => run.length));
+    let longest = 0;
+    for (const run of value.match(/`+/g) ?? []) longest = Math.max(longest, run.length);
     const delimiter = '`'.repeat(longest + 1);
     const pad = delimiter.length > 1 ? ' ' : '';
     const rewrite = `${delimiter}${pad}${value}${pad}${delimiter}`;
@@ -1511,7 +1684,9 @@ function blockStart(base, index, view, ctx, markerMayBeText) {
   if (!listStart || HR_LINE_RE.test(view)) return blockLine(base, index, view, false, ctx);
   const item = openItem(listStart);
   const out = blockLine({ ...base, items: [...base.items, item], para: false }, index, item.content, true, ctx);
-  if (markerMayBeText) out.push(...blockLine(base, index, view, false, ctx));
+  if (markerMayBeText) {
+    for (const successor of blockLine(base, index, view, false, ctx)) out.push(successor);
+  }
   return out;
 }
 
@@ -1564,10 +1739,13 @@ function blockLine(r, index, view, fresh, ctx) {
     return depth === 0 || j <= index || blockView(texts, index, r.items, depth)(j) !== null;
   };
 
-  // Fenced code.
+  // Fenced code. A search the lookahead budget cut short leaves the line
+  // uncertain, and `findCodeRegions` stops masking after it.
   if (FENCE_START_RE.test(view)) {
     const misses = depth === 0 ? ctx.fenceMisses : null;
-    const close = kramdownFenceClose(view, index, texts.length, blockView(texts, index, r.items, depth), misses);
+    const charge = depth === 0 ? null : () => chargeLookahead(ctx);
+    const close = kramdownFenceClose(view, index, texts.length, blockView(texts, index, r.items, depth), misses, charge);
+    if (close === null) return [lazyTextStep(r)];
     if (close === -1) return [textStep({ ...r, para: true })];
     const opened = skip(r, close, 'code');
     if (!r.lazy || fresh) return [opened];
@@ -1589,15 +1767,11 @@ function blockLine(r, index, view, fresh, ctx) {
   // line may be part of the paragraph instead.
   const ext = BLOCK_EXTENSION_RE.exec(view);
   if (ext && ext[2] !== '/') {
-    const stop = new RegExp(`^ {0,3}\\{:/(?:${escapeRegExp(ext[1])})?\\}[ \\t\\r\\f\\v]*$`);
-    const next = blockView(texts, index, r.items, depth);
-    for (let j = index + 1; j < texts.length; j += 1) {
-      const v = next(j);
-      if (v === null) break;
-      if (stop.test(v)) {
-        const raw = skip(r, j, 'raw');
-        return RAW_EXTENSIONS.has(ext[1]) && !r.para ? [raw] : [raw, lazyTextStep(r)];
-      }
+    const stop = extensionClose(ctx, ext[1], index, r.items, depth);
+    if (stop === null) return [lazyTextStep(r)];
+    if (stop !== -1) {
+      const raw = skip(r, stop, 'raw');
+      return RAW_EXTENSIONS.has(ext[1]) && !r.para ? [raw] : [raw, lazyTextStep(r)];
     }
   }
   if (MATH_BLOCK_RE.test(view)) {
@@ -1659,11 +1833,26 @@ function blockLine(r, index, view, fresh, ctx) {
  * - A `{::options}` extension can change how kramdown parses everything
  *   after it, and kramdown reads a lone carriage return as a line break; in
  *   either case nothing from that point on is treated as code.
+ * - When more readings stay open than `MAX_HYPOTHESES`, nothing after the
+ *   line is treated as code. When a search for the end of a fence or
+ *   extension inside list items finds the lookahead budget
+ *   (`LOOKAHEAD_PER_LINE`) spent, the line itself is left uncertain too and
+ *   nothing after it is treated as code: an unknown end could shift every
+ *   later pairing.
  */
 function findCodeRegions(body) {
   const lines = splitLines(body);
   const texts = lines.map((line) => stripCr(line.text));
-  const ctx = { body, lines, texts, budget: 0, fenceMisses: new Map() };
+  const ctx = {
+    body,
+    lines,
+    texts,
+    budget: 0,
+    fenceMisses: new Map(),
+    extensionStops: null,
+    lookahead: LOOKAHEAD_PER_LINE * lines.length + LOOKAHEAD_BASE,
+    exhausted: false,
+  };
   const loneCr = body.search(/\r(?!\n)/);
   const options = body.search(OPTIONS_EXTENSION_RE);
   const stopAt = Math.min(
@@ -1704,10 +1893,10 @@ function findCodeRegions(body) {
       closeCode(index - 1);
     }
     readings = [...successors.values()];
-    if (readings.length > MAX_HYPOTHESES) break;
+    if (readings.length > MAX_HYPOTHESES || ctx.exhausted) break;
   }
   closeCode(info.length - 1);
-  regions.push(...inlineCodeRegions(ctx, info));
+  for (const region of inlineCodeRegions(ctx, info)) regions.push(region);
   return regions.sort((a, b) => a.start - b.start);
 }
 
@@ -1728,73 +1917,94 @@ function maskCode(body, regions) {
 }
 
 /**
- * End offsets of tags and attribute lists in `text`, computed in one
- * backward pass so every lookup is O(1) and a body full of unclosed `<` or
- * `{:` cannot make a scan quadratic. For an offset `i` where a tag's
- * attributes or a list's content begins:
- *   - `quoted[i]`: the `>` that ends the tag, skipping `>` inside quoted
- *     attribute values; -1 when a quote is left open or no `>` follows;
- *   - `nextGt[i]`: the first `>` at or after `i` (the extent used when a
- *     quote is left open, as a browser would recover); -1 when none;
- *   - `brace[i]`: the `}` that ends a kramdown attribute list, where a
- *     backslash escapes the next character; -1 when none.
+ * End offsets in `text` of the tags whose attributes begin at the offsets
+ * `tagFrom` and of the attribute lists whose content begins at `listFrom`
+ * (both ascending), as `{ tagEnds, listEnds }` parallel to them:
+ *   - a tag ends at the `>` that closes it, skipping `>` inside quoted
+ *     attribute values, or, when a quote is left open, at the first `>`
+ *     after its name (as a browser would recover); -1 when no `>` follows;
+ *   - a list ends at the `}` that closes it, where a backslash escapes the
+ *     next character; -1 when none.
+ * One backward pass from the end of the text down to the smallest queried
+ * offset answers every query and keeps only scalars, so a body full of
+ * unclosed `<` or `{:` cannot make a scan quadratic, memory grows with the
+ * number of queries only, and no query means no pass.
  */
-function extentIndex(text) {
+function extentEnds(text, tagFrom, listFrom) {
   const n = text.length;
-  const nextGt = new Int32Array(n + 1).fill(-1);
-  const nextDouble = new Int32Array(n + 1).fill(-1);
-  const nextSingle = new Int32Array(n + 1).fill(-1);
-  const quoted = new Int32Array(n + 1).fill(-1);
-  const brace = new Int32Array(n + 2).fill(-1);
-  for (let i = n - 1; i >= 0; i -= 1) {
+  const tagEnds = tagFrom.map(() => -1);
+  const listEnds = listFrom.map(() => -1);
+  let t = tagFrom.length - 1;
+  let l = listFrom.length - 1;
+  // Nothing closes at or past the end of the text.
+  while (t >= 0 && tagFrom[t] >= n) t -= 1;
+  while (l >= 0 && listFrom[l] >= n) l -= 1;
+  // Each holds its value for offset i + 1 when character i is read: `gt` is
+  // the first `>`; `quoted` the end of a tag whose attributes begin there;
+  // `lastDouble` (`lastSingle`) the first `"` (`'`) and `afterDouble`
+  // (`afterSingle`) the `quoted` value just past it; `brace` the end of a
+  // list, and `braceAfter` that value for offset i + 2.
+  let gt = -1;
+  let quoted = -1;
+  let lastDouble = -1;
+  let afterDouble = -1;
+  let lastSingle = -1;
+  let afterSingle = -1;
+  let brace = -1;
+  let braceAfter = -1;
+  for (let i = n - 1; i >= 0 && (t >= 0 || l >= 0); i -= 1) {
     const c = text[i];
-    nextGt[i] = c === '>' ? i : nextGt[i + 1];
-    nextDouble[i] = c === '"' ? i : nextDouble[i + 1];
-    nextSingle[i] = c === "'" ? i : nextSingle[i + 1];
     if (c === '>') {
-      quoted[i] = i;
-    } else if (c === '"' || c === "'") {
-      const close = (c === '"' ? nextDouble : nextSingle)[i + 1];
-      quoted[i] = close === -1 ? -1 : quoted[close + 1];
-    } else {
-      quoted[i] = quoted[i + 1];
+      gt = i;
+      quoted = i;
+    } else if (c === '"') {
+      const close = lastDouble === -1 ? -1 : afterDouble;
+      afterDouble = quoted;
+      lastDouble = i;
+      quoted = close;
+    } else if (c === "'") {
+      const close = lastSingle === -1 ? -1 : afterSingle;
+      afterSingle = quoted;
+      lastSingle = i;
+      quoted = close;
     }
-    if (c === '}') brace[i] = i;
-    else if (c === '\\') brace[i] = i + 1 < n ? brace[i + 2] : -1;
-    else brace[i] = brace[i + 1];
+    let end = brace;
+    if (c === '}') end = i;
+    else if (c === '\\') end = braceAfter;
+    braceAfter = brace;
+    brace = end;
+    for (; t >= 0 && tagFrom[t] === i; t -= 1) tagEnds[t] = quoted !== -1 ? quoted : gt;
+    for (; l >= 0 && listFrom[l] === i; l -= 1) listEnds[l] = brace;
   }
-  return { nextGt, quoted, brace };
+  return { tagEnds, listEnds };
 }
 
 /**
- * Tags whose `<` lies outside code, as `{ start, source }`. The start is
- * found in the masked text, but the extent comes from the original text:
- * kramdown parses an HTML tag from its `<`, so backticks inside its
- * attributes are not code (`<img title="`" onerror="…" alt="`">` keeps its
- * `onerror`, verified). `startRe` must carry the `g` flag.
+ * Tags whose `<` lies outside code (starts of `tagRe`, which must carry the
+ * `g` flag) and, when `withLists` is set, kramdown attribute lists whose
+ * `{:` does, as `{ tags, lists }`: arrays of `{ start, end }` ordered by
+ * start, `end` being the offset of the closing `>` or `}`; constructs that
+ * never close are left out. Starts are found in the masked text, but the
+ * extents come from the original text: kramdown parses an HTML tag from its
+ * `<`, so backticks inside its attributes are not code
+ * (`<img title="`" onerror="…" alt="`">` keeps its `onerror`, verified).
  */
-function* tagsOutsideCode(body, masked, extents, startRe = TAG_START_RE) {
-  for (const m of masked.matchAll(startRe)) {
-    const attrStart = m.index + m[0].length;
-    const end = extents.quoted[attrStart] !== -1 ? extents.quoted[attrStart] : extents.nextGt[attrStart];
-    if (end !== -1) yield { start: m.index, source: body.slice(m.index, end + 1) };
+function markupOutsideCode(body, masked, tagRe, withLists = false) {
+  const tagStarts = [];
+  const tagFrom = [];
+  for (const m of masked.matchAll(tagRe)) {
+    tagStarts.push(m.index);
+    tagFrom.push(m.index + m[0].length);
   }
-}
-
-/** kramdown attribute lists outside code, with extents from the original text. */
-function* attributeListsOutsideCode(body, masked, extents) {
-  for (const m of masked.matchAll(IAL_START_RE)) {
-    const end = extents.brace[m.index + 2];
-    if (end !== -1) yield { start: m.index, source: body.slice(m.index, end + 1) };
-  }
-}
-
-/** Text matched by the sticky regex `re` at `offset`, or `null`. */
-function extentAt(text, offset, re) {
-  const sticky = new RegExp(re.source, re.flags.includes('y') ? re.flags : `${re.flags}y`);
-  sticky.lastIndex = offset;
-  const m = sticky.exec(text);
-  return m ? m[0] : null;
+  const listStarts = [];
+  if (withLists) for (const m of masked.matchAll(IAL_START_RE)) listStarts.push(m.index);
+  const { tagEnds, listEnds } = extentEnds(body, tagFrom, listStarts.map((start) => start + 2));
+  const closed = (starts, ends) => {
+    const out = [];
+    for (let k = 0; k < starts.length; k += 1) if (ends[k] !== -1) out.push({ start: starts[k], end: ends[k] });
+    return out;
+  };
+  return { tags: closed(tagStarts, tagEnds), lists: closed(listStarts, listEnds) };
 }
 
 
@@ -1810,6 +2020,38 @@ const FM_TRAILER_RE = /^(?:[ \t]*|[ \t]+#.*)$/;
 const FLOW_BARE_ITEM_RE = /[^,[\]{}"'#]+/y;
 const NOT_CLOSED_QUOTE = 'a double-quoted string must close on the same line';
 const NOT_CLOSED_LIST = 'a flow list must close with ] on the same line, as in tags: [a, b]';
+
+/*
+ * How Jekyll 3.10 types an unquoted (plain) YAML scalar: it reads front matter
+ * with SafeYAML 1.0.5, whose transformers run in the order below (symbols are
+ * off, as Jekyll leaves them). The patterns are the gem's own, with Ruby's
+ * `\A`/`\Z` written as `^`/`$` and its `\s` as `RUBY_SPACE`.
+ */
+/** `ToInteger` matchers, tried after `_` and `,` are removed from the value. */
+const YAML_INTEGER_RES = [
+  /^[-+]?(?:0|[1-9][0-9_,]*)$/,
+  /^0[0-7]+$/,
+  /^0x[0-9a-f]+$/i,
+  /^0b[01_]+$/,
+  /^[-+]?0x[0-9a-fA-F_]+$/,
+  /^[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+$/,
+];
+/**
+ * `ToFloat` matchers, tried on the value as written. A match whose digits
+ * Ruby's `Float()` refuses (`1__0.5`) fails the whole load instead.
+ */
+const YAML_FLOAT_RES = [
+  /^[-+]?(?:\d[\d_]*)?\.[\d_]+(?:[eE][-+]\d+)?$/,
+  /^[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\.[0-9_]*$/,
+];
+const YAML_FLOAT_WORDS = new Set(['.inf', '.Inf', '.INF', '-.inf', '-.Inf', '-.INF', '.nan', '.NaN', '.NAN']);
+const YAML_NULL_RE = /^(?:~|null)$/i;
+const YAML_BOOLEAN_RE = /^(?:yes|no|on|off|true|false)$/i;
+const YAML_DATE_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+const YAML_TIME_RE = new RegExp(
+  `^(\\d{4})-(\\d{1,2})-(\\d{1,2})(?:[Tt]|${RUBY_SPACE}+)(\\d{1,2}):(\\d{2}):(\\d{2})(?:\\.\\d*)?`
+  + `${RUBY_SPACE}*(?:Z|[-+]\\d{1,2}(?::?\\d{2})?)?$`,
+);
 
 /** Defines an own enumerable property, so a key such as `__proto__` cannot alter the prototype. */
 function setOwn(target, key, value) {
@@ -1844,8 +2086,47 @@ function readQuoted(s, start) {
 }
 
 /**
+ * True when Ruby's `Date` (which SafeYAML builds dates and times with) accepts
+ * the day: the Julian calendar before 1582-10-15 and the Gregorian one from
+ * then on, so 1582-10-05 to 1582-10-14 do not exist.
+ */
+function isRubyCivilDate(year, month, day) {
+  if (month < 1 || month > 12 || day < 1) return false;
+  if (year === 1582 && month === 10 && day >= 5 && day <= 14) return false;
+  const leap = year < 1582 ? year % 4 === 0 : (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+  return day <= [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+}
+
+/**
+ * What Jekyll's YAML loader makes of the plain scalar `value`: `null` when it
+ * stays text, otherwise `'null'`, `'a boolean'`, `'a number'`, `'a date'` or
+ * `'a time'`. A date or time Ruby cannot build stays text, as SafeYAML keeps
+ * the string when `Date.parse` fails. `value` is the scalar as YAML reads it:
+ * one line, without surrounding spaces and tabs.
+ */
+function plainScalarKind(value) {
+  const digits = value.replace(/[_,]/g, '');
+  if (YAML_INTEGER_RES.some((re) => re.test(digits))) return 'a number';
+  if (YAML_FLOAT_RES.some((re) => re.test(value)) || YAML_FLOAT_WORDS.has(value)) return 'a number';
+  if (YAML_NULL_RE.test(value)) return 'null';
+  if (YAML_BOOLEAN_RE.test(value)) return 'a boolean';
+  const date = YAML_DATE_RE.exec(value);
+  if (date) return isRubyCivilDate(Number(date[1]), Number(date[2]), Number(date[3])) ? 'a date' : null;
+  const time = YAML_TIME_RE.exec(value);
+  if (time) {
+    const [hour, minute, second] = [time[4], time[5], time[6]].map(Number);
+    const validTime = hour <= 24 && minute <= 59 && second <= 60 && (hour < 24 || (minute === 0 && second === 0));
+    return validTime && isRubyCivilDate(Number(time[1]), Number(time[2]), Number(time[3])) ? 'a time' : null;
+  }
+  return null;
+}
+
+/**
  * Reads the one-line flow list that starts at `s[0]`, such as `[a, "b c"]`.
- * Items are double-quoted strings or bare words; `[]` is the empty list.
+ * Items are double-quoted strings or bare words; `[]` is the empty list. A
+ * bare word that YAML reads as something other than text (`null`, `on`,
+ * `0123`, `2026-01-15`; see `plainScalarKind`) is an error asking for double
+ * quotes, since Jekyll would publish a different value or drop it.
  * Returns `{ value: string[], end }` or `{ error }`.
  */
 function readFlowList(s) {
@@ -1876,7 +2157,16 @@ function readFlowList(s) {
     } else {
       FLOW_BARE_ITEM_RE.lastIndex = i;
       const m = FLOW_BARE_ITEM_RE.exec(s);
-      items.push(m[0].trim());
+      // `}` is the one character the pattern excludes that no branch above
+      // handles; any such character is reported rather than dereferenced.
+      if (m === null) return { error: `unexpected ${JSON.stringify(c)} in a flow list` };
+      // YAML trims only spaces and tabs, so a no-break space stays in the tag.
+      const item = m[0].replace(/[ \t]+$/, '');
+      const kind = plainScalarKind(item);
+      if (kind !== null) {
+        return { error: `bare ${item} in a flow list is read by YAML as ${kind}, not text; write "${item}"` };
+      }
+      items.push(item);
       i += m[0].length;
     }
     skipBlanks();
@@ -1940,7 +2230,9 @@ function parseValue(key, raw) {
  * `key: value` lines with a lowercase key and one of these values:
  *   - a double-quoted string on one line (escapes `\"` and `\\` only),
  *     optionally followed by ` # comment`;
- *   - a one-line flow list `[a, "b"]` of bare or double-quoted strings;
+ *   - a one-line flow list `[a, "b"]` of bare or double-quoted strings; a
+ *     bare item that YAML reads as null, a boolean, a number, a date or a
+ *     time (`null`, `on`, `0123`, `2026-01-15`) must be double-quoted;
  *   - a plain value such as `2026-02-10`, kept as a string with any trailing
  *     ` # comment` removed (`title`, `summary` and `author` must be quoted).
  * Indentation, block lists, block scalars, anchors, aliases, YAML tags, flow
@@ -2017,10 +2309,96 @@ export function parseArticle(text) {
 /* Images                                                                    */
 /* ------------------------------------------------------------------------ */
 
-/** Text of the capture group `group` of match `m` (found in masked text), read from `body`. */
-function groupText(body, m, group) {
+/**
+ * Text of the capture group `group` of match `m` (found in masked text), read
+ * from `body`; `base` is the offset in `body` of the text `m` was found in.
+ */
+function groupText(body, m, group, base = 0) {
   const span = m.indices[group];
-  return span ? body.slice(span[0], span[1]) : undefined;
+  return span ? body.slice(base + span[0], base + span[1]) : undefined;
+}
+
+/**
+ * Spans `[start, end)` of the Liquid tags `{{ … }}` and `{% … %}` in `text`,
+ * read left to right as Liquid's tokenizer does. Once an opener of one kind
+ * finds no closer, no later opener of that kind can, so the scan is linear.
+ */
+function liquidTagSpans(text) {
+  const spans = [];
+  let output = text.indexOf('{{');
+  let tag = text.indexOf('{%');
+  while (output !== -1 || tag !== -1) {
+    const isOutput = tag === -1 || (output !== -1 && output < tag);
+    const open = isOutput ? output : tag;
+    const close = text.indexOf(isOutput ? '}}' : '%}', open + 2);
+    if (close === -1) {
+      if (isOutput) output = -1;
+      else tag = -1;
+      continue;
+    }
+    const pos = close + 2;
+    spans.push([open, pos]);
+    if (output !== -1 && output < pos) output = text.indexOf('{{', pos);
+    if (tag !== -1 && tag < pos) tag = text.indexOf('{%', pos);
+  }
+  return spans;
+}
+
+/**
+ * Spans `[start, end)` of the paragraphs of `body`: the runs of lines between
+ * blank lines. kramdown parses images inside one block's text, so an image,
+ * its title or its `[id]` never continues past a blank line (verified:
+ * `![D](` + blank line + `)` renders as two paragraphs of text). A blank line
+ * inside a Liquid tag does not separate paragraphs, as Liquid replaces the
+ * whole tag before kramdown runs.
+ */
+function paragraphSpans(body) {
+  const liquid = liquidTagSpans(body);
+  const spans = [];
+  let from = 0;
+  let k = 0;
+  for (const line of splitLines(body)) {
+    if (!RUBY_BLANK_LINE_RE.test(line.text)) continue;
+    while (k < liquid.length && liquid[k][1] <= line.start) k += 1;
+    if (k < liquid.length && liquid[k][0] < line.start) continue;
+    if (line.start > from) spans.push([from, line.start]);
+    from = line.next;
+  }
+  if (from < body.length) spans.push([from, body.length]);
+  return spans;
+}
+
+/**
+ * Offset just after the `)` that closes an inline image whose destination
+ * ends at `p` in the paragraph text `text`, or -1 when kramdown renders the
+ * construct as text. An `<…>` destination (`angle`) must be followed directly
+ * by `)`; any other may be followed by whitespace and `)`. Otherwise a title
+ * must follow: after whitespace (any amount for `<…>`, at least one character
+ * otherwise), a quote, at least one character, and the first matching quote
+ * that only whitespace separates from `)`. `closers` caches the positions of
+ * such quotes in `text`, found once per paragraph so that every lookup is a
+ * binary search and an unclosed title never rescans the paragraph.
+ */
+function inlineImageEnd(text, p, angle, closers) {
+  let q = p;
+  while (q < text.length && RUBY_SPACE_CHAR_RE.test(text[q])) q += 1;
+  if (text[q] === ')') return angle && q !== p ? -1 : q + 1;
+  const quote = text[q];
+  if ((quote !== '"' && quote !== "'") || (!angle && q === p)) return -1;
+  if (closers.byQuote === null) {
+    closers.byQuote = { '"': [], "'": [] };
+    for (const m of text.matchAll(TITLE_CLOSE_RE)) closers.byQuote[m[0]].push(m.index);
+  }
+  const list = closers.byQuote[quote];
+  let lo = 0;
+  let hi = list.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (list[mid] < q + 2) lo = mid + 1;
+    else hi = mid;
+  }
+  if (lo === list.length) return -1;
+  return text.indexOf(')', list[lo] + 1) + 1;
 }
 
 function unwrapAngle(s) {
@@ -2028,8 +2406,13 @@ function unwrapAngle(s) {
   return t.startsWith('<') && t.endsWith('>') ? t.slice(1, -1).trim() : t;
 }
 
+/**
+ * A reference label as kramdown compares it: each run of ASCII whitespace
+ * (Ruby's `\s`, so not U+00A0) becomes one space and letters are lowercased.
+ * Nothing is trimmed, so `[ pic ]` and `[pic]` are different labels.
+ */
 function normalizeLabel(s) {
-  return s.trim().replace(/\s+/g, ' ').toLowerCase();
+  return s.replace(/[ \t\n\v\f\r]+/g, ' ').toLowerCase();
 }
 
 /** Shortens a long source (a `data:` URI, say) for display in a message. */
@@ -2057,34 +2440,67 @@ function readAttributes(source) {
 /**
  * Every image in a body, outside code, ordered by position:
  * `{ offset, alt, src, html, srcset }`. Covers Markdown inline images,
- * reference images resolved against link definitions (unresolved references
- * render as text and are ignored), and raw `<img>` tags. Positions are found
- * in the masked body; alt text and sources are read from the original.
+ * reference images resolved against link definitions (the last definition of
+ * a label wins, as in kramdown; unresolved references render as text and are
+ * ignored), and raw `<img>` tags. Markdown images are matched within one
+ * paragraph (`paragraphSpans`), and an inline image is kept only when it closes
+ * as kramdown requires (`inlineImageEnd`). Positions are found in the masked
+ * body; alt text and sources are read from the original. A Markdown image with
+ * an empty or whitespace destination has `src: ''`; an `<img>` without a `src`
+ * attribute has `src: undefined`. When overlapping `<img>` tags exceed the
+ * tag-reading budget (`IMAGE_TAG_WORK_PER_CHAR`), the tags from there on go
+ * unread and one entry `{ offset, html: true, unchecked: true }` stands for
+ * them, so validation fails instead of passing images it never read.
  */
 function collectImages(body, masked) {
   const images = [];
   const inlineSpans = [];
-  for (const m of masked.matchAll(new RegExp(IMG_INLINE_RE.source, 'gd'))) {
-    images.push({ offset: m.index, alt: groupText(body, m, 1), src: unwrapAngle(groupText(body, m, 2)), html: false });
-    inlineSpans.push([m.index, m.index + m[0].length]);
-  }
-  const definitions = new Map();
-  for (const m of masked.matchAll(new RegExp(LINK_DEFINITION_RE.source, 'gmd'))) {
-    const label = normalizeLabel(groupText(body, m, 1));
-    if (!definitions.has(label)) definitions.set(label, unwrapAngle(groupText(body, m, 2)));
-  }
-  let span = 0;
-  for (const m of masked.matchAll(new RegExp(IMG_REFERENCE_RE.source, 'gd'))) {
-    while (span < inlineSpans.length && inlineSpans[span][1] <= m.index) span += 1;
-    if (span < inlineSpans.length && inlineSpans[span][0] <= m.index) continue;
-    const alt = groupText(body, m, 1);
-    const label = normalizeLabel(m[2] ? groupText(body, m, 2) : alt);
-    if (definitions.has(label)) {
-      images.push({ offset: m.index, alt, src: definitions.get(label), html: false });
+  const paragraphs = paragraphSpans(body);
+  for (const [from, to] of paragraphs) {
+    const text = masked.slice(from, to);
+    const head = new RegExp(IMG_INLINE_HEAD_RE.source, 'gd');
+    const closers = { byQuote: null };
+    let m;
+    while ((m = head.exec(text)) !== null) {
+      const angle = groupText(body, m, 2, from);
+      const end = inlineImageEnd(text, m.index + m[0].length, angle !== undefined, closers);
+      if (end === -1) {
+        // Text, as when the whole pattern fails here: look again one character on.
+        head.lastIndex = m.index + 1;
+        continue;
+      }
+      const src = angle === undefined ? groupText(body, m, 3, from).trim() : unwrapAngle(angle);
+      images.push({ offset: from + m.index, alt: groupText(body, m, 1, from), src, html: false });
+      inlineSpans.push([from + m.index, from + end]);
+      head.lastIndex = end;
     }
   }
-  for (const tag of tagsOutsideCode(body, masked, extentIndex(body), IMG_TAG_START_RE)) {
-    const attrs = readAttributes(tag.source);
+  // kramdown overwrites a duplicate definition, so the last one for a label is the one rendered.
+  const definitions = new Map();
+  for (const m of masked.matchAll(new RegExp(LINK_DEFINITION_RE.source, 'gmd'))) {
+    definitions.set(normalizeLabel(groupText(body, m, 1)), unwrapAngle(groupText(body, m, 2)));
+  }
+  let span = 0;
+  for (const [from, to] of paragraphs) {
+    for (const m of masked.slice(from, to).matchAll(new RegExp(IMG_REFERENCE_RE.source, 'gd'))) {
+      const at = from + m.index;
+      while (span < inlineSpans.length && inlineSpans[span][1] <= at) span += 1;
+      if (span < inlineSpans.length && inlineSpans[span][0] <= at) continue;
+      const alt = groupText(body, m, 1, from);
+      const label = normalizeLabel(m[2] ? groupText(body, m, 2, from) : alt);
+      if (definitions.has(label)) {
+        images.push({ offset: at, alt, src: definitions.get(label), html: false });
+      }
+    }
+  }
+  let work = IMAGE_TAG_WORK_PER_CHAR * body.length + IMAGE_TAG_WORK_BASE;
+  for (const tag of markupOutsideCode(body, masked, IMG_TAG_START_RE).tags) {
+    work -= tag.end + 1 - tag.start;
+    if (work < 0) {
+      images.push({ offset: tag.start, html: true, unchecked: true });
+      break;
+    }
+    const attrs = readAttributes(body.slice(tag.start, tag.end + 1));
     images.push({
       offset: tag.start,
       alt: attrs.get('alt'),
@@ -2099,7 +2515,11 @@ function collectImages(body, masked) {
 /**
  * Maps an image source to the public path it loads and applies the source
  * rules. `slug` is the article's slug (or `null` when the filename gave none,
- * which skips the folder rule). Returns `{ path }` or `{ error }`.
+ * which skips the folder rule). Returns `{ path }` or `{ error }`; `path` is
+ * the root-relative file path the browser requests: percent-decoded, without
+ * query or fragment, and with `.` segments removed. Backslashes and `..`
+ * segments are rejected, and the article's folder prefix must be written
+ * before any `.` segment.
  */
 function imagePublicPath(src, slug, kind) {
   const folder = kind === 'draft' ? 'drafts' : 'blog';
@@ -2125,14 +2545,20 @@ function imagePublicPath(src, slug, kind) {
     decoded = bare;
   }
   if (decoded.includes('\\')) return { error: `image path ${preview(src)} must not contain backslashes` };
-  if (decoded.split('/').includes('..')) return { error: `image path ${preview(src)} must not contain .. segments` };
+  const segments = decoded.split('/');
+  if (segments.includes('..')) return { error: `image path ${preview(src)} must not contain .. segments` };
+  // The browser drops `.` segments when it resolves the URL; a trailing one leaves a trailing slash.
+  const normalized = segments.filter((s) => s !== '.').join('/') + (segments.at(-1) === '.' ? '/' : '');
   if (slug !== null) {
     const prefix = `/assets/${folder}/${slug}/`;
-    if (!decoded.startsWith(prefix) || decoded.length === prefix.length || decoded.endsWith('/')) {
+    // The folder prefix must stand before any `.` segment (`/assets/./drafts/…` is refused):
+    // publish and unpublish rewrite it as text, and would otherwise leave the image behind.
+    if (!decoded.startsWith(prefix) || !normalized.startsWith(prefix)
+      || normalized.length === prefix.length || normalized.endsWith('/')) {
       return { error: `image ${preview(src)} must be under ${prefix}` };
     }
   }
-  return { path: decoded };
+  return { path: normalized };
 }
 
 /* ------------------------------------------------------------------------ */
@@ -2164,8 +2590,8 @@ function futureDateMessage(path, date, today) {
  *     article's own folder, `/assets/drafts/<slug>/` for a draft or
  *     `/assets/blog/<slug>/` for a post, written as
  *     `{{ '/assets/…' | relative_url }}`, `{{ site.baseurl }}/assets/…` or
- *     `/assets/…`; external, protocol-relative, `data:`, page-relative and
- *     `..` sources and `srcset` are rejected.
+ *     `/assets/…`; empty, external, protocol-relative, `data:`, page-relative
+ *     and `..` sources and `srcset` are rejected.
  *
  * @param {object} args
  * @param {string} args.path Repository-relative path, such as `_posts/2026-01-15-foo.md` or `_drafts/foo.md`.
@@ -2174,7 +2600,8 @@ function futureDateMessage(path, date, today) {
  * @param {'draft' | 'post'} args.kind Which folder rules apply.
  * @param {string} [args.todayUtc] Today as `YYYY-MM-DD` in UTC (default: the current UTC date).
  * @param {(publicPath: string) => boolean} [args.imageExists] Called with a root-relative public
- *   path such as `/assets/blog/foo/fig.png` for each image that passed the other rules; `false`
+ *   path such as `/assets/blog/foo/fig.png` (percent-decoded, without query, fragment or `.`
+ *   segments) for each image that passed the other rules; `false`
  *   reports the image as missing. Omit it to skip the existence check.
  * @param {number} [args.bodyStartLine] File line on which `body` starts (default 1). Pass
  *   `text.slice(0, text.length - body.length).split('\n').length` so body findings carry file lines.
@@ -2182,6 +2609,38 @@ function futureDateMessage(path, date, today) {
  *   `${path}:${line}: …` for body findings.
  */
 export function validateArticle({ path, data, body, kind, todayUtc, imageExists, bodyStartLine } = {}) {
+  return validateWithAnalysis({ path, data, body, kind, todayUtc, imageExists, bodyStartLine }, null);
+}
+
+/**
+ * The part of an article check that depends on nothing but the body: a line
+ * locator for its offsets, the lines carrying a leftover template placeholder
+ * outside code, and every image outside code (`collectImages`). Code regions
+ * are found once and the masked body is not kept. Because neither path, date
+ * nor tree enters it, one analysis serves every check of the same body.
+ *
+ * @param {string} body Markdown body (from `parseArticle`).
+ * @returns {{ lineAt: (offset: number) => number, todoLines: number[], images: object[] }}
+ *   `todoLines` are 1-based lines of `body` in ascending order.
+ */
+function analyzeBody(body) {
+  const masked = maskCode(body, findCodeRegions(body));
+  const todo = lineFindings(body);
+  for (const m of masked.matchAll(/TODO:/g)) todo.note(m.index);
+  return {
+    lineAt: lineLocator(body),
+    todoLines: todo.list().map((finding) => finding.line),
+    images: collectImages(body, masked),
+  };
+}
+
+/**
+ * `validateArticle` given `analysis`, the `analyzeBody` result for `body`,
+ * or `null` to compute it here. Only that analysis may come from an earlier
+ * check of the same body: the filename, schema, date, folder and existence
+ * rules always run, as they depend on `path`, `todayUtc` and `imageExists`.
+ */
+function validateWithAnalysis({ path, data, body, kind, todayUtc, imageExists, bodyStartLine }, analysis) {
   if (typeof path !== 'string' || path === '') throw new TypeError('path must be a non-empty string');
   if (kind !== 'draft' && kind !== 'post') {
     throw new TypeError(`kind must be 'draft' or 'post', got ${JSON.stringify(kind)}`);
@@ -2199,7 +2658,7 @@ export function validateArticle({ path, data, body, kind, todayUtc, imageExists,
 
   const errors = [];
   const fileError = (message) => errors.push(`${path}: ${message}`);
-  const lineAt = lineLocator(text);
+  const { lineAt, todoLines, images } = analysis ?? analyzeBody(text);
   const bodyError = (offset, message) => errors.push(`${path}:${startLine + lineAt(offset) - 1}: ${message}`);
 
   // Filename, slug and date.
@@ -2282,19 +2741,18 @@ export function validateArticle({ path, data, body, kind, todayUtc, imageExists,
       : Array.isArray(value) && value.some((item) => typeof item === 'string' && item.includes('TODO:'));
     if (marked) fileError(`${key} still contains a TODO: placeholder`);
   }
-  const masked = maskCode(text, findCodeRegions(text));
-  const todo = lineFindings(text);
-  for (const m of masked.matchAll(/TODO:/g)) todo.note(m.index);
-  for (const finding of todo.list()) {
-    errors.push(`${path}:${startLine + finding.line - 1}: body still contains a TODO: placeholder`);
+  for (const line of todoLines) {
+    errors.push(`${path}:${startLine + line - 1}: body still contains a TODO: placeholder`);
   }
 
   // Images.
-  for (const image of collectImages(text, masked)) {
+  for (const image of images) {
+    if (image.unchecked) { bodyError(image.offset, 'too many overlapping <img> tags to check; simplify the markup'); continue; }
     const at = image.offset;
     const src = image.src ?? '';
     if (image.html && image.srcset) bodyError(at, 'srcset is not supported; use a single src');
-    if (image.html && src === '') bodyError(at, '<img> has no src');
+    // kramdown renders an empty Markdown destination as `<img src="">`, which loads nothing.
+    if (src === '') bodyError(at, image.html ? '<img> has no src' : 'image has no source');
     if (typeof image.alt !== 'string' || image.alt.trim() === '') {
       bodyError(at, `image has no alt text${src === '' ? '' : ` (${preview(src)})`}`);
     }
@@ -2314,17 +2772,42 @@ export function validateArticle({ path, data, body, kind, todayUtc, imageExists,
 /* ------------------------------------------------------------------------ */
 
 /**
- * Notes event-handler attributes and `javascript:` values in one tag or
- * attribute list. The value check also looks through character references
- * (`&#106;avascript:`), which kramdown passes through and browsers decode
- * (verified with kramdown 2.4.0).
+ * Notes every event-handler attribute and `javascript:` value in `source`,
+ * text of a tag or attribute list starting at offset `start`, on the line
+ * where each one stands. The value check also looks through character
+ * references (`&#106;avascript:`), which kramdown passes through and
+ * browsers decode (verified with kramdown 2.4.0); a decoded match is noted
+ * where its text starts in the source. `eventRe` must carry the `g` flag.
  */
 function noteAttributeRisks(found, { start, source }, eventRe) {
-  const event = eventRe.exec(source);
-  if (event) found.note(start + event.index + 1);
-  const js = JS_URL_ATTR_RE.exec(source);
-  if (js) found.note(start + js.index);
-  else if (JS_URL_ATTR_RE.test(decodeEntities(source))) found.note(start);
+  for (const m of source.matchAll(eventRe)) found.note(start + m.index + 1);
+  for (const m of source.matchAll(JS_URL_ATTR_RE)) found.note(start + m.index);
+  if (!source.includes('&')) return;
+  const decoded = decodeEntitiesMapped(source);
+  for (const m of decoded.text.matchAll(JS_URL_ATTR_RE)) found.note(start + decoded.from[m.index]);
+}
+
+/**
+ * `noteAttributeRisks` for every construct in `extents` (`{ start, end }`
+ * of one kind, ordered by start), reading each character of `text` once
+ * however much the constructs overlap: `'<img '.repeat(n) + '>'` holds n
+ * tags ending at the same `>`. Taken in start order, each construct is
+ * scanned only past `covered`, the furthest end scanned so far, and skipped
+ * when it ends by then. This finds exactly what scanning each construct
+ * whole would: a skipped part lies inside a construct already scanned, and
+ * no match crosses from one scanned window into the next, because windows
+ * meet only just after a `>` or `}` or at a `<` or `{`, and no
+ * event-handler or `javascript:` match, decoded or raw, holds any of these
+ * (a character reference is made of none of them either).
+ */
+function noteExtentRisks(found, text, extents, eventRe) {
+  let covered = -1;
+  for (const { start, end } of extents) {
+    if (end <= covered) continue;
+    const from = Math.max(start, covered + 1);
+    noteAttributeRisks(found, { start: from, source: text.slice(from, end + 1) }, eventRe);
+    covered = end;
+  }
 }
 
 /**
@@ -2352,11 +2835,9 @@ export function scanUnsafeMarkup(body) {
   const masked = maskCode(text, findCodeRegions(text));
   const found = lineFindings(text);
   for (const m of masked.matchAll(UNSAFE_TAG_RE)) found.note(m.index);
-  const extents = extentIndex(text);
-  for (const tag of tagsOutsideCode(text, masked, extents)) noteAttributeRisks(found, tag, TAG_EVENT_ATTR_RE);
-  for (const list of attributeListsOutsideCode(text, masked, extents)) {
-    noteAttributeRisks(found, list, IAL_EVENT_ATTR_RE);
-  }
+  const { tags, lists } = markupOutsideCode(text, masked, TAG_START_RE, true);
+  noteExtentRisks(found, text, tags, TAG_EVENT_ATTR_RE);
+  noteExtentRisks(found, text, lists, IAL_EVENT_ATTR_RE);
   for (const m of masked.matchAll(JS_URL_MARKDOWN_RE)) found.note(m.index);
   return found.list();
 }
@@ -2386,11 +2867,142 @@ function rawRegions(text) {
 }
 
 /**
+ * Pairs the backtick runs of one paragraph, `text` from `from` to `to`, as
+ * kramdown's `parse_codespan` does when no other span parser takes them, and
+ * appends each span to `out` as `{ start, end }`. `at` and `len` hold the
+ * paragraph's runs (offset and length, ascending). A run of n backticks opens
+ * a span that ends n backticks into the first later run at least n long,
+ * whose remaining backticks open the next span; a single backtick at the
+ * start or after whitespace and before whitespace is literal; and after an
+ * odd number of backslashes a run loses its first backtick to the escape.
+ * Linear in the paragraph's runs: a suffix maximum of their lengths rejects
+ * a search that cannot succeed at once, and a search that succeeds visits
+ * only the runs inside its span.
+ */
+function pairBackticks(text, from, to, at, len, out) {
+  const longest = new Array(at.length + 1).fill(0);
+  for (let k = at.length - 1; k >= 0; k -= 1) longest[k] = Math.max(len[k], longest[k + 1]);
+  let carry = -1;
+  let carried = 0;
+  for (let k = 0; k < at.length;) {
+    let start = at[k];
+    let size = len[k];
+    if (carry !== -1) {
+      // Backticks left over from the run that closed the previous span.
+      start = carry;
+      size = carried;
+      carry = -1;
+    } else {
+      let slashes = 0;
+      while (start - slashes - 1 >= from && text[start - slashes - 1] === '\\') slashes += 1;
+      if (slashes % 2 === 1) {
+        start += 1;
+        size -= 1;
+      }
+      const lone = size === 1 && (start === from || isRubySpace(text[start - 1]))
+        && start + 1 < to && isRubySpace(text[start + 1]);
+      if (size === 0 || lone) {
+        k += 1;
+        continue;
+      }
+    }
+    if (longest[k + 1] < size) {
+      k += 1;
+      continue;
+    }
+    let j = k + 1;
+    while (len[j] < size) j += 1;
+    out.push({ start, end: at[j] + size });
+    if (len[j] > size) {
+      carry = at[j] + size;
+      carried = len[j] - size;
+      k = j;
+    } else {
+      k = j + 1;
+    }
+  }
+}
+
+/**
+ * Inline code spans kramdown could read in `masked`, a body whose certain
+ * code regions `maskCode` has blanked, as sorted `{ start, end }` offsets:
+ * the backtick pairs of every paragraph (run of non-blank lines), across
+ * line breaks included (`pairBackticks`). The backtick runs are listed in
+ * one pass over the body and each paragraph is handed only its own, so the
+ * work stays linear however many paragraphs the body has.
+ */
+function possibleCodeSpans(masked) {
+  const spans = [];
+  const at = [];
+  const len = [];
+  for (const m of masked.matchAll(/`+/g)) {
+    at.push(m.index);
+    len.push(m[0].length);
+  }
+  if (at.length === 0) return spans;
+  const lines = splitLines(masked);
+  const blank = (j) => BLANK_LINE_RE.test(stripCr(lines[j].text));
+  let r = 0;
+  for (let s = 0; s < lines.length && r < at.length; s += 1) {
+    if (blank(s)) continue;
+    let e = s;
+    while (e + 1 < lines.length && !blank(e + 1)) e += 1;
+    const from = lines[s].start;
+    const to = lines[e].end;
+    // A run never holds a line break, so it lies within one paragraph.
+    while (r < at.length && at[r] < from) r += 1;
+    let q = r;
+    while (q < at.length && at[q] < to) q += 1;
+    if (q > r) pairBackticks(masked, from, to, at.slice(r, q), len.slice(r, q), spans);
+    r = q;
+    s = e;
+  }
+  return spans;
+}
+
+/**
+ * The union of two lists of `{ start, end }` regions, each sorted by start
+ * and disjoint, as sorted, disjoint regions (overlapping or touching ones
+ * joined).
+ */
+function mergeRegions(a, b) {
+  const out = [];
+  let i = 0;
+  let j = 0;
+  while (i < a.length || j < b.length) {
+    const r = j >= b.length || (i < a.length && a[i].start <= b[j].start) ? a[i++] : b[j++];
+    const last = out[out.length - 1];
+    if (last !== undefined && r.start <= last.end) last.end = Math.max(last.end, r.end);
+    else out.push({ start: r.start, end: r.end });
+  }
+  return out;
+}
+
+/**
+ * Code regions for the Liquid-in-code warning only, as sorted, disjoint
+ * `{ start, end }` offsets: the certain regions of `findCodeRegions` and
+ * every inline span kramdown could read in the rest of the body
+ * (`possibleCodeSpans`). kramdown pairs backticks across line breaks within
+ * a paragraph, and the marker runs of a fence inside a blockquote or an
+ * indented one pair the same way; the safety mask leaves all of these to
+ * prose, while Liquid evaluates them first all the same. Warnings may
+ * therefore over-report. This never changes the mask that
+ * `scanUnsafeMarkup` and `validateArticle` use.
+ */
+function possibleCodeRegions(text) {
+  const certain = findCodeRegions(text);
+  return mergeRegions(certain, possibleCodeSpans(maskCode(text, certain)));
+}
+
+/**
  * Finds Liquid syntax (`{{` or `{%`) inside fenced or inline code that no
  * `{% raw %}…{% endraw %}` region protects. Jekyll runs Liquid before
  * Markdown, so such text is evaluated instead of shown and can break the
  * build. `raw` and `endraw` tags themselves are not reported. Callers treat
- * the findings as warnings.
+ * the findings as warnings. Code here includes what kramdown may read as
+ * code but the unsafe-markup scan's conservative mask does not, such as an
+ * inline span across a line break (see `possibleCodeRegions`), so a warning
+ * may be raised for text that renders as prose.
  *
  * @param {string} body Markdown body (from `parseArticle`).
  * @returns {Array<{ line: number, text: string }>} One finding per line, ordered by line;
@@ -2400,11 +3012,17 @@ export function findUnrawLiquidInCode(body) {
   const text = asText(body, 'body');
   const raw = rawRegions(text);
   const found = lineFindings(text);
-  for (const region of findCodeRegions(text)) {
+  // Code regions and the matches in each come in ascending order, and raw
+  // regions are ordered and disjoint, so one cursor finds the raw region
+  // that could hold each match.
+  let next = 0;
+  for (const region of possibleCodeRegions(text)) {
     for (const m of text.slice(region.start, region.end).matchAll(LIQUID_IN_CODE_RE)) {
       const at = region.start + m.index;
-      if (raw.some((r) => at >= r.start && at < r.end)) continue;
-      if (extentAt(text, at, RAW_TAG_AT_RE) !== null) continue;
+      while (next < raw.length && raw[next].end <= at) next += 1;
+      if (next < raw.length && raw[next].start <= at) continue;
+      RAW_TAG_AT_RE.lastIndex = at;
+      if (RAW_TAG_AT_RE.test(text)) continue;
       found.note(at);
     }
   }
@@ -2472,6 +3090,30 @@ function normalizePath(p) {
   return p.replace(/^(?:\.\/)+/, '');
 }
 
+/** Every entry `analyzeArticle` made; a cache value from anywhere else is never reused. */
+const ARTICLE_ANALYSES = new WeakSet();
+
+/**
+ * Everything `checkTrackedContent` derives from an article's text alone: the
+ * parse, the file line on which the body starts, the `analyzeBody` result
+ * and the `scanUnsafeMarkup` findings. `text` is kept so that a cached entry
+ * is reused only for identical text.
+ */
+function analyzeArticle(text) {
+  const { data, body, errors } = parseArticle(text);
+  const entry = {
+    text,
+    data,
+    body,
+    parseErrors: errors,
+    bodyStartLine: text.slice(0, text.length - body.length).split('\n').length,
+    bodyAnalysis: analyzeBody(body),
+    unsafe: scanUnsafeMarkup(body),
+  };
+  ARTICLE_ANALYSES.add(entry);
+  return entry;
+}
+
 /**
  * Applies the rules for content that may sit in the public repository to a
  * complete tree (the staged index for `guard --staged`, each pushed commit
@@ -2491,19 +3133,31 @@ function normalizePath(p) {
  *
  * Each given article is then parsed, validated as a post with its images
  * checked against `paths`, and scanned for unsafe markup, with every finding
- * on its file line.
+ * on its file line. What depends on an article's text alone (its parse, code
+ * regions, placeholder lines, images and unsafe-markup findings) is stored in
+ * `cache` under the article's `id`, so a caller checking the same blob in
+ * several trees, as `guard --pre-push` does across commits, parses it once.
+ * An entry is reused only for identical text, and the filename, date, folder
+ * and image-existence rules run for every article on every call.
  *
  * @param {object} args
  * @param {string[]} args.paths The complete tree as repository-relative POSIX paths
  *   (a leading `./` is removed; empty strings are ignored).
- * @param {Array<{ path: string, text: string }>} [args.articles] Articles to validate,
- *   typically those added or changed (default `[]`).
+ * @param {Array<{ path: string, text: string, id?: string }>} [args.articles] Articles to
+ *   validate, typically those added or changed (default `[]`). `id`, such as the git blob id,
+ *   names the text in `cache`; it must be a non-empty string when given, and an article
+ *   without one is analysed afresh.
+ * @param {Map<string, object>} [args.cache] Text analyses by `id`, owned by the caller and
+ *   passed to every call that should share them (default: a new `Map` for this call). Its
+ *   values are opaque; any not made here is replaced. Anything other than a `Map` is a `TypeError`.
  * @param {string} [args.todayUtc] Today as `YYYY-MM-DD` in UTC (default: the current UTC date).
  * @returns {string[]} Errors, each starting with its path; path rules first, then the
  *   articles in input order. Identical messages are reported once.
  */
-export function checkTrackedContent({ paths, articles, todayUtc } = {}) {
+export function checkTrackedContent({ paths, articles, todayUtc, cache } = {}) {
   const today = resolveToday(todayUtc);
+  if (cache !== undefined && cache !== null && !(cache instanceof Map)) throw new TypeError('cache must be a Map');
+  const analyses = cache ?? new Map();
   const tree = [];
   const pathSet = new Set();
   for (const p of paths ?? []) {
@@ -2576,11 +3230,23 @@ export function checkTrackedContent({ paths, articles, todayUtc } = {}) {
     }
     const path = normalizePath(article.path);
     const text = asText(article.text, `text of ${path}`);
-    const { data, body, errors: parseErrors } = parseArticle(text);
+    const id = article.id ?? null;
+    if (id !== null && (typeof id !== 'string' || id === '')) {
+      throw new TypeError(`id of ${path} must be a non-empty string`);
+    }
+    let entry = id === null ? undefined : analyses.get(id);
+    if (!ARTICLE_ANALYSES.has(entry) || entry.text !== text) {
+      entry = analyzeArticle(text);
+      if (id !== null) analyses.set(id, entry);
+    }
+    const { data, body, parseErrors, bodyStartLine, bodyAnalysis, unsafe } = entry;
     for (const e of parseErrors) errors.push(`${path}: ${e}`);
-    const bodyStartLine = text.slice(0, text.length - body.length).split('\n').length;
-    errors.push(...validateArticle({ path, data, body, kind: 'post', todayUtc: today, imageExists, bodyStartLine }));
-    for (const finding of scanUnsafeMarkup(body)) {
+    const articleErrors = validateWithAnalysis(
+      { path, data, body, kind: 'post', todayUtc: today, imageExists, bodyStartLine },
+      bodyAnalysis,
+    );
+    for (const e of articleErrors) errors.push(e);
+    for (const finding of unsafe) {
       errors.push(`${path}:${bodyStartLine + finding.line - 1}: unsafe markup: ${finding.text}`);
     }
   }

@@ -34,7 +34,9 @@ search: true
 
   Every printed front-matter value passes through escape, and every internal URL through
   relative_url, so the page works on the custom domain and under a project path alike.
-  The blog policy forbids inline script, inline style and event-handler attributes: add none.
+  The blog policy blocks inline scripts, inline event-handler attributes and javascript: URLs.
+  It permits inline styles only because kramdown writes table-alignment style attributes into
+  articles. By convention this listing adds no inline script, event handler or inline style.
   Keep braces out of this comment, because Liquid would read them as markup.
 {%- endcomment -%}
 <section class="section blog-index">

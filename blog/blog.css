@@ -10,9 +10,11 @@
 .post-meta, .post-card .post-meta { color: var(--muted); font-size: .92rem; margin-block-end: 10px; }
 .post-summary { color: var(--muted); margin-block-end: 14px; }
 .tag-list { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px; }
+/* A long unbroken tag shrinks to the column and wraps inside its pill. 1.2em rounds one line fully, like 999px, and keeps wrapped lines inside the tint. */
+.tag-list > li { min-inline-size: 0; max-inline-size: 100%; }
 /* --sea-ink on this 12% mix measures about 4.53:1. A darker mix drops below 4.5:1, so hover changes decoration only. */
 .tag-link {
-  display: inline-block; padding: 3px 12px; border-radius: 999px;
+  display: inline-block; padding: 3px 12px; border-radius: 1.2em; max-inline-size: 100%; overflow-wrap: anywhere;
   font-size: .82rem; font-weight: 600;
   background: color-mix(in srgb, var(--sea) 12%, var(--surface)); color: var(--sea-ink);
 }
@@ -91,9 +93,11 @@
 /* ---------- Hover, on devices that can hover ---------- */
 @media (hover: hover) {
   .post-card h2 a:hover { color: var(--sea-ink); }
-  .tag-link:hover { text-decoration: underline; }
+  .post-back a:hover, .tag-link:hover { text-decoration: underline; }
   .prose a:hover { text-decoration-thickness: 2px; }
 }
+/* Pressed links, touch included: decoration only, so colours and contrast hold. */
+.post-back a:active, .post-card h2 a:active, .tag-link:active, .prose a:active { text-decoration: underline; text-decoration-thickness: 2px; }
 
 @media (max-width: 720px) {
   .post-card { padding: 24px 20px; }

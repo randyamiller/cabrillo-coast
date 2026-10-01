@@ -34,9 +34,9 @@
   <meta name="description" content="{{ page_description | escape }}">
   <meta name="theme-color" content="#0d3b4f">
   <link rel="canonical" href="{{ page.url | absolute_url }}">
+  <meta property="og:url" content="{{ page.url | absolute_url }}">
 
   <meta property="og:type" content="{% if page.collection == 'posts' %}article{% else %}website{% endif %}">
-  <meta property="og:url" content="{{ page.url | absolute_url }}">
   <meta property="og:title" content="{{ page.title | default: site.title | escape }}">
   <meta property="og:description" content="{{ page_description | escape }}">
   <meta property="og:site_name" content="Cabrillo Coast LLC">

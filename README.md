@@ -120,8 +120,9 @@ Do the [one-time setup](#one-time-setup) first, including
    and run the [preview](#preview). The draft is at
    `http://localhost:4000/blog/<slug>/`.
 3. **Check.** `node scripts/article.mjs check _drafts/<slug>.md` reports schema
-   errors, leftover `TODO:` markers, unsafe markup, missing, external or `data:`
-   images, and Liquid in code that is not wrapped in `{% raw %}`.
+   errors, placeholder markers left over from the article template, unsafe markup,
+   missing, external or `data:` images, and Liquid in code that is not wrapped in
+   `{% raw %}`.
 4. **Publish.** `node scripts/article.mjs publish <slug>` re-runs the check, moves the
    draft to `_posts/<UTC date>-<slug>.md`, moves its images to `assets/blog/<slug>/`
    and rewrites their paths. An empty image folder is deleted instead, so an article
@@ -181,9 +182,10 @@ tags: [kubernetes, platform-engineering]
 | date | From the filename prefix (`YYYY-MM-DD`), read as UTC; set by `publish`; never in the future |
 | `title` | Double-quoted; 1–100 characters |
 | `summary` | Double-quoted; 1–200 characters |
-| `tags` | Flow list `[a, b]`; 1–5 lowercase kebab-case items |
+| `tags` | Flow list `[a, b]`; 1–5 lowercase kebab-case items; double-quote an item YAML would read as a number, date, boolean or null, such as `["2026", "null", "on"]` |
 | `updated` | Optional `YYYY-MM-DD`; not before the date |
 | `author` | Optional; double-quoted; defaults to "Randy Miller" |
+| body | Required; the Markdown after the closing `---` (article content, not a front-matter key); must not be empty; rendered by kramdown (GFM input) with Rouge highlighting |
 
 Any other key is rejected, including `layout`, `permalink`, `published`, `date` and
 `categories`: the layout, URL and date come from `_config.yml` and the filename.

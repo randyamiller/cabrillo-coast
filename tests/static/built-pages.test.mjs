@@ -25,7 +25,10 @@
  *     absent from the output, `CNAME` follows the deployment mode and the
  *     home page passes through byte for byte.
  *   - AC-02 [F-017] drafts, draft images and future-dated posts never reach a
- *     normal build; the preview build renders the draft and its image.
+ *     normal build: no output path names either synthetic slug, and no page,
+ *     `search.json` or other text file holds a slug, a marker or an
+ *     `assets/drafts/` path. The preview build renders the draft and its
+ *     image, and its paths and text hold no trace of the future-dated post.
  *   - AC-05 [F-018] the escaping fixture's title is escaped everywhere it is
  *     printed, `{% raw %}` survives, Rouge highlighting and tables render.
  *   - AC-17 [F-018] the zero-article listing and an empty search index.
@@ -122,12 +125,20 @@ const FORBIDDEN_OUTPUTS = Object.freeze([
 ]);
 
 /**
- * Extensions of output files whose text is searched for the private markers.
- * Beyond the HTML, JSON, CSS, JS, XML and plain-text files Jekyll emits, raw
- * Markdown, SVG and YAML are included, because a draft copied verbatim
- * instead of rendered would arrive as one of those.
+ * Extensions of output files whose text is searched for the private slugs,
+ * markers and draft-image paths. Beyond the HTML, JSON, CSS, JS, XML and
+ * plain-text files Jekyll emits, raw Markdown, SVG and YAML are included,
+ * because a draft copied verbatim instead of rendered would arrive as one of
+ * those.
  */
 const TEXT_EXTENSIONS = new Set(['.html', '.json', '.css', '.js', '.xml', '.txt', '.md', '.svg', '.yml', '.yaml']);
+
+/**
+ * Path prefix of every draft image (`assets/drafts/<slug>/…`), the AC-02
+ * draft-image reference: no text file of a normal build may hold it, since a
+ * page or index entry that names a draft image leaks the draft it belongs to.
+ */
+const DRAFT_IMAGE_PREFIX = 'assets/drafts/';
 
 /** The launch-state text of the listing (AAP 0.5.4). */
 const EMPTY_LISTING_TEXT = 'No articles have been published yet.';
@@ -493,7 +504,7 @@ function definePageContractTests() {
     const pages = siteBlogPages();
     t.diagnostic(`${pages.length} blog page(s) under ${SITE_DIR}: ${pages.map((p) => p.rel).join(', ')}`);
     for (const page of pages) {
-      await t.test(`${page.rel} (${page.urlPath})`, (st) => {
+      await t.test(`[AC-06][F-018] ${page.rel} (${page.urlPath})`, (st) => {
         const html = readFileSync(page.file, 'utf8');
         assert.ok(html.startsWith('<!DOCTYPE html>'), 'page must start with <!DOCTYPE html>');
         const root = tags(html).find((tag) => tag.name === 'html');
@@ -573,7 +584,7 @@ function defineLinkAndOutputTests() {
 
   test('[AC-07][F-018] canonical and og:url name the page on the deployment host', async (t) => {
     for (const page of siteBlogPages()) {
-      await t.test(page.rel, () => {
+      await t.test(`[AC-07][F-018] ${page.rel}`, () => {
         const html = readFileSync(page.file, 'utf8');
         const expected = `${SITE_URL}${page.urlPath}`;
         const canonical = tags(html).filter(
@@ -631,19 +642,22 @@ function assertSyntheticSource() {
 }
 
 /**
- * No path under `dir` names one of `slugs`, and no text file holds one of `markers`.
+ * No path under `dir` names one of `slugs`, and no text file under it (every
+ * page, `search.json` and the other `TEXT_EXTENSIONS` files) holds one of
+ * `slugs` or `texts`: slugs are excluded from file text as well as paths.
  * @param {string} dir
- * @param {string[]} slugs
- * @param {string[]} markers
+ * @param {string[]} slugs matched against output paths and file text
+ * @param {string[]} texts matched against file text only: markers, draft-image paths
  */
-function assertAbsent(dir, slugs, markers) {
+function assertAbsent(dir, slugs, texts) {
   const paths = walk(dir).filter((rel) => slugs.some((slug) => rel.includes(slug)));
   assert.deepEqual(paths, [], `${dir} must not contain ${slugs.join(' or ')}`);
+  const needles = [...slugs, ...texts];
   const leaks = textFiles(dir).flatMap((rel) => {
     const text = readSiteFile(dir, rel);
-    return markers.filter((marker) => text.includes(marker)).map((marker) => `${rel}: ${marker}`);
+    return needles.filter((needle) => text.includes(needle)).map((needle) => `${rel}: ${needle}`);
   });
-  assert.deepEqual(leaks, [], `private markers found under ${dir}`);
+  assert.deepEqual(leaks, [], `private slugs, markers or draft-image paths found in the text under ${dir}`);
 }
 
 function definePrivacyTests() {
@@ -655,7 +669,7 @@ function definePrivacyTests() {
 
   test('[AC-02][F-017] the project build holds no draft, draft image or future-dated post', FIXTURE_ONLY, () => {
     assertSyntheticSource();
-    assertAbsent(SITE_DIR, [DRAFT_SLUG, FUTURE_SLUG], [DRAFT_MARKER, FUTURE_MARKER]);
+    assertAbsent(SITE_DIR, [DRAFT_SLUG, FUTURE_SLUG], [DRAFT_MARKER, FUTURE_MARKER, DRAFT_IMAGE_PREFIX]);
   });
 
   test('[AC-02][F-017] the preview build renders the draft and its image but no future-dated post', FIXTURE_ONLY, () => {
