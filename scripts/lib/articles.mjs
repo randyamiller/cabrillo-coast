@@ -17,6 +17,14 @@
  *   - posts:     `_posts/YYYY-MM-DD-<slug>.md`, images in `assets/blog/<slug>/`
  *   - fixtures:  `tests/fixtures/posts/YYYY-MM-DD-<slug>.md` (validated as posts)
  *
+ * The root `_posts/` and `tests/fixtures/posts/` are the only article folders.
+ * No tracked path may sit in a `_drafts/` folder at any depth, in a `_posts/`
+ * folder below the root, or in a folder inside `_posts/` whose name starts
+ * with `_`, `.`, `#` or `~`. Jekyll reads `<dir>/_drafts/` as drafts and
+ * `<dir>/_posts/` as posts in every folder it builds, which the article
+ * checks would not cover, and skips the last kind of folder, so its files
+ * stay off the site while GitHub shows them (see `folderRefusal`).
+ *
  * Front matter accepts `title`, `summary`, `tags`, `updated` and `author` only,
  * written in a restricted YAML subset that `parseArticle` reads without a
  * library.
@@ -89,6 +97,12 @@ const POST_FILENAME_RE = /^(\d{4}-\d{2}-\d{2})-(.+)\.md$/;
 const DRAFT_FILENAME_RE = /^(.+)\.md$/;
 const POST_PATH_RE = /^_posts\/(?:[^/]+\/)*(\d{4}-\d{2}-\d{2})-([^/]+)\.md$/;
 const DATED_BASENAME_RE = /^(\d{4}-\d{2}-\d{2})-/;
+/** A path inside a `_drafts` folder at any depth (whole folder names only). */
+const DRAFTS_FOLDER_RE = /(?:^|\/)_drafts\//;
+/** A path inside a `_posts` folder below the repository root (whole folder names only). */
+const NESTED_POSTS_FOLDER_RE = /\/_posts\//;
+/** A folder name Jekyll's entry filter skips: one starting with `_`, `.`, `#` or `~`. */
+const SKIPPED_FOLDER_RE = /^[_.#~]/;
 
 /** kramdown 2.4.0 `HTML_SPAN_ELEMENTS`: a line starting with one of these is paragraph text. */
 const HTML_SPAN_ELEMENTS = new Set([
@@ -4093,6 +4107,41 @@ function normalizePath(p) {
   return p.replace(/^(?:\.\/)+/, '');
 }
 
+/**
+ * The folder refusal for one tracked path, or null. Each folder below keeps
+ * a file from the site, or puts it there unchecked, while GitHub shows it:
+ *   - a `_drafts/` folder at any depth, or `assets/drafts/` (rule 1 of
+ *     `checkTrackedContent`). Jekyll reads `<dir>/_drafts/` in every folder it
+ *     builds when run with `--drafts`;
+ *   - a `_posts/` folder below the root. Jekyll reads `<dir>/_posts/` in every
+ *     folder it builds as posts, but `ARTICLE_PATH_RE` and the article checks
+ *     cover only the root one;
+ *   - a folder inside the root `_posts/` whose name starts with `_`, `.`, `#`
+ *     or `~`. Jekyll 3.10.0 skips such a folder directly below `_posts/`, so
+ *     its posts never reach the site. It reads deeper ones, so refusing them
+ *     at every depth is stricter than Jekyll on purpose: a misjudgement here
+ *     can only produce a false finding, which the author fixes by renaming
+ *     the folder, never a missed one.
+ * Folder names are matched whole: `notes/my_drafts/` and `_posts/sub/` pass.
+ */
+function folderRefusal(p) {
+  if (DRAFTS_FOLDER_RE.test(p) || p.startsWith('assets/drafts/')) {
+    return `${p}: drafts and draft images must never be tracked (git rm --cached; they belong only in your working copy)`;
+  }
+  if (NESTED_POSTS_FOLDER_RE.test(p)) {
+    return `${p}: articles belong only in the root _posts/ folder; Jekyll can read a nested _posts/ folder `
+      + 'as posts, but the article checks cover only the root one';
+  }
+  if (p.startsWith('_posts/')) {
+    const skipped = p.split('/').slice(1, -1).find((name) => SKIPPED_FOLDER_RE.test(name));
+    if (skipped !== undefined) {
+      return `${p}: folder ${skipped}/ is not allowed in _posts/; Jekyll can skip folders whose names start `
+        + 'with _, ., # or ~, so a post in one could stay off the site while public on GitHub';
+    }
+  }
+  return null;
+}
+
 /** Every entry `analyzeArticle` made; a cache value from anywhere else is never reused. */
 const ARTICLE_ANALYSES = new WeakSet();
 
@@ -4121,7 +4170,8 @@ function analyzeArticle(text) {
  * Applies the rules for content that may sit in the public repository to a
  * complete tree (the staged index for `guard --staged`, each pushed commit
  * for `guard --pre-push`, the working tree for the AC-01 test):
- *   1. nothing under `_drafts/` or `assets/drafts/` is tracked;
+ *   1. nothing in a `_drafts/` folder at any depth (`blog/_drafts/` and
+ *      `_posts/_drafts/` included) or under `assets/drafts/` is tracked;
  *   2. no article has a `published:` key (through `validateArticle`);
  *   3. no article path (`ARTICLE_PATH_RE`) carries a date after `todayUtc`;
  *   4. every `assets/blog/<slug>/` folder has a matching
@@ -4129,10 +4179,20 @@ function analyzeArticle(text) {
  *      `assets/blog/`. Because `paths` is the whole tree, a deletion of a
  *      post whose image folder remains is caught.
  * Each rule keeps material from being hidden from the site while staying
- * world-readable on GitHub. For the same reason every file in `_posts/` must
- * be a correctly named Markdown article (Jekyll silently skips a misnamed
- * post), and two posts may not share a slug (they would publish to the same
- * URL and one would vanish).
+ * world-readable on GitHub. For the same reason:
+ *   - nothing is tracked in a `_posts/` folder below the root, such as
+ *     `blog/_posts/`: Jekyll can publish it as posts, but rules 2 and 3 and the
+ *     article checks cover only the root `_posts/` and `tests/fixtures/posts/`;
+ *   - no folder inside `_posts/` has a name starting with `_`, `.`, `#` or `~`,
+ *     such as `_posts/_hold/`: Jekyll skips it, so its posts stay off the site
+ *     (deeper ones, which Jekyll reads, are refused too; see `folderRefusal`);
+ *   - every file in `_posts/` must be a correctly named Markdown article
+ *     (Jekyll silently skips a misnamed post);
+ *   - two posts may not share a slug (they would publish to the same URL and
+ *     one would vanish).
+ * A path refused by rule 1 or either folder rule gets one such refusal and
+ * is not counted as a post: it is never a duplicate slug and never the post
+ * of an `assets/blog/<slug>/` folder.
  *
  * Each given article is then parsed, validated as a post with its images
  * checked against `paths`, and scanned for unsafe markup, with every finding
@@ -4173,14 +4233,19 @@ export function checkTrackedContent({ paths, articles, todayUtc, cache } = {}) {
   }
   const errors = [];
 
-  // Rule 1: drafts and draft images.
+  // Rule 1 and the folder rules (`folderRefusal`): drafts and draft images,
+  // nested _posts/ folders and skipped folders in _posts/, at most one per path.
+  const misplaced = new Set();
   for (const p of tree) {
-    if (p.startsWith('_drafts/') || p.startsWith('assets/drafts/')) {
-      errors.push(`${p}: drafts and draft images must never be tracked (git rm --cached; they belong only in your working copy)`);
-    }
+    const refusal = folderRefusal(p);
+    if (refusal === null) continue;
+    misplaced.add(p);
+    errors.push(refusal);
   }
 
   // Files in _posts/: Markdown articles only, correctly named, one per slug.
+  // A path refused above is not counted as a post, so it neither collides
+  // with another post nor stands as an image folder's post.
   const postsBySlug = new Map();
   for (const p of tree) {
     if (!p.startsWith('_posts/')) continue;
@@ -4194,6 +4259,7 @@ export function checkTrackedContent({ paths, articles, todayUtc, cache } = {}) {
       continue;
     }
     const slug = m[2];
+    if (misplaced.has(p)) continue;
     if (postsBySlug.has(slug)) {
       errors.push(`${p}: slug ${slug} is already used by ${postsBySlug.get(slug)}; both would publish to /blog/${slug}/`);
     } else {

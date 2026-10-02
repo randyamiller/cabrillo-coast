@@ -2509,6 +2509,42 @@ test('[AC-03][F-017] guard --staged refuses every tracked-content and article ru
         git(repo, 'rm', '-q', postRel);
       },
     },
+    {
+      name: 'a future-dated post in a nested _posts/ folder',
+      offender: `blog/${futureRel}`,
+      message: new RegExp(`^error: ${escapeRegExp(`blog/${futureRel}`)}: articles belong only in the root _posts/ folder; `, 'm'),
+      setup(repo) {
+        write(repo, `blog/${futureRel}`, validArticle());
+        git(repo, 'add', `blog/${futureRel}`);
+      },
+    },
+    {
+      name: 'a past-dated post with a published: key in a nested _posts/ folder',
+      offender: `blog/_posts/${PAST}-pub.md`,
+      message: new RegExp(`^error: ${escapeRegExp(`blog/_posts/${PAST}-pub.md`)}: articles belong only in the root _posts/ folder; `, 'm'),
+      setup(repo) {
+        write(repo, `blog/_posts/${PAST}-pub.md`, validArticle({ extra: 'published: false' }));
+        git(repo, 'add', `blog/_posts/${PAST}-pub.md`);
+      },
+    },
+    {
+      name: 'a draft in a nested _drafts/ folder added with git add -f',
+      offender: 'blog/_drafts/x.md',
+      message: /^error: blog\/_drafts\/x\.md: drafts and draft images must never be tracked /m,
+      setup(repo) {
+        write(repo, 'blog/_drafts/x.md', validArticle());
+        git(repo, 'add', '-f', 'blog/_drafts/x.md');
+      },
+    },
+    {
+      name: 'a valid, past-dated post in a folder Jekyll skips, _posts/_hold/',
+      offender: `_posts/_hold/${PAST}-held.md`,
+      message: new RegExp(`^error: ${escapeRegExp(`_posts/_hold/${PAST}-held.md`)}: folder _hold/ is not allowed in _posts/; `, 'm'),
+      setup(repo) {
+        write(repo, `_posts/_hold/${PAST}-held.md`, validArticle());
+        git(repo, 'add', `_posts/_hold/${PAST}-held.md`);
+      },
+    },
   ];
   for (const { name, offender, message, setup } of cases) {
     await t.test(`[AC-03][F-017] guard --staged refuses ${name}`, GIT_CASE, () => {
@@ -2698,6 +2734,39 @@ test('[AC-03][F-017] guard --pre-push refuses a range in which one commit adds a
   const result = prePushUnchanged({ repo, remote }, 'refs/heads/main', 'refs/heads/main', remoteSha);
   expectExit(result, 1);
   assert.match(result.stderr, /_drafts\/leak\.md/);
+});
+
+test('[AC-03][F-017] guard --pre-push refuses a range in which one commit adds a nested blog/_drafts/ draft and a later one deletes it', GIT_CASE, () => {
+  const { repo, remote } = makeRemoteRepo();
+  const remoteSha = git(repo, 'rev-parse', 'HEAD');
+  write(repo, 'blog/_drafts/leak.md', validArticle({ title: 'Not for publication yet' }));
+  git(repo, 'add', '-f', 'blog/_drafts/leak.md');
+  commit(repo, 'Add a nested draft by mistake');
+  const leakCommit = git(repo, 'rev-parse', 'HEAD').slice(0, 7);
+  git(repo, 'rm', '-q', 'blog/_drafts/leak.md');
+  commit(repo, 'Remove the nested draft again');
+  assert.equal(git(repo, 'ls-tree', '-r', '--name-only', 'HEAD').includes('_drafts/'), false,
+    'the tip itself holds no draft, so only a check of every commit catches it');
+
+  const result = prePushUnchanged({ repo, remote }, 'refs/heads/main', 'refs/heads/main', remoteSha);
+  expectExit(result, 1);
+  assert.match(result.stderr, new RegExp(`^error: ${leakCommit}: blog/_drafts/leak\\.md: drafts and draft images `
+    + 'must never be tracked ', 'm'));
+  assert.match(result.stderr, /guard: push refused \(1 problem in 1 commit\)/);
+});
+
+test('[AC-03][F-017] guard --pre-push refuses a pushed commit holding a future-dated post in a nested blog/_posts/ folder', GIT_CASE, () => {
+  const { repo, remote } = makeRemoteRepo();
+  const remoteSha = git(repo, 'rev-parse', 'HEAD');
+  const nestedRel = `blog/_posts/${addDaysUtc(2)}-later.md`;
+  write(repo, nestedRel, validArticle());
+  git(repo, 'add', nestedRel);
+  commit(repo, 'Add a post in a nested _posts/ folder');
+
+  const result = prePushUnchanged({ repo, remote }, 'refs/heads/main', 'refs/heads/main', remoteSha);
+  expectExit(result, 1);
+  assert.match(result.stderr, new RegExp(`^error: [0-9a-f]{7}: ${escapeRegExp(nestedRel)}: articles belong only in `
+    + 'the root _posts/ folder; ', 'm'));
 });
 
 test('[AC-03][F-017] guard --pre-push refuses a commit that deletes a post but leaves its image folder', GIT_CASE, async (t) => {
@@ -3214,4 +3283,3 @@ test('[AC-03][F-017] guard --pre-push refuses (fail closed) when the probe for t
   assert.equal(calls.some((call) => call.startsWith('rev-list')), false,
     `a killed probe is not read as an unknown remote tip, so no range is listed:\n${calls.join('\n')}`);
 });
-

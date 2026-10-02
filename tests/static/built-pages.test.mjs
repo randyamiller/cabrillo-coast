@@ -10,8 +10,8 @@
  * The fixture-only cases run only when `FIXTURE_DIR` is set; the real
  * launch-state case runs only while `_posts/` holds no article.
  *
- *   - AC-06 [F-018] page contract: CSP, scripts, metadata, landmarks, the
- *     prose scan and the listing state the built articles call for.
+ *   - AC-06 [F-018] page contract: CSP, scripts, metadata, landmarks, list
+ *     roles, the prose scan and the listing state the built articles call for.
  *   - AC-07 [F-018] links, canonical URLs and the published outputs.
  *   - AC-02 [F-017] drafts, draft images and future-dated posts stay out of
  *     normal builds.
@@ -191,11 +191,20 @@ const FORBIDDEN_OUTPUTS = Object.freeze([
 const TEXT_EXTENSIONS = new Set(['.html', '.json', '.css', '.js', '.xml', '.txt', '.md', '.svg', '.yml', '.yaml']);
 
 /**
- * Path prefix of every draft image (`assets/drafts/<slug>/…`), the AC-02
- * draft-image reference: no text file of a normal build may hold it, since a
- * page or index entry that names a draft image leaks the draft it belongs to.
+ * The synthetic draft's image folder (`assets/drafts/fixture-private-draft/`),
+ * the AC-02 draft-image reference: no text file of the project build may hold
+ * it, since a page or index entry that names a draft image leaks the draft it
+ * belongs to. It is the only draft-image folder the fixture build's source
+ * holds (staging leaves the author's own `assets/drafts/` out). The bare
+ * `assets/drafts/` prefix is no needle: the project build also renders the
+ * real `_posts/`, and a published article may name the path in prose or code
+ * without leaking anything. An article image pointing into `assets/drafts/`
+ * is refused by the article checks and, since that folder is never built,
+ * fails the AC-07 link check. The folder holds `DRAFT_SLUG`, so the slug
+ * needle matches it too; it is kept so that a failure names the draft-image
+ * clause of AC-02.
  */
-const DRAFT_IMAGE_PREFIX = 'assets/drafts/';
+const DRAFT_IMAGE_FOLDER = `${path.posix.dirname(DRAFT_IMAGE)}/`;
 
 /** The launch-state text of the listing (AAP 0.5.4). */
 const EMPTY_LISTING_TEXT = 'No articles have been published yet.';
@@ -884,14 +893,43 @@ function assertBlogCurrent(html, kind) {
 }
 
 /**
+ * Every `.tag-list` among `candidates` carries `role="list"`: the blog
+ * stylesheet sets `list-style: none` on tag lists, and WebKit drops the list
+ * role from such a list unless the markup states it.
+ * @param {import('./lib/site-links.mjs').StartTag[]} candidates
+ */
+function assertTagListRoles(candidates) {
+  for (const tag of candidates.filter((t) => classTokens(t).includes('tag-list'))) {
+    assert.equal(tag.attrs.role, 'list', `.tag-list must carry role="list" so WebKit keeps its list semantics: ${tag.source}`);
+  }
+}
+
+/**
+ * The tag list in an article's `header.post-header` carries `role="list"`
+ * (`assertTagListRoles`). Only the layout-owned header is read: the prose
+ * after it is author content and may hold any markup.
+ * @param {string} html
+ */
+function assertArticleTagLists(html) {
+  const all = tags(html);
+  const header = all.find((t) => t.name === 'header' && classTokens(t).includes('post-header'));
+  assert.ok(header, 'article has no <header class="post-header"> (layout contract of _layouts/post.html)');
+  const close = closingTagIndex(html, 'header', header.end);
+  assert.notEqual(close, -1, 'header.post-header is never closed');
+  assertTagListRoles(all.filter((t) => t.start >= header.end && t.start < close));
+}
+
+/**
  * The listing's state, chosen by the built article inventory and never by the
  * listing's own markup, so a list or form that went missing cannot pass for
  * the launch state.
  *
- * With articles: `ol#post-list.post-list` holds one `li[data-url]` per built
- * article (the join `search.js` makes with the index); `form#blog-search` is
- * hidden until `search.js` runs, a GET to the listing, and names the index
- * under the base path in `data-index`; no `.post-empty` element is present.
+ * With articles: `ol#post-list.post-list`, which carries `role="list"` as
+ * each of its tag lists does (`assertTagListRoles`), holds one
+ * `li[data-url]` per built article (the join `search.js` makes with the
+ * index); `form#blog-search` is hidden until `search.js` runs, a GET to the
+ * listing, and names the index under the base path in `data-index`; no
+ * `.post-empty` element is present.
  * Without articles: one `p.post-empty` reading the empty-state text, and
  * neither the form nor the list.
  *
@@ -925,8 +963,10 @@ function assertListing(html, { base, articleUrls }) {
   assert.ok(list, `the listing must hold #post-list for its ${articleUrls.length} built article(s)`);
   assert.equal(list.name, 'ol', `#post-list must be an <ol>: ${list.source}`);
   assert.ok(classTokens(list).includes('post-list'), `#post-list lacks class "post-list": ${list.source}`);
+  assert.equal(list.attrs.role, 'list', `#post-list must carry role="list" so WebKit keeps its list semantics: ${list.source}`);
   const close = closingTagIndex(html, 'ol', list.end);
   assert.notEqual(close, -1, 'ol#post-list is never closed');
+  assertTagListRoles(all.filter((tag) => tag.start >= list.end && tag.start < close));
   const listed = all
     .filter((tag) => tag.name === 'li' && tag.start >= list.end && tag.start < close && Object.hasOwn(tag.attrs, 'data-url'))
     .map((tag) => tag.attrs['data-url']);
@@ -984,6 +1024,7 @@ function definePageContractTests() {
         assertMetadata(html, page.kind);
         assertLandmarks(html);
         assertBlogCurrent(html, page.kind);
+        if (page.kind === 'article') assertArticleTagLists(html);
         if (page.kind === 'listing') assertListing(html, { base: BASE, articleUrls });
       });
     }
@@ -1171,9 +1212,9 @@ function definePageContractTests() {
     const card = (url, words = 'Title') =>
       `<li class="card post-card" data-url="${url}">\n<h2><a href="${url}">${words}</a></h2>\n` +
       `<p class="post-summary">${words}</p>\n` +
-      `<ul class="tag-list" aria-label="Tags"><li><a class="tag-link" href="${base}/blog/?q=tag">tag</a></li></ul>\n</li>`;
+      `<ul class="tag-list" role="list" aria-label="Tags"><li><a class="tag-link" href="${base}/blog/?q=tag">tag</a></li></ul>\n</li>`;
     const list = (items, words) =>
-      `<ol class="post-list" id="post-list" aria-label="Articles">\n${items.map((url) => card(url, words)).join('\n')}\n</ol>`;
+      `<ol class="post-list" id="post-list" role="list" aria-label="Articles">\n${items.map((url) => card(url, words)).join('\n')}\n</ol>`;
     const page = (inner) =>
       '<!DOCTYPE html>\n<html lang="en">\n<body>\n<main id="main">\n<section class="section blog-index">\n' +
       `<div class="container">\n<div class="section-head"><h1>Technical articles</h1></div>\n${inner}\n</div>\n` +
@@ -1185,6 +1226,8 @@ function definePageContractTests() {
 
     assert.doesNotThrow(check(populated, urls), 'a valid populated listing must pass');
     fails(populated.replace('id="post-list"', 'id="posts"'), urls, 'list id renamed');
+    fails(populated.replace(' role="list" aria-label="Articles"', ' aria-label="Articles"'), urls, 'list without role="list"');
+    fails(populated.replace(' role="list" aria-label="Tags"', ' aria-label="Tags"'), urls, 'tag list without role="list"');
     fails(page(form), urls, 'list removed');
     fails(page(list(urls)), urls, 'form removed');
     fails(populated.replace(` ${index}`, ''), urls, 'form without data-index');
@@ -1276,7 +1319,7 @@ function assertSyntheticSource() {
  * `slugs` or `texts`: slugs are excluded from file text as well as paths.
  * @param {string} dir
  * @param {string[]} slugs matched against output paths and file text
- * @param {string[]} texts matched against file text only: markers, draft-image paths
+ * @param {string[]} texts matched against file text only: markers, the draft-image folder
  */
 function assertAbsent(dir, slugs, texts) {
   const paths = walk(dir).filter((rel) => slugs.some((slug) => rel.includes(slug)));
@@ -1298,7 +1341,7 @@ function definePrivacyTests() {
 
   test('[AC-02][F-017] the project build holds no draft, draft image or future-dated post', FIXTURE_ONLY, () => {
     assertSyntheticSource();
-    assertAbsent(SITE_DIR, [DRAFT_SLUG, FUTURE_SLUG], [DRAFT_MARKER, FUTURE_MARKER, DRAFT_IMAGE_PREFIX]);
+    assertAbsent(SITE_DIR, [DRAFT_SLUG, FUTURE_SLUG], [DRAFT_MARKER, FUTURE_MARKER, DRAFT_IMAGE_FOLDER]);
   });
 
   test('[AC-02][F-017] the preview build renders the draft and its image but no future-dated post', FIXTURE_ONLY, () => {

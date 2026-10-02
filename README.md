@@ -191,7 +191,7 @@ Every safeguard runs on your machine except the last, which only reports.
 |-----------|---------------|-------|
 | `.gitignore` (`_drafts/`, `assets/drafts/`) | `git add -A` and `git add .` skip drafts and draft images | `git add -f` overrides it |
 | `article.mjs check` and `publish` | A draft that fails the schema, date or image rules is not moved into `_posts/` | Runs only when you run it |
-| `.githooks/pre-commit` (`guard --staged`) | Refuses a commit when the complete staged tree tracks a draft or draft image, a misnamed or duplicate-slug file in `_posts/`, an article whose filename date is in the future or an `assets/blog/<slug>/` folder without its post (the tree rules); when an article the commit adds or changes fails the schema (which rejects a `published:` key), image or unsafe-markup checks (the article checks); or when a staged `.githooks/` file lacks mode `100755` | Needs `git config core.hooksPath .githooks` once per clone; skipped by `git commit --no-verify`; does not run for edits made on github.com or in a clone without the setting |
+| `.githooks/pre-commit` (`guard --staged`) | Refuses a commit when the complete staged tree tracks a draft or draft image (a `_drafts/` folder at any depth included), a file in a `_posts/` folder below the repository root or in a `_posts/` subfolder whose name starts with `_`, `.`, `#` or `~`, a misnamed or duplicate-slug file in `_posts/`, an article whose filename date is in the future or an `assets/blog/<slug>/` folder without its post (the tree rules); when an article the commit adds or changes fails the schema (which rejects a `published:` key), image or unsafe-markup checks (the article checks); or when a staged `.githooks/` file lacks mode `100755` | Needs `git config core.hooksPath .githooks` once per clone; skipped by `git commit --no-verify`; does not run for edits made on github.com or in a clone without the setting |
 | `.githooks/pre-push` (`guard --pre-push`) | Refuses a push when the complete tree of any pushed commit, not only the tip, breaks the tree rules, or an article that commit adds or modifies fails the article checks. A draft committed and later deleted, or an image folder left behind when its post is deleted, therefore still blocks the push | As for pre-commit; skipped by `git push --no-verify`; does not check hook modes (only pre-commit does) |
 | `node scripts/verify.mjs` | Every automated check, before the push | Voluntary |
 | `blog-checks` workflow | Reports a violation after the push | Detection only: the content is already public |
@@ -270,9 +270,14 @@ characters are refused.
 reference the post (a `post_url` tag or a link to `/blog/<slug>/`) and lists each file
 and line. Repoint or remove those references first. Otherwise it moves the post back
 to `_drafts/<slug>.md` and any images back to `assets/drafts/<slug>/`, and keeps the
-post it retired as the git-ignored backup `_drafts/.<slug>.unpublish-backup` for you
-to delete. Then commit the deletions and push (it prints the commands). The next
-build removes the page, its search entry and its images.
+post it retired as the git-ignored backup `_drafts/.<slug>.unpublish-backup`
+(numbered `-backup-2` to `-backup-99` when that name is taken; `unpublish` names it)
+for you to delete. Then commit the deletions and push (it prints the commands). The
+next build removes the page, its search entry and its images.
+
+`publish` and `unpublish` each keep at most 99 backups per slug: once every name from
+`-backup` to `-backup-99` exists, the command refuses and changes nothing until you
+delete the backups you no longer need.
 
 Unpublishing ends current publication only: everything already pushed stays readable
 in git history.
@@ -361,7 +366,25 @@ runs. When https://pages.github.com/versions.json changes:
    `.ruby-version` together, to the versions it lists.
 2. Regenerate `Gemfile.lock` with `bundle lock`, using the Bundler shipped with that
    Ruby.
-3. Run `node scripts/verify.mjs`, then commit all three files together.
+3. At the top of `tests/static/blog-content.test.mjs`, set `PAGES_VERSION`,
+   `NOKOGIRI_VERSION` and the `LOCKED_GEMS` entries for `jekyll`, `kramdown` and
+   `rouge` to the versions the new lock resolves. Every other pinned string in that
+   suite is derived from them.
+4. Replace each old version wherever else it is named; `git grep -nF '<old version>'`
+   lists every place. They appear only in text: the Ruby and github-pages versions
+   under [One-time setup](#one-time-setup), the Ruby version in the `bundle not found`
+   messages of `scripts/verify.mjs` and `tests/fixtures/build-fixture-site.mjs`
+   (`tests/unit/verify.test.mjs` asserts the `verify.mjs` message, so change the two
+   together), and comments (`_config.yml`, `.github/workflows/blog-checks.yml` and
+   others). Where a comment names a version because the code beside it reproduces
+   that version's behaviour, check the code against the new version too: kramdown,
+   kramdown-parser-gfm and Ruby's regular expressions in `scripts/lib/articles.mjs`
+   (what kramdown renders as code, which the unsafe-markup scans skip), Liquid there
+   and in `tests/static/built-search-index.test.mjs`, and Rouge's token classes in
+   `tests/static/built-pages.test.mjs`.
+5. Run `node scripts/verify.mjs`, then commit every file you changed together:
+   `Gemfile`, `Gemfile.lock`, `.ruby-version`, `tests/static/blog-content.test.mjs`
+   and the files step 4 changed.
 
 ### Project-path mode
 

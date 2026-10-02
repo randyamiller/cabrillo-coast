@@ -310,7 +310,7 @@ function linksBelow(root, relDir) {
   for (const entry of entries) {
     const child = `${relDir}/${entry.name}`;
     if (entry.isSymbolicLink()) links.push(child);
-    else if (entry.isDirectory()) links.push(...linksBelow(root, child));
+    else if (entry.isDirectory()) for (const link of linksBelow(root, child)) links.push(link);
   }
   return links;
 }
@@ -362,7 +362,7 @@ function findPosts(root, slug, links) {
   };
   const met = [];
   const posts = listMarkdown(root, '_posts', met).filter(isPost);
-  links?.push(...met.filter(isPost));
+  if (links) for (const link of met.filter(isPost)) links.push(link);
   return posts;
 }
 

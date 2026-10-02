@@ -676,7 +676,6 @@ function jekyllBuild({ source, destination, configs, extra = [] }) {
   }
 }
 
-
 /**
  * The whole run behind `buildFixtureSite`: option checks, pre-flight checks,
  * staging and the three builds. Its errors are normalized by that wrapper.
@@ -886,4 +885,3 @@ if (isMainModule()) {
     },
   );
 }
-

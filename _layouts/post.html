@@ -25,7 +25,7 @@ layout: blog
         {%- if page.updated %} · Updated <time datetime="{{ page.updated | date: '%Y-%m-%d' | escape }}">{{ page.updated | date: '%B %-d, %Y' | escape }}</time>{% endif -%}
       </p>
       {%- if page.tags.size > 0 %}
-      <ul class="tag-list" aria-label="Tags">
+      <ul class="tag-list" role="list" aria-label="Tags">
         {%- for tag in page.tags %}
         <li><a class="tag-link" href="{{ '/blog/' | relative_url }}?q={{ tag | url_encode }}">{{ tag | escape }}</a></li>
         {%- endfor %}

@@ -8,7 +8,8 @@
 .post-card h2 { font-size: clamp(1.3rem, 2.4vw, 1.6rem); margin-block-end: 8px; }
 /* The second selector outranks .card p in styles.css, which would otherwise set .98rem inside listing cards. */
 .post-meta, .post-card .post-meta { color: var(--muted); font-size: .92rem; margin-block-end: 10px; }
-.post-summary { color: var(--muted); margin-block-end: 14px; }
+/* Clipped to two lines; screen readers still read the whole summary. */
+.post-summary { color: var(--muted); margin-block-end: 14px; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
 .tag-list { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px; }
 /* A long unbroken tag shrinks to the column and wraps inside its pill. 1.2em rounds one line fully, like 999px, and keeps wrapped lines inside the tint. */
 .tag-list > li { min-inline-size: 0; max-inline-size: 100%; }

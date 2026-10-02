@@ -31,14 +31,14 @@ search: true
       <input id="blog-search-input" type="search" name="q" placeholder="Search by title, topic or tag" autocomplete="off" spellcheck="false">
       <p class="blog-search-status" id="blog-search-status" role="status" aria-live="polite"></p>
     </form>
-    <ol class="post-list" id="post-list" aria-label="Articles">
+    <ol class="post-list" id="post-list" role="list" aria-label="Articles">
 {%- for post in site.posts %}
       <li class="card post-card" data-url="{{ post.url | relative_url | escape }}">
         <h2><a href="{{ post.url | relative_url | escape }}">{{ post.title | escape }}</a></h2>
         <p class="post-meta"><time datetime="{{ post.date | date: '%Y-%m-%d' | escape }}">{{ post.date | date: '%B %-d, %Y' | escape }}</time></p>
         <p class="post-summary">{{ post.summary | escape }}</p>
         {%- if post.tags.size > 0 %}
-        <ul class="tag-list" aria-label="Tags">{% for tag in post.tags %}<li><a class="tag-link" href="{{ '/blog/' | relative_url }}?q={{ tag | url_encode }}">{{ tag | escape }}</a></li>{% endfor %}</ul>
+        <ul class="tag-list" role="list" aria-label="Tags">{% for tag in post.tags %}<li><a class="tag-link" href="{{ '/blog/' | relative_url }}?q={{ tag | url_encode }}">{{ tag | escape }}</a></li>{% endfor %}</ul>
         {%- endif %}
       </li>
 {%- endfor %}

@@ -145,9 +145,17 @@ const HOOK_CD_LINE = 'cd "$(git rev-parse --show-toplevel)" || exit 1';
 /** `url` of the project-path deployment, used once `CNAME` is removed (AAP 0.5.3). */
 const PROJECT_URL = 'https://randyamiller.github.io';
 
+/**
+ * The github-pages version `Gemfile` pins and `Gemfile.lock` resolves. A
+ * re-pin changes only `PAGES_VERSION`, `LOCKED_GEMS` and `NOKOGIRI_VERSION`
+ * (README, "Keeping the build in step with Pages"): every other pinned
+ * string in this suite is derived from them.
+ */
+const PAGES_VERSION = '232';
+
 /** Gem versions `Gemfile.lock` must resolve, matching pages.github.com/versions.json. */
 const LOCKED_GEMS = Object.freeze([
-  ['github-pages', '232'],
+  ['github-pages', PAGES_VERSION],
   ['jekyll', '3.10.0'],
   ['kramdown', '2.4.0'],
   ['rouge', '3.30.0'],
@@ -384,6 +392,21 @@ function replaceOnce(text, search, replacement) {
   const at = text.indexOf(search);
   assert.ok(at !== -1 && text.indexOf(search, at + 1) === -1, `expected exactly one ${JSON.stringify(search)} to replace`);
   return text.slice(0, at) + replacement + text.slice(at + search.length);
+}
+
+/** `text` escaped for literal use inside `new RegExp` (Node 22 has no `RegExp.escape`). */
+function regExpLiteral(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * A version that can never equal `version`: its last numeric component plus
+ * one (`2.5.9` becomes `2.5.10`), or `version` with `.1` appended when it
+ * does not end in a number.
+ */
+function strayVersion(version) {
+  const last = /(\d+)$/.exec(version);
+  return last === null ? `${version}.1` : `${version.slice(0, last.index)}${BigInt(last[1]) + 1n}`;
 }
 
 function assertReports(problems, pattern, label) {
@@ -1285,8 +1308,9 @@ function setOwnOption(options, key, value) {
  * `=end` blocks and everything after `__END__` are inactive. Every active
  * statement must be `source "https://rubygems.org"` (exactly once) or a `gem`
  * declaration, so a pin inside `if false … end` or `group … do … end` is
- * refused; and exactly one active `gem "github-pages", "232", group:
- * :jekyll_plugins` and one `gem "nokogiri", "1.16.7"` must exist.
+ * refused; and exactly one active `github-pages` declaration, pinned to
+ * `PAGES_VERSION` with `group: :jekyll_plugins`, and one `nokogiri`
+ * declaration, pinned to `NOKOGIRI_VERSION`, must exist.
  *
  * @returns {string[]} Problems; `[]` for a valid Gemfile.
  */
@@ -1326,7 +1350,7 @@ function gemfileProblems(text) {
   if (sources !== 1) problems.push(`Gemfile must declare source "https://rubygems.org" exactly once (found ${sources})`);
 
   const pins = [
-    { name: 'github-pages', requirements: ['232'], options: { group: ':jekyll_plugins' }, shown: 'gem "github-pages", "232", group: :jekyll_plugins' },
+    { name: 'github-pages', requirements: [PAGES_VERSION], options: { group: ':jekyll_plugins' }, shown: `gem "github-pages", "${PAGES_VERSION}", group: :jekyll_plugins` },
     { name: 'nokogiri', requirements: [NOKOGIRI_VERSION], options: {}, shown: `gem "nokogiri", "${NOKOGIRI_VERSION}"` },
   ];
   for (const pin of pins) {
@@ -1410,9 +1434,10 @@ function dropLockSpec(lock, name) {
 
 /* AC-01: draft privacy and publishing configuration                         */
 
-test('[AC-01][F-017] nothing under _drafts/ or assets/drafts/ is tracked', () => {
+test('[AC-01][F-017] nothing in a _drafts/ folder at any depth or under assets/drafts/ is tracked', () => {
   assertRepositoryRoot();
-  const tracked = git(['ls-files', '--', '_drafts', 'assets/drafts']).trim();
+  // Jekyll reads `<dir>/_drafts/` in every folder it builds, so a nested one such as blog/_drafts/ counts too.
+  const tracked = git(['ls-files', '--', '_drafts', 'assets/drafts', ':(glob)**/_drafts/**']).trim();
   assert.equal(
     tracked,
     '',
@@ -1471,8 +1496,24 @@ function removePath(tree, rel) {
 
 /** A future-date refusal for `rel`, dated the day after `FIXED_TODAY`. */
 function futureRefusal(rel) {
-  const escaped = rel.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
-  return new RegExp(`^${escaped}: dated 2026-06-16, after today \\(UTC 2026-06-15\\); future-dated posts are not allowed$`);
+  return new RegExp(`^${regExpLiteral(rel)}: dated 2026-06-16, after today \\(UTC 2026-06-15\\); future-dated posts are not allowed$`);
+}
+
+/** The refusal of `rel` as a tracked draft or draft image. */
+function draftRefusal(rel) {
+  return new RegExp(`^${regExpLiteral(rel)}: drafts and draft images must never be tracked \\(git rm --cached; `);
+}
+
+/** The refusal of `rel` for sitting in a `_posts/` folder below the repository root. */
+function nestedPostsRefusal(rel) {
+  return new RegExp(`^${regExpLiteral(rel)}: articles belong only in the root _posts/ folder; Jekyll can read a nested `
+    + '_posts/ folder as posts, but the article checks cover only the root one$');
+}
+
+/** The refusal of `rel` for its folder `folder` inside `_posts/`, a name Jekyll can skip. */
+function skippedFolderRefusal(rel, folder) {
+  return new RegExp(`^${regExpLiteral(rel)}: folder ${regExpLiteral(folder)}/ is not allowed in _posts/; Jekyll can skip folders `
+    + 'whose names start with _, \\., # or ~, so a post in one could stay off the site while public on GitHub$');
 }
 
 /**
@@ -1492,6 +1533,76 @@ const TREE_CASES = Object.freeze([
     name: 'a tracked draft image is refused',
     change: (tree) => tree.paths.push('assets/drafts/secret/fig.png'),
     expect: [/^assets\/drafts\/secret\/fig\.png: drafts and draft images must never be tracked/],
+  },
+  {
+    name: 'a tracked draft in a nested _drafts/ folder is refused',
+    change: (tree) => tree.paths.push('blog/_drafts/secret.md'),
+    expect: [draftRefusal('blog/_drafts/secret.md')],
+  },
+  {
+    name: 'a draft folder inside _posts/ is refused as a draft and, being in _posts/, as a misnamed post',
+    change: (tree) => tree.paths.push('_posts/_drafts/x.md'),
+    expect: [draftRefusal('_posts/_drafts/x.md'), /^_posts\/_drafts\/x\.md: post filename must be YYYY-MM-DD-<slug>\.md$/],
+  },
+  {
+    name: 'a valid, past-dated post in a nested _posts/ folder is refused',
+    change: (tree) => setArticle(tree, 'blog/_posts/2026-03-02-beta.md', articleSource(VALID_FRONT_MATTER, 'Body.\n')),
+    expect: [nestedPostsRefusal('blog/_posts/2026-03-02-beta.md')],
+  },
+  {
+    name: 'a future-dated post in a nested _posts/ folder at any depth is refused',
+    change: (tree) => tree.paths.push('blog/_posts/2026-06-16-later.md', 'a/b/_posts/2026-06-16-deep.md'),
+    expect: [nestedPostsRefusal('blog/_posts/2026-06-16-later.md'), nestedPostsRefusal('a/b/_posts/2026-06-16-deep.md')],
+  },
+  {
+    name: 'a nested post with a published: key is refused for its folder and its key',
+    change: (tree) => setArticle(tree, 'blog/_posts/2026-03-02-beta.md', articleSource([...VALID_FRONT_MATTER, 'published: false'], 'Body.\n')),
+    expect: [nestedPostsRefusal('blog/_posts/2026-03-02-beta.md'), /^blog\/_posts\/2026-03-02-beta\.md: published: is not allowed/],
+  },
+  {
+    name: 'a valid, past-dated post in a folder Jekyll skips (_posts/_hold/) is refused',
+    change: (tree) => setArticle(tree, '_posts/_hold/2026-03-02-held.md', articleSource(VALID_FRONT_MATTER, 'Body.\n')),
+    expect: [skippedFolderRefusal('_posts/_hold/2026-03-02-held.md', '_hold')],
+  },
+  {
+    name: 'posts in _posts/ folders led by ., # or ~, and in a deeper _ folder, are refused',
+    change: (tree) => tree.paths.push(
+      '_posts/.dot/2026-03-02-dot.md',
+      '_posts/#hash/2026-03-02-hash.md',
+      '_posts/~tilde/2026-03-02-tilde.md',
+      '_posts/2026/_x/2026-03-02-deep.md',
+    ),
+    expect: [
+      skippedFolderRefusal('_posts/.dot/2026-03-02-dot.md', '.dot'),
+      skippedFolderRefusal('_posts/#hash/2026-03-02-hash.md', '#hash'),
+      skippedFolderRefusal('_posts/~tilde/2026-03-02-tilde.md', '~tilde'),
+      skippedFolderRefusal('_posts/2026/_x/2026-03-02-deep.md', '_x'),
+    ],
+  },
+  {
+    name: 'a post in a skipped folder is refused for its folder, not as a second post with its slug',
+    change: (tree) => tree.paths.push('_posts/_hold/2026-03-02-alpha.md'),
+    expect: [skippedFolderRefusal('_posts/_hold/2026-03-02-alpha.md', '_hold')],
+  },
+  {
+    name: 'a post in a skipped folder does not count as the post of its image folder',
+    change: (tree) => {
+      removePath(tree, ALPHA_PATH);
+      setArticle(tree, '_posts/_hold/2026-03-01-alpha.md', alphaSource());
+    },
+    expect: [
+      skippedFolderRefusal('_posts/_hold/2026-03-01-alpha.md', '_hold'),
+      /^assets\/blog\/alpha\/: image folder has no matching _posts\/\*-alpha\.md$/,
+    ],
+  },
+  {
+    name: 'folder names are matched whole: my_drafts/, my_posts/, _postscript.md, _drafts.md, _posts/sub/ and _posts/sub~/ are accepted',
+    change: (tree) => {
+      tree.paths.push('notes/my_drafts/x.md', 'docs/_postscript.md', 'docs/_drafts.md', 'blog/my_posts/x.md');
+      tree.paths.push('_posts/sub~/2026-03-03-gamma.md');
+      setArticle(tree, '_posts/sub/2026-03-02-beta.md', articleSource(VALID_FRONT_MATTER, 'Body.\n'));
+    },
+    expect: [],
   },
   {
     name: 'a published: key in a post is refused',
@@ -2000,8 +2111,16 @@ test('[AC-01][F-017] Gemfile and Gemfile.lock pin the GitHub Pages gem versions'
 });
 
 /** The two pin lines as `Gemfile` writes them; the controls rewrite them. */
-const PAGES_PIN = 'gem "github-pages", "232", group: :jekyll_plugins\n';
+const PAGES_PIN = `gem "github-pages", "${PAGES_VERSION}", group: :jekyll_plugins\n`;
 const NOKOGIRI_PIN = `gem "nokogiri", "${NOKOGIRI_VERSION}"\n`;
+
+/** A `~> major.minor` requirement around the nokogiri pin, which admits releases other than the pin. */
+const NOKOGIRI_PESSIMISTIC = `~> ${NOKOGIRI_VERSION.split('.').slice(0, 2).join('.')}`;
+
+/** The jekyll version the lock must resolve, and versions the controls substitute for the pins. */
+const JEKYLL_VERSION = new Map(LOCKED_GEMS).get('jekyll');
+const JEKYLL_STRAY = strayVersion(JEKYLL_VERSION);
+const NOKOGIRI_STRAY = strayVersion(NOKOGIRI_VERSION);
 
 /** Controls for `gemfileProblems`, each a change to the real `Gemfile` and the problems it must produce, in order. */
 const GEMFILE_CONTROLS = Object.freeze([
@@ -2014,14 +2133,18 @@ const GEMFILE_CONTROLS = Object.freeze([
     ],
   },
   {
-    name: 'nokogiri pinned as ~> 1.16',
-    change: (text) => replaceOnce(text, NOKOGIRI_PIN, 'gem "nokogiri", "~> 1.16"\n'),
-    expect: [/^Gemfile line \d+: must be gem "nokogiri", "1\.16\.7" \(got requirements \["~> 1\.16"\], options \{\}\)$/],
+    name: `nokogiri pinned as ${NOKOGIRI_PESSIMISTIC}`,
+    change: (text) => replaceOnce(text, NOKOGIRI_PIN, `gem "nokogiri", "${NOKOGIRI_PESSIMISTIC}"\n`),
+    expect: [new RegExp(`^Gemfile line \\d+: ${regExpLiteral(
+      `must be gem "nokogiri", "${NOKOGIRI_VERSION}" (got requirements ${JSON.stringify([NOKOGIRI_PESSIMISTIC])}, options {})`,
+    )}$`)],
   },
   {
     name: 'github-pages without its group',
-    change: (text) => replaceOnce(text, PAGES_PIN, 'gem "github-pages", "232"\n'),
-    expect: [/^Gemfile line \d+: must be gem "github-pages", "232", group: :jekyll_plugins \(got requirements \["232"\], options \{\}\)$/],
+    change: (text) => replaceOnce(text, PAGES_PIN, `gem "github-pages", "${PAGES_VERSION}"\n`),
+    expect: [new RegExp(`^Gemfile line \\d+: ${regExpLiteral(
+      `must be ${PAGES_PIN.trimEnd()} (got requirements ${JSON.stringify([PAGES_VERSION])}, options {})`,
+    )}$`)],
   },
   {
     name: 'both pins inside if false … end',
@@ -2045,19 +2168,19 @@ const GEMFILE_CONTROLS = Object.freeze([
     name: 'a pin disabled by a trailing if false',
     change: (text) => replaceOnce(text, NOKOGIRI_PIN, `gem "nokogiri", "${NOKOGIRI_VERSION}" if false\n`),
     expect: [
-      /^Gemfile line \d+: cannot read the gem declaration \(gem "nokogiri", "1\.16\.7" if false\)$/,
+      new RegExp(`^Gemfile line \\d+: ${regExpLiteral(`cannot read the gem declaration (${NOKOGIRI_PIN.trimEnd()} if false)`)}$`),
       /^Gemfile must declare gem "nokogiri", .* \(found 0\)$/,
     ],
   },
   {
     name: 'a second nokogiri declaration',
-    change: (text) => `${text}gem "nokogiri", "1.19.4"\n`,
+    change: (text) => `${text}gem "nokogiri", "${NOKOGIRI_STRAY}"\n`,
     expect: [/^Gemfile must declare gem "nokogiri", .* exactly once as an active line \(found 2\)$/],
   },
   {
     name: 'single quotes, :group => and trailing comments are accepted',
     change: (text) => replaceOnce(
-      replaceOnce(text, PAGES_PIN, "gem 'github-pages', '232', :group => :jekyll_plugins # Pages\n"),
+      replaceOnce(text, PAGES_PIN, `gem 'github-pages', '${PAGES_VERSION}', :group => :jekyll_plugins # Pages\n`),
       NOKOGIRI_PIN,
       `gem 'nokogiri', '${NOKOGIRI_VERSION}' # the version Pages runs\n`,
     ),
@@ -2070,22 +2193,24 @@ const LOCK_CONTROLS = Object.freeze([
   {
     name: 'nokogiri missing from the GEM specs while DEPENDENCIES still names it',
     change: (text) => dropLockSpec(text, 'nokogiri'),
-    expect: [/^Gemfile\.lock GEM specs must resolve nokogiri \(1\.16\.7\[-platform\]\)$/],
+    expect: [new RegExp(`^${regExpLiteral(`Gemfile.lock GEM specs must resolve nokogiri (${NOKOGIRI_VERSION}[-platform])`)}$`)],
   },
   {
-    name: 'nokogiri resolved as 1.19.4',
-    change: (text) => text.replaceAll(`    nokogiri (${NOKOGIRI_VERSION}`, '    nokogiri (1.19.4'),
-    expect: [/^Gemfile\.lock resolves nokogiri 1\.19\.4-.*, not 1\.16\.7$/],
+    name: `nokogiri resolved as ${NOKOGIRI_STRAY}`,
+    change: (text) => text.replaceAll(`    nokogiri (${NOKOGIRI_VERSION}`, `    nokogiri (${NOKOGIRI_STRAY}`),
+    expect: [new RegExp(
+      `^Gemfile\\.lock resolves nokogiri ${regExpLiteral(NOKOGIRI_STRAY)}-.*, not ${regExpLiteral(NOKOGIRI_VERSION)}$`,
+    )],
   },
   {
-    name: 'github-pages (232) only as a dependency line',
-    change: (text) => replaceOnce(text, '\n    github-pages (232)\n', '\n      github-pages (232)\n'),
-    expect: [/^Gemfile\.lock GEM specs must resolve github-pages \(232\)$/],
+    name: `github-pages (${PAGES_VERSION}) only as a dependency line`,
+    change: (text) => replaceOnce(text, `\n    github-pages (${PAGES_VERSION})\n`, `\n      github-pages (${PAGES_VERSION})\n`),
+    expect: [new RegExp(`^${regExpLiteral(`Gemfile.lock GEM specs must resolve github-pages (${PAGES_VERSION})`)}$`)],
   },
   {
-    name: 'jekyll resolved as 3.9.5',
-    change: (text) => replaceOnce(text, '\n    jekyll (3.10.0)\n', '\n    jekyll (3.9.5)\n'),
-    expect: [/^Gemfile\.lock resolves jekyll 3\.9\.5, not 3\.10\.0$/],
+    name: `jekyll resolved as ${JEKYLL_STRAY}`,
+    change: (text) => replaceOnce(text, `\n    jekyll (${JEKYLL_VERSION})\n`, `\n    jekyll (${JEKYLL_STRAY})\n`),
+    expect: [new RegExp(`^${regExpLiteral(`Gemfile.lock resolves jekyll ${JEKYLL_STRAY}, not ${JEKYLL_VERSION}`)}$`)],
   },
 ]);
 

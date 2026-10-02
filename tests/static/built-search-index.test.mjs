@@ -30,7 +30,8 @@
  *
  * Privacy checks search the raw text and every string value of the parsed
  * index, which catches text hidden behind JSON escapes such as
- * `assets\/drafts\/`, case-insensitively because Liquid downcases bodies.
+ * `assets\/drafts\/fixture-private-draft\/`, case-insensitively because
+ * Liquid downcases bodies.
  *
  * Environment (same handling as `built-pages.test.mjs`):
  *   SITE_DIR      Built site, resolved against the repository root (`_site`).
@@ -53,6 +54,7 @@ import { gzipSync } from 'node:zlib';
 
 import { parseArticle } from '../../scripts/lib/articles.mjs';
 import {
+  DRAFT_IMAGE,
   DRAFT_MARKER,
   DRAFT_SLUG,
   FIXTURE_POSTS,
@@ -195,16 +197,22 @@ const RUBY_WHITESPACE_RE = /[ \t\r\n\f\v]+/g;
 const TOKEN_BODY_RE = /^[^\t\n\v\f\r ]+(?: [^\t\n\v\f\r ]+)*$/;
 
 /**
- * Path prefix of every draft image (`assets/drafts/<slug>/…`), the AC-02
- * draft-image reference: an index that names a draft image leaks its draft.
+ * The synthetic draft's image folder (`assets/drafts/fixture-private-draft/`),
+ * the AC-02 draft-image reference. It is the only draft-image folder a fixture
+ * build's source holds (staging leaves the author's own out), and the real
+ * build renders no draft. The bare `assets/drafts/` prefix is no needle: index
+ * bodies are `strip_html` text, so on either build it could match only a
+ * published article that names the path, which leaks nothing. The folder holds
+ * `DRAFT_SLUG`, so the slug needle matches it too; it is kept so that a failure
+ * names the draft-image clause of AC-02.
  */
-const DRAFT_IMAGE_PREFIX = 'assets/drafts/';
+const DRAFT_IMAGE_FOLDER = `${path.posix.dirname(DRAFT_IMAGE)}/`;
 
 /**
  * Text the index must never hold, in any field (AC-02): both synthetic slugs,
- * the draft-image prefix and both markers.
+ * the synthetic draft's image folder and both markers.
  */
-const PRIVATE_TEXTS = Object.freeze([DRAFT_SLUG, FUTURE_SLUG, DRAFT_IMAGE_PREFIX, DRAFT_MARKER, FUTURE_MARKER]);
+const PRIVATE_TEXTS = Object.freeze([DRAFT_SLUG, FUTURE_SLUG, DRAFT_IMAGE_FOLDER, DRAFT_MARKER, FUTURE_MARKER]);
 
 /* Helpers */
 
@@ -628,7 +636,8 @@ function defineSuite() {
       assert.ok(!url.includes(FUTURE_SLUG), `the future-dated post is indexed: ${url}`);
     }
     // Every decoded string of every entry, whatever its field: JSON escapes
-    // (`assets\/drafts\/`, `\u0066ixture-…`) can hide a needle from the raw text.
+    // (`assets\/drafts\/fixture-private-draft\/`, `\u0066ixture-…`) can hide a
+    // needle from the raw text.
     const leaks = entries.flatMap((entry, i) => {
       const where = `entry ${i}${entry && typeof entry.url === 'string' ? ` (${entry.url})` : ''}`;
       return [...stringValues(entry, where)].flatMap(([field, value]) => {
@@ -646,7 +655,7 @@ function defineSuite() {
       assert.ok(!text.includes(marker.toLowerCase()), `search.json contains the private marker ${marker}`);
     }
     // The raw text also covers what no string value holds, such as an object key.
-    for (const needle of [DRAFT_SLUG, FUTURE_SLUG, DRAFT_IMAGE_PREFIX]) {
+    for (const needle of [DRAFT_SLUG, FUTURE_SLUG, DRAFT_IMAGE_FOLDER]) {
       assert.ok(!text.includes(needle.toLowerCase()), `search.json text contains ${needle}`);
     }
   });

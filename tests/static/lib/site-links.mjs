@@ -818,4 +818,3 @@ export function checkSiteLinks({ siteDir, baseurl = '', siteUrl } = {}) {
   }
   return findings;
 }
-
