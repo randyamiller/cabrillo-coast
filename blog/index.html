@@ -1,0 +1,48 @@
+---
+layout: blog
+title: Technical articles
+description: Technical articles from Cabrillo Coast on software architecture, technical leadership and agentic AI.
+search: true
+---
+{%- comment -%}
+  data-url is post.url passed through relative_url, the same string search.json writes as each
+  entry's url, so search.js joins list items to index entries under any base path.
+
+  The form ships with the hidden attribute, so visitors without JavaScript see the full list
+  rather than a control that does nothing; search.js removes it once it can run.
+
+  One page, no pagination: in-page search needs every item present.
+
+  The blog policy permits inline styles only because kramdown writes table-alignment style
+  attributes into articles. This listing adds none.
+{%- endcomment -%}
+<section class="section blog-index">
+  <div class="container">
+    <div class="section-head">
+      <p class="kicker">Blog</p>
+      <h1>Technical articles</h1>
+      <p class="lede">Notes on software architecture, technical leadership and agentic AI.</p>
+    </div>
+{%- if site.posts.size == 0 %}
+    <p class="post-empty">No articles have been published yet.</p>
+{%- else %}
+    <form class="blog-search" id="blog-search" role="search" action="{{ '/blog/' | relative_url }}" method="get" data-index="{{ '/blog/search.json' | relative_url }}" hidden>
+      <label for="blog-search-input">Search articles</label>
+      <input id="blog-search-input" type="search" name="q" placeholder="Search by title, topic or tag" autocomplete="off" spellcheck="false">
+      <p class="blog-search-status" id="blog-search-status" role="status" aria-live="polite"></p>
+    </form>
+    <ol class="post-list" id="post-list" role="list" aria-label="Articles">
+{%- for post in site.posts %}
+      <li class="card post-card" data-url="{{ post.url | relative_url | escape }}">
+        <h2><a href="{{ post.url | relative_url | escape }}">{{ post.title | escape }}</a></h2>
+        <p class="post-meta"><time datetime="{{ post.date | date: '%Y-%m-%d' | escape }}">{{ post.date | date: '%B %-d, %Y' | escape }}</time></p>
+        <p class="post-summary">{{ post.summary | escape }}</p>
+        {%- if post.tags.size > 0 %}
+        <ul class="tag-list" role="list" aria-label="Tags">{% for tag in post.tags %}<li><a class="tag-link" href="{{ '/blog/' | relative_url }}?q={{ tag | url_encode }}">{{ tag | escape }}</a></li>{% endfor %}</ul>
+        {%- endif %}
+      </li>
+{%- endfor %}
+    </ol>
+{%- endif %}
+  </div>
+</section>

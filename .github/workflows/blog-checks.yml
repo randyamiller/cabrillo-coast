@@ -1,0 +1,114 @@
+# Cabrillo Coast LLC — blog verification (CI)
+#
+# Verification only: this workflow never builds a deployment and never
+# publishes anything. It runs `node scripts/verify.mjs`, the same single entry
+# point authors run before pushing, so a CI result means what a local result
+# means.
+#
+# GitHub Pages builds and publishes `main` on its own (legacy branch build from
+# `main` at `/`), whatever this workflow reports. A failure on a push to `main`
+# therefore reports a regression that is already live; the check that can stop
+# a bad change is `node scripts/verify.mjs`, run before the push.
+#
+# Deliberately absent, and to stay absent:
+#   - repository credentials of any kind; the token is read-only;
+#   - the Jekyll environment variable: a production build without a Pages API
+#     token derives the wrong base path (/pages/randyamiller/cabrillo-coast);
+#   - any override of GitHub's own CI flag, which the content tests read to
+#     require that the git hooks are tracked;
+#   - the visual-change environment switch: intended visual changes are
+#     declared with a `Visual-Change: intended` commit trailer instead;
+#   - every Pages deployment permission or action.
+
+name: blog-checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    # Pinned rather than ubuntu-latest, so the runner image changes only by a
+    # deliberate edit here.
+    runs-on: ubuntu-24.04
+    steps:
+      # Full history: the visual comparison extracts the base revision with
+      # `git archive <base>` and reads `git log <base>..HEAD` for the
+      # `Visual-Change: intended` trailer.
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # No ruby-version input: the action reads `.ruby-version` (3.3.4), and
+      # installs the Bundler recorded in Gemfile.lock (2.5.11) and the locked
+      # gems into vendor/bundle, which _config.yml excludes from the build.
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      # verify.mjs fails, rather than skips, when Chromium is missing.
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      # Base revision for the visual comparison: the pull request's base, or
+      # the previous tip of the pushed branch. `before` is all zeros for a new
+      # branch and can name a commit no longer in history after a force push;
+      # both fall back to the parent of HEAD, or HEAD itself for a root commit,
+      # because an unresolvable --base stops verify.mjs before any check runs.
+      # Event values arrive only through env, never expanded into the script.
+      - name: Choose comparison base
+        id: base
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -eu
+          zero_sha=0000000000000000000000000000000000000000
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base="$PR_BASE_SHA"
+          else
+            base="${PUSH_BEFORE:-}"
+            if [ -z "$base" ] || [ "$base" = "$zero_sha" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+              if git rev-parse --verify --quiet 'HEAD^' >/dev/null; then
+                base="$(git rev-parse 'HEAD^')"
+              else
+                base="$(git rev-parse HEAD)"
+              fi
+            fi
+          fi
+          if [ -z "$base" ]; then
+            echo "::error::No comparison base could be determined for event $EVENT_NAME"
+            exit 1
+          fi
+          echo "Visual comparison base: $base"
+          echo "ref=$base" >> "$GITHUB_OUTPUT"
+
+      - name: Verify
+        env:
+          BASE_REF: ${{ steps.base.outputs.ref }}
+        run: node scripts/verify.mjs --base "$BASE_REF"
+
+      # Only on failure. An earlier step can fail before Playwright writes a
+      # report, so a missing folder is not an error.
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report
+          path: tests/visual/report/
+          if-no-files-found: ignore

@@ -1,0 +1,16 @@
+#!/bin/sh
+# Refuses commits that would put drafts, draft images, orphan article images,
+# `published:` keys, or future-dated or invalid articles into the public repository.
+# Enable once per clone: git config core.hooksPath .githooks
+# `git commit --no-verify` skips it, so it is a safeguard, not a guarantee
+# (see README, "Publishing a technical article"). All checks live in scripts/article.mjs.
+
+# Run from the repository root so the relative tool path resolves from any subfolder.
+# GIT_INDEX_FILE and the other variables git exports are left as they are, so guard
+# reads the exact index being committed (including `git commit -a` and `git commit <paths>`).
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+command -v node >/dev/null 2>&1 || { echo "pre-commit: Node.js 22 or later is required to run scripts/article.mjs guard; commit refused." >&2; exit 1; }
+[ -f scripts/article.mjs ] || { echo "pre-commit: scripts/article.mjs not found; commit refused." >&2; exit 1; }
+
+exec node scripts/article.mjs guard --staged

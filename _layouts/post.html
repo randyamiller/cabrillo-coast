@@ -1,0 +1,41 @@
+---
+layout: blog
+---
+{%- comment -%}
+  Article layout, applied to every post (and to drafts in the local preview) through the
+  _config.yml defaults. It renders only the article inside main; _layouts/blog.html supplies
+  the document. It sets no search key, so search.js loads on the listing only.
+
+  The article body is trusted author Markdown and is printed unescaped by design.
+
+  The prose region runs from the opening div.prose to the closing back link that directly
+  follows it. Nothing else sits between them, and the built-page tests scan that region for
+  unsafe markup.
+{%- endcomment -%}
+{%- assign post_author = page.author | strip -%}
+<article class="section post">
+  <div class="container">
+    <p class="post-back"><a href="{{ '/blog/' | relative_url }}">← All articles</a></p>
+
+    <header class="post-header">
+      <h1>{{ page.title | escape }}</h1>
+      <p class="post-meta">
+        {%- if post_author != '' %}By {{ post_author | escape }} · {% endif -%}
+        <time datetime="{{ page.date | date: '%Y-%m-%d' | escape }}">{{ page.date | date: '%B %-d, %Y' | escape }}</time>
+        {%- if page.updated %} · Updated <time datetime="{{ page.updated | date: '%Y-%m-%d' | escape }}">{{ page.updated | date: '%B %-d, %Y' | escape }}</time>{% endif -%}
+      </p>
+      {%- if page.tags.size > 0 %}
+      <ul class="tag-list" role="list" aria-label="Tags">
+        {%- for tag in page.tags %}
+        <li><a class="tag-link" href="{{ '/blog/' | relative_url }}?q={{ tag | url_encode }}">{{ tag | escape }}</a></li>
+        {%- endfor %}
+      </ul>
+      {%- endif %}
+    </header>
+
+    <div class="prose">
+{{ content }}
+    </div>
+    <p class="post-back"><a href="{{ '/blog/' | relative_url }}">← All articles</a></p>
+  </div>
+</article>

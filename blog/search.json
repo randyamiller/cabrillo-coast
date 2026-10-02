@@ -1,0 +1,21 @@
+---
+layout: null
+---
+{%- comment -%}
+  Entries are newest first (Jekyll's site.posts order); search.js uses array position as its
+  tie-break, so the order must not change. url is post.url | relative_url, the same string
+  blog/index.html writes into each listing item's data-url, which search.js joins on.
+  No filtering here: builds without --drafts (Pages, CI, local) never have drafts in site.posts.
+  Only the local --drafts preview, and the fixture builder's preview variant, add them; that is
+  acceptable because that output is served only on the author's machine and never published.
+  future: false leaves future-dated posts out of every build.
+  body decodes lt, gt, quot and #39 first and amp LAST, so literal entity text in code samples
+  survives as written and a body-only R&D indexes as r&d.
+  split, uniq and join keep distinct tokens in first-occurrence order. Query terms hold no
+  whitespace and ranking counts which fields contain a term, not how often, so results are
+  unchanged and the index roughly halves.
+  Keep braces out of this comment and add no HTML or JSON comments: either would make the
+  output invalid JSON. When site.posts is empty, the output is [].
+{%- endcomment -%}
+[{% for post in site.posts %}{% unless forloop.first %},{% endunless %}
+{"url":{{ post.url | relative_url | jsonify }},"title":{{ post.title | jsonify }},"summary":{{ post.summary | jsonify }},"tags":{{ post.tags | jsonify }},"date":{{ post.date | date_to_xmlschema | jsonify }},"body":{{ post.content | strip_html | replace: "&lt;", "<" | replace: "&gt;", ">" | replace: "&quot;", '"' | replace: "&#39;", "'" | replace: "&amp;", "&" | normalize_whitespace | downcase | split: " " | uniq | join: " " | jsonify }}}{% endfor %}]

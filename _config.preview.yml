@@ -1,0 +1,12 @@
+# Local preview overlay only. Use: bundle exec jekyll serve --drafts --config _config.yml,_config.preview.yml
+# Restates _config.yml's exclude list without assets/drafts so draft images render. Pages never reads this file.
+exclude:
+  - README.md
+  - Gemfile
+  - Gemfile.lock
+  - package.json
+  - package-lock.json
+  - vendor
+  - node_modules
+  - tests
+  - scripts
