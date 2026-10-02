@@ -3,46 +3,18 @@
  * `checkSiteLinks` in `tests/static/lib/site-links.mjs` is what gives the
  * AC-07 link check in `tests/static/built-pages.test.mjs` its meaning: a
  * checker that quietly returned `[]` would let every broken link through.
- * This suite writes small synthetic sites into a temporary directory and
- * proves that the checker
- *   - reports nothing for a site whose every reference resolves,
- *   - reports a broken page-relative link, a broken absolute link on the
- *     site's own host (under both schemes), a missing fragment, a missing
- *     image, a `data-index` that names no file and a broken link on a page
- *     two directory levels deep,
- *   - ignores links to other hosts, and
- *   - reports a root-relative link that escapes the base path of a
- *     project-path deployment.
- * It also pins the parsing and resolution rules those results rest on:
- *   - values in double, single or no quotes are read, the first of two
- *     duplicate attributes wins, and attribute-looking text, escaped markup
- *     and commented-out tags are not references;
- *   - a comment ends where the HTML tokenizer ends it, `<!--` inside an
- *     attribute value opens none, and `parseStartTags` offsets point into
- *     the original HTML;
- *   - character references are decoded once, and percent-encoded paths and
- *     fragments are decoded, a malformed sequence being a missing file;
- *   - a query string is ignored, a directory path needs no trailing slash,
- *     and a missing or unnamed site directory throws;
- *   - pages named with `#`, `?`, `%` or a space resolve their own links at
- *     either base path, `listHtmlPages` percent-encoding their URLs; and
- *   - a symbolic link out of the site directory is a missing file, while one
- *     that stays inside resolves.
+ * This suite proves on small synthetic sites that it reports each kind of
+ * broken reference and nothing else, and pins the tokenizer and decoding
+ * rules those results rest on, hostile input included.
  *
- * Ordinary failure cases extend the same valid baseline (`validFiles`) with
- * only the files and references under test, so a finding can come from
- * nothing else. The base-path, reserved-name and symbolic-link cases need a
- * differently shaped site, so each writes an independent one holding its own
- * valid controls. The direct checks of `parseStartTags` and `decodeEntities`
- * and the missing-directory case write no site. Findings are compared
- * without their `page` field (`summarize`), and `page` is checked only for
- * naming the right page, so the suite pins the checker's contract rather
- * than its report format.
- *
- * Runs with `node --test tests/unit/site-links.test.mjs` or as part of
- * `node --test "tests/**\/*.test.mjs"`. It needs no Jekyll build and no
- * network, writes only under `os.tmpdir()`, and removes its temporary tree
- * once the file's tests have finished.
+ * Every site is isolated: each case writes its own under one temporary
+ * directory in `os.tmpdir()`, removed once the file's tests finish, and
+ * nothing needs a Jekyll build or the network. Ordinary failure cases extend
+ * the same valid baseline (`validFiles`) with only the references under
+ * test, so a finding can come from nothing else; cases that need a
+ * differently shaped site write one holding its own valid controls.
+ * Findings are compared without their `page` field (`summarize`), so the
+ * suite pins the checker's contract rather than its report format.
  */
 
 import { after, test } from 'node:test';
@@ -51,11 +23,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { checkSiteLinks, decodeEntities, listHtmlPages, parseStartTags } from '../static/lib/site-links.mjs';
+import { checkSiteLinks, decodeEntities, listHtmlPages, parseStartTags, tokenizeHtml } from '../static/lib/site-links.mjs';
 
-/* ------------------------------------------------------------------------ */
 /* Constants                                                                 */
-/* ------------------------------------------------------------------------ */
 
 /** Deployment URL of the custom-domain build (`url` in `_config.yml`). */
 const SITE_URL = 'https://www.cabrillocoast.com';
@@ -63,10 +33,8 @@ const SITE_URL = 'https://www.cabrillocoast.com';
 /** Deployment URL of the project-path build (`CNAME` removed). */
 const PROJECT_URL = 'https://randyamiller.github.io';
 
-/** Base path the project-path build is served under. */
 const BASEURL = '/cabrillo-coast';
 
-/** Both deployment modes, as `checkSiteLinks` options without `siteDir`. */
 const MODES = Object.freeze([
   Object.freeze({ baseurl: '', siteUrl: SITE_URL }),
   Object.freeze({ baseurl: BASEURL, siteUrl: PROJECT_URL }),
@@ -78,9 +46,7 @@ const MODES = Object.freeze([
  */
 const IMAGE_BYTES = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
-/* ------------------------------------------------------------------------ */
 /* Temporary sites                                                           */
-/* ------------------------------------------------------------------------ */
 
 /**
  * One parent directory for the whole file; each case writes its own site
@@ -193,15 +159,8 @@ function withMarkup(files, additions) {
   return result;
 }
 
-/* ------------------------------------------------------------------------ */
 /* Assertion helpers                                                         */
-/* ------------------------------------------------------------------------ */
 
-/**
- * Findings as readable JSON, used as the assertion message.
- * @param {unknown} problems
- * @returns {string}
- */
 function formatProblems(problems) {
   return `checkSiteLinks returned:\n${JSON.stringify(problems, null, 2)}`;
 }
@@ -229,9 +188,39 @@ function findingFor(problems, value) {
   return matches[0];
 }
 
-/* ------------------------------------------------------------------------ */
+/**
+ * The result of `run`, failing the case when it takes 5 s or more. On the
+ * hostile inputs below, a pass that rescans the rest of the input for each
+ * opener needs minutes; a linear one needs milliseconds.
+ * @template T
+ * @param {string} why
+ * @param {() => T} run
+ * @returns {T}
+ */
+function withinBound(why, run) {
+  const started = performance.now();
+  const result = run();
+  const elapsed = performance.now() - started;
+  assert.ok(elapsed < 5000, `${why} took ${elapsed.toFixed(0)} ms`);
+  return result;
+}
+
+/**
+ * Each token of `html` as `[type, name, source, terminated]`, `name` being
+ * `null` for comments.
+ * @param {string} html
+ * @param {{ rawText?: boolean }} [options]
+ */
+function brief(html, options) {
+  return tokenizeHtml(html, options).map(({ type, name, start, end, terminated }) => [
+    type,
+    name ?? null,
+    html.slice(start, end),
+    terminated,
+  ]);
+}
+
 /* Cases                                                                     */
-/* ------------------------------------------------------------------------ */
 
 test('[AC-07][F-018] a valid site has no unresolved references', () => {
   const siteDir = writeSite(validFiles());
@@ -351,8 +340,9 @@ test('[AC-07][F-018] ignores links to other hosts', () => {
 });
 
 test('[AC-07][F-018] enforces the base path', () => {
-  // Project-path mode: files sit at the content root that BASEURL maps to,
-  // and every URL that is not page-relative carries the prefix.
+  // Project-path mode: files sit at the content root that BASEURL maps to.
+  // Valid prefixed, page-relative and absolute URLs sit beside `/blog/`,
+  // which lacks the prefix and is the one reference the check must reject.
   const siteDir = writeSite({
     'index.html': page([
       '<a href="/cabrillo-coast/blog/">Blog, prefixed</a>',
@@ -370,9 +360,7 @@ test('[AC-07][F-018] enforces the base path', () => {
   );
 });
 
-/* ------------------------------------------------------------------------ */
 /* Reference extraction                                                      */
-/* ------------------------------------------------------------------------ */
 
 test('[AC-07][F-018] "<!--" inside a quoted attribute value does not hide later references', () => {
   const siteDir = writeSite(
@@ -505,9 +493,135 @@ test('[AC-07][F-018] the first of two duplicate attributes is the one checked', 
   assert.deepEqual(parseStartTags('<a href="/a/" HREF="/b/">')[0].attrs, { href: '/a/' });
 });
 
-/* ------------------------------------------------------------------------ */
+test('[AC-07][F-018] reads attributes written with the recovery syntax browsers accept', () => {
+  const siteDir = writeSite(
+    withMarkup(validFiles(), {
+      'index.html': [
+        '<a/href="/missing/">A slash instead of a space</a>',
+        '<a href="/blog/"title="t">No space after a quoted value</a>',
+        '<a href="/missing-too/"title="t">No space after a quoted value, broken target</a>',
+      ],
+    }),
+  );
+  const problems = checkSiteLinks({ siteDir, baseurl: '', siteUrl: SITE_URL });
+  assert.deepEqual(
+    summarize(problems),
+    [
+      { attribute: 'href', value: '/missing-too/', reason: 'missing file' },
+      { attribute: 'href', value: '/missing/', reason: 'missing file' },
+    ],
+    formatProblems(problems),
+  );
+  assert.deepEqual(parseStartTags('<a/href="/missing/">')[0].attrs, { href: '/missing/' });
+  assert.deepEqual(parseStartTags('<a href="/blog/"title="t">')[0].attrs, { href: '/blog/', title: 't' });
+});
+
+test('[AC-07][F-018] ignores links inside an end tag, a processing instruction, CDATA and a doctype', () => {
+  const siteDir = writeSite(
+    withMarkup(validFiles(), {
+      'index.html': [
+        `<p>Text</p title="<a href='/missing-end-tag/'>">`,
+        '<?xml <a href="/missing-instruction/">?>',
+        '<![CDATA[ <a href="/missing-cdata/"> ]]>',
+        '<!DOCTYPE <a href="/missing-doctype/">>',
+        '<a href="/missing-after/">Read: the scan resumes after each construct</a>',
+      ],
+    }),
+  );
+  const problems = checkSiteLinks({ siteDir, baseurl: '', siteUrl: SITE_URL });
+  assert.deepEqual(
+    summarize(problems),
+    [{ attribute: 'href', value: '/missing-after/', reason: 'missing file' }],
+    formatProblems(problems),
+  );
+});
+
+test('[AC-07][F-018] tokenizeHtml reads tags and attributes as a browser tokenizer does', () => {
+  assert.deepEqual(tokenizeHtml('<img src="x"onerror="alert(1)">')[0].attrs, [
+    { name: 'src', value: 'x' },
+    { name: 'onerror', value: 'alert(1)' },
+  ]);
+  // Names are ASCII-lowercased, `=` may lead a name and `<` belongs to one;
+  // duplicates stay, values stay raw, and a boolean attribute has no value.
+  assert.deepEqual(tokenizeHtml('<A HREF=/x =y href="&amp;" checked <b>')[0], {
+    type: 'start-tag',
+    name: 'a',
+    attrs: [
+      { name: 'href', value: '/x' },
+      { name: '=y', value: null },
+      { name: 'href', value: '&amp;' },
+      { name: 'checked', value: null },
+      { name: '<b', value: null },
+    ],
+    start: 0,
+    end: 38,
+    terminated: true,
+  });
+  assert.deepEqual(tokenizeHtml('<a\0 b\0="c\0" d=>')[0].attrs, [
+    { name: 'b\ufffd', value: 'c\ufffd' },
+    { name: 'd', value: '' },
+  ]);
+  assert.equal(tokenizeHtml('<a\0>')[0].name, 'a\ufffd');
+  assert.deepEqual(brief('<a href="x'), [['start-tag', 'a', '<a href="x', false]]);
+  assert.deepEqual(brief('</p class="<a>"><br/><br / x>'), [
+    ['end-tag', 'p', '</p class="<a>">', true],
+    ['start-tag', 'br', '<br/>', true],
+    ['start-tag', 'br', '<br / x>', true],
+  ]);
+});
+
+test('[AC-07][F-018] tokenizeHtml ends comments and bogus comments where a browser does', () => {
+  assert.deepEqual(brief('<!--><!---><!-- a --!><!-- b --><!-- open <a>'), [
+    ['comment', null, '<!-->', true],
+    ['comment', null, '<!--->', true],
+    ['comment', null, '<!-- a --!>', true],
+    ['comment', null, '<!-- b -->', true],
+    ['comment', null, '<!-- open <a>', false],
+  ]);
+  // `</>` is dropped without a token; `<` before a non-letter and `</` at the end are text.
+  assert.deepEqual(brief('<!DOCTYPE html><?x <a>><![CDATA[ <b> ]]></ 3></><f>< g <1</'), [
+    ['bogus-comment', null, '<!DOCTYPE html>', true],
+    ['bogus-comment', null, '<?x <a>', true],
+    ['bogus-comment', null, '<![CDATA[ <b>', true],
+    ['bogus-comment', null, '</ 3>', true],
+    ['start-tag', 'f', '<f>', true],
+  ]);
+  assert.deepEqual(brief('<!DOCTYPE never closed'), [['bogus-comment', null, '<!DOCTYPE never closed', false]]);
+});
+
+test('[AC-07][F-018] tokenizeHtml reads raw text only when asked, as a browser reads it', () => {
+  const hidden = '<textarea><!--</textarea><script src=x></script>';
+  assert.deepEqual(brief(hidden), [
+    ['start-tag', 'textarea', '<textarea>', true],
+    ['comment', null, '<!--</textarea><script src=x></script>', false],
+  ]);
+  assert.deepEqual(brief(hidden, { rawText: true }), [
+    ['start-tag', 'textarea', '<textarea>', true],
+    ['raw-text', 'textarea', '<!--', true],
+    ['end-tag', 'textarea', '</textarea>', true],
+    ['start-tag', 'script', '<script src=x>', true],
+    ['raw-text', 'script', '', true],
+    ['end-tag', 'script', '</script>', true],
+  ]);
+  // The closer is `</name` in any case followed by whitespace, `/` or `>`; a
+  // self-closing start tag still switches; with no closer the text runs on.
+  assert.deepEqual(brief('<title>a</TITLE ><script/>b</scriptx></script><style>open', { rawText: true }), [
+    ['start-tag', 'title', '<title>', true],
+    ['raw-text', 'title', 'a', true],
+    ['end-tag', 'title', '</TITLE >', true],
+    ['start-tag', 'script', '<script/>', true],
+    ['raw-text', 'script', 'b</scriptx>', true],
+    ['end-tag', 'script', '</script>', true],
+    ['start-tag', 'style', '<style>', true],
+    ['raw-text', 'style', 'open', false],
+  ]);
+  assert.deepEqual(brief('<plaintext></plaintext><p>', { rawText: true }), [
+    ['start-tag', 'plaintext', '<plaintext>', true],
+    ['raw-text', 'plaintext', '</plaintext><p>', false],
+  ]);
+});
+
 /* Entity and percent decoding                                               */
-/* ------------------------------------------------------------------------ */
 
 test('[AC-07][F-018] decodes character references in a value once before resolving it', () => {
   const siteDir = writeSite(
@@ -587,9 +701,7 @@ test('[AC-07][F-018] decodes percent-encoded paths and fragments, and reports ma
   );
 });
 
-/* ------------------------------------------------------------------------ */
 /* Target lookup                                                             */
-/* ------------------------------------------------------------------------ */
 
 test('[AC-07][F-018] ignores a query string and still checks the fragment after it', () => {
   const siteDir = writeSite(
@@ -648,9 +760,7 @@ test('[AC-07][F-018] a missing or unnamed site directory throws instead of passi
   assert.throws(() => checkSiteLinks(), TypeError);
 });
 
-/* ------------------------------------------------------------------------ */
 /* Page URLs from file names                                                 */
-/* ------------------------------------------------------------------------ */
 
 /**
  * A site whose page and directory names hold `#`, `?`, `%` and a space, the
@@ -750,9 +860,7 @@ test('[AC-07][F-018] listHtmlPages percent-encodes each URL segment and keeps re
   }
 });
 
-/* ------------------------------------------------------------------------ */
 /* Symbolic links                                                            */
-/* ------------------------------------------------------------------------ */
 
 /**
  * Creates a symbolic link at `rel` inside `siteDir`, written relative to the
@@ -837,6 +945,43 @@ test('[AC-07][F-018] a symbolic link that stays inside the site resolves, as doe
         { attribute: 'href', value: 'notes.html#gone', reason: 'missing fragment' },
       ],
       `${dir}: ${formatProblems(problems)}`,
+    );
+  }
+});
+
+/* Hostile input                                                             */
+
+test('[AC-07][F-018] parseStartTags stays linear on markup left open a hundred thousand times', () => {
+  const count = 100000;
+  // A tag, quoted value or comment open at the end of the input is dropped,
+  // as a browser drops it, so none of these yields a start tag.
+  for (const opener of ['<a ', '<a x="', '<!--', '</a title="']) {
+    const tags = withinBound(`parseStartTags on ${JSON.stringify(opener)} x ${count}`, () =>
+      parseStartTags(opener.repeat(count)),
+    );
+    assert.deepEqual(tags, [], JSON.stringify(opener));
+  }
+  // Closed at last, the same run is one tag whose repeated attribute keeps its first value.
+  const closed = withinBound('parseStartTags on a closed run', () => parseStartTags(`${'<a '.repeat(count)}><b>`));
+  assert.deepEqual(
+    closed.map(({ name, attrs }) => ({ name, attrs })),
+    [
+      { name: 'a', attrs: { '<a': '' } },
+      { name: 'b', attrs: {} },
+    ],
+  );
+});
+
+test('[AC-07][F-018] the base path is normalised in linear time, however many slashes it holds', () => {
+  const siteDir = writeSite({ 'index.html': page(['<p>Home</p>']) });
+  const slashes = '/'.repeat(200000);
+  for (const baseurl of [`${slashes}x`, `x${slashes}`]) {
+    const pages = withinBound(`listHtmlPages with ${baseurl.length} base-path characters`, () =>
+      listHtmlPages(siteDir, baseurl),
+    );
+    assert.deepEqual(
+      pages.map(({ rel, urlPath }) => ({ rel, urlPath })),
+      [{ rel: 'index.html', urlPath: '/x/' }],
     );
   }
 });

@@ -1,4 +1,4 @@
-/* Cabrillo Coast LLC — unit proof of the visual runner's trailer scanner and Playwright environment (AC-16, F-018) */
+/* Cabrillo Coast LLC — unit proof of the visual runner's trailer scanner and git and Playwright environments (AC-16, F-018) */
 /**
  * `createTrailerScanner` in `tests/visual/run-visual.mjs` decides whether a
  * commit message in `<base>..HEAD` declares an intended visual change with a
@@ -25,7 +25,9 @@
  * runner prints and the blog-checks workflow uploads), make it open, add a
  * reporter or redirect the JSON results, while the runner's own inputs are
  * set, unrelated variables pass through and the caller's object is left as
- * it was.
+ * it was. It also proves that `gitEnv`, the environment of every git child,
+ * drops an inherited `JEKYLL_ENV` and sets `GIT_OPTIONAL_LOCKS=0` without
+ * changing `process.env`.
  *
  * Runs with `node --test tests/unit/run-visual.test.mjs` or as part of
  * `node --test "tests/**\/*.test.mjs"`. It needs no Jekyll build, no git, no
@@ -40,7 +42,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { createTrailerScanner, playwrightEnv } from '../visual/run-visual.mjs';
+import { createTrailerScanner, gitEnv, playwrightEnv } from '../visual/run-visual.mjs';
 
 /* ------------------------------------------------------------------------ */
 /* Constants                                                                 */
@@ -389,4 +391,29 @@ test('[AC-16][F-018] playwrightEnv sets the runner inputs and passes every unrel
     PLAYWRIGHT_HTML_OPEN: 'never',
   });
   assert.deepEqual(clean, { PATH: '/usr/bin' });
+});
+
+test('[AC-16][F-018] gitEnv removes JEKYLL_ENV and disables optional locks for every git child', () => {
+  const hadJekyllEnv = Object.hasOwn(process.env, 'JEKYLL_ENV');
+  const previousJekyllEnv = process.env.JEKYLL_ENV;
+  process.env.JEKYLL_ENV = 'production';
+  try {
+    const before = { ...process.env };
+    const env = gitEnv();
+
+    assert.equal(Object.hasOwn(env, 'JEKYLL_ENV'), false, 'JEKYLL_ENV never reaches git');
+    assert.equal(env.GIT_OPTIONAL_LOCKS, '0');
+    assert.equal(env.PATH, process.env.PATH, 'PATH passes through');
+    const expected = { ...before, GIT_OPTIONAL_LOCKS: '0' };
+    delete expected.JEKYLL_ENV;
+    assert.deepEqual(env, expected, 'nothing else is added or removed');
+
+    // A new object; the caller's environment is left exactly as it was.
+    assert.notEqual(env, process.env);
+    assert.equal(process.env.JEKYLL_ENV, 'production');
+    assert.deepEqual({ ...process.env }, before);
+  } finally {
+    if (hadJekyllEnv) process.env.JEKYLL_ENV = previousJekyllEnv;
+    else delete process.env.JEKYLL_ENV;
+  }
 });

@@ -2,41 +2,20 @@
 layout: null
 ---
 {%- comment -%}
-  Search index for the blog listing, rendered by Jekyll to /blog/search.json on every build.
-
-  Consumer: blog/search.js fetches this file once per page view and reads it with JSON.parse
-  only; it never writes any of it into the page as HTML.
-
-  Shape: one JSON array over site.posts, newest first (Jekyll's order). search.js uses the
-  array position as its tie-break order, so the order must not be changed here. Each entry
-  has exactly six keys, in this order: url, title, summary, tags, date, body. Every value
-  passes through jsonify (not escape), so titles such as  Escaping "quotes" & <angle>  stay
-  raw text inside valid JSON strings.
-
-  url is post.url passed through relative_url, the same string blog/index.html writes into
-  each listing item's data-url attribute; search.js joins index entries to listing items on
-  it, and it carries the base path in both deployment modes.
-
-  No filtering happens here. In every build without --drafts (GitHub Pages, the CI build and
-  local builds) drafts never reach site.posts. The local --drafts preview, and the fixture
-  builder's preview variant, do add drafts to site.posts and so to this index; that is
-  acceptable because the preview is served only on the author's machine and neither output
-  is published. Future-dated posts are left out of every build, the preview included, by
-  future: false in _config.yml.
-
-  body is the full rendered article text, code samples included:
-    1. strip_html removes the markup but keeps the character references kramdown emits.
-    2. The references are decoded: lt, gt, quot and #39 first, amp LAST, so literal entity
-       text shown in a code sample (double-encoded in the HTML) comes out as written, and a
-       body-only R&D is indexed as r&d rather than r&amp;d.
-    3. Whitespace is collapsed and the text lowercased.
-    4. split, uniq and join reduce the text to its distinct tokens in first-occurrence order.
-       Query terms never contain whitespace and ranking counts which fields contain a term,
-       not how often, so this changes no search result and roughly halves the index.
-
-  This block renders nothing, and its whitespace control keeps the output starting with the
-  opening bracket. Keep braces out of this comment, and add no HTML or JSON comments below:
-  either would make the output invalid JSON. With no published articles the output is [].
+  Entries are newest first (Jekyll's site.posts order); search.js uses array position as its
+  tie-break, so the order must not change. url is post.url | relative_url, the same string
+  blog/index.html writes into each listing item's data-url, which search.js joins on.
+  No filtering here: builds without --drafts (Pages, CI, local) never have drafts in site.posts.
+  Only the local --drafts preview, and the fixture builder's preview variant, add them; that is
+  acceptable because that output is served only on the author's machine and never published.
+  future: false leaves future-dated posts out of every build.
+  body decodes lt, gt, quot and #39 first and amp LAST, so literal entity text in code samples
+  survives as written and a body-only R&D indexes as r&d.
+  split, uniq and join keep distinct tokens in first-occurrence order. Query terms hold no
+  whitespace and ranking counts which fields contain a term, not how often, so results are
+  unchanged and the index roughly halves.
+  Keep braces out of this comment and add no HTML or JSON comments: either would make the
+  output invalid JSON. When site.posts is empty, the output is [].
 {%- endcomment -%}
 [{% for post in site.posts %}{% unless forloop.first %},{% endunless %}
 {"url":{{ post.url | relative_url | jsonify }},"title":{{ post.title | jsonify }},"summary":{{ post.summary | jsonify }},"tags":{{ post.tags | jsonify }},"date":{{ post.date | date_to_xmlschema | jsonify }},"body":{{ post.content | strip_html | replace: "&lt;", "<" | replace: "&gt;", ">" | replace: "&quot;", '"' | replace: "&#39;", "'" | replace: "&amp;", "&" | normalize_whitespace | downcase | split: " " | uniq | join: " " | jsonify }}}{% endfor %}]

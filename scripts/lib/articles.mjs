@@ -23,12 +23,14 @@
  *
  * How the Markdown scanners decide what is code: the live site is rendered by
  * kramdown 2.4.0 with GFM input, so a scanner that treats text as code when
- * kramdown does not would hide real markup. Text is therefore masked as code
- * only where both CommonMark and kramdown agree that it is code, and every
- * uncertain case is scanned as prose. A misjudgement can only produce a false
- * finding, which the author fixes by rewording, never a missed one. Each place
- * where these rules are narrower than plain CommonMark is commented below with
- * the kramdown behaviour that decided it.
+ * kramdown does not would hide real markup. Code is therefore located by
+ * kramdown's own rules, including those plain CommonMark lacks: a fence run
+ * may mix backticks and tildes, and inline code may close on part of a longer
+ * backtick run. Any construct whose reading is uncertain is scanned as prose.
+ * A misjudgement can only produce a false finding, which the author fixes by
+ * rewording, never a missed one. Each place where these rules differ from
+ * plain CommonMark is commented below with the kramdown behaviour that
+ * decided it.
  */
 
 import { posix } from 'node:path';
@@ -68,7 +70,12 @@ const SUMMARY_MAX = 200;
 const TAGS_MIN = 1;
 const TAGS_MAX = 5;
 
-/** Front-matter keys that Jekyll understands but this schema sets elsewhere. */
+/**
+ * Front-matter keys Jekyll understands that the schema rejects, each with its
+ * reason: `layout`, `permalink` and `date` are supplied elsewhere (the
+ * `_config.yml` defaults, its `permalink` and the filename), `published` is
+ * prohibited, and `categories` is replaced by `tags`.
+ */
 const REJECTED_KEY_REASONS = {
   published: 'published: is not allowed; keep unpublished drafts in the git-ignored _drafts/ folder',
   layout: 'layout: is not allowed; the layout is set by _config.yml defaults',
@@ -135,13 +142,14 @@ const KNOWN_HTML_ELEMENTS = new Set([
 /** Opening tags of elements that may run script, load content or change the page. */
 const UNSAFE_TAG_RE = /<(?:script|iframe|object|embed|form|base|meta|link|style)\b/gi;
 
-/** Start of an HTML tag. Markdown autolinks such as `<https://…>` do not match. */
-const TAG_START_RE = /<[a-zA-Z][a-zA-Z0-9-]*(?=[\s/>])/g;
-
 /** Start of a kramdown attribute list (`{: …}`, `{:#id}`, ALDs). */
 const IAL_START_RE = /\{:/g;
 
-/** Event-handler attribute inside a tag, and inside an attribute list (`g`: every one is reported). */
+/**
+ * Event-handler attribute inside a tag, and inside an attribute list. The `g`
+ * flag lets the scanner visit every match; findings are still reported one
+ * per line (`lineFindings`).
+ */
 const TAG_EVENT_ATTR_RE = /[\s"'/]on[a-z]+\s*=/gi;
 const IAL_EVENT_ATTR_RE = /[\s"'/:]on[a-z]+\s*=/gi;
 
@@ -155,22 +163,35 @@ const JS_SCHEME = 'j[\\t\\n\\r]*a[\\t\\n\\r]*v[\\t\\n\\r]*a[\\t\\n\\r]*s[\\t\\n\
   + 'r[\\t\\n\\r]*i[\\t\\n\\r]*p[\\t\\n\\r]*t\\s*:';
 
 /**
- * `javascript:` in Markdown URL positions: an inline link or image
- * destination `](`, a link definition `]:`, and an angle-bracket URL `<`.
+ * Where a Markdown URL can start: after an inline link or image destination
+ * `](`, a link definition `]:` (each optionally followed by whitespace and
+ * `<`), or an angle-bracket URL `<`. Matched in the source, so a delimiter is
+ * always a literal character: `&lt;javascript:x&gt;` is prose, not a URL.
+ */
+const MD_URL_START_RE = /\]\(\s*<?|\]:\s*<?|</g;
+
+/**
+ * `javascript:` at the start of a Markdown URL (sticky), tested where
+ * `MD_URL_START_RE` ends, in the body with its character references decoded:
+ * kramdown copies `&#106;avascript:`, `java&#x09;script:` or
+ * `javascript&colon;` into the `href` or `src` as written, and the browser
+ * decodes them there.
  *
  * The scheme is matched only where a URL can stand, never as a bare word, so
  * prose such as a heading "JavaScript: closures explained" does not block
- * publishing a technical article, while every way a URL can be written is
- * still caught.
+ * publishing a technical article. Only these literal Markdown URL positions
+ * are covered: a destination that Liquid generates is not evaluated here and
+ * is left to the scan of the rendered pages.
  */
-const JS_URL_MARKDOWN_RE = new RegExp(`(?:\\]\\(\\s*<?|\\]:\\s*<?|<)[\\s\\u0000-\\u001f]*${JS_SCHEME}`, 'gi');
+const JS_URL_DEST_RE = new RegExp(`[\\s\\u0000-\\u001f]*${JS_SCHEME}`, 'iy');
 
 /** Link text as kramdown counts brackets in it, one level of nesting deep. */
 const BRACKETED_TEXT = '(?:[^\\[\\]]|\\[[^\\[\\]]*\\])*';
 
 /**
  * `javascript:` after `=` (optionally quoted), applied inside tags and
- * attribute lists only (`g`: every one is reported).
+ * attribute lists only. The `g` flag lets the scanner visit every match;
+ * findings are still reported one per line (`lineFindings`).
  */
 const JS_URL_ATTR_RE = new RegExp(`=\\s*["']?[\\s\\u0000-\\u001f]*${JS_SCHEME}`, 'gi');
 
@@ -216,12 +237,6 @@ const RUBY_BLANK_LINE_RE = /^[ \t\v\f\r]*$/;
  * Matched within one paragraph (`paragraphSpans`).
  */
 const IMG_REFERENCE_RE = new RegExp(`!\\[(${BRACKETED_TEXT})\\](?:\\s*?\\[([^\\]]*)\\])?`, 'g');
-
-/**
- * Link reference definition `[id]: dest "title"`; like kramdown, `dest` runs
- * to the end of the line, spaces included, before an optional title.
- */
-const LINK_DEFINITION_RE = /^ {0,3}\[([^\]\n]+)\]:[ \t]*\n?[ \t]*(<[^>\n]*>|[^\n]*?\S)(?:(?:[ \t]*\n|[ \t]+)[ \t]*(["'])[^\n]*?\3)?[ \t]*$/gm;
 
 /** Raw HTML `<img …>` start. */
 const IMG_TAG_START_RE = /<img(?=[\s/>])/gi;
@@ -304,21 +319,20 @@ function isCalendarDate(s) {
   return t.getUTCFullYear() === year && t.getUTCMonth() === month - 1 && t.getUTCDate() === day;
 }
 
-/** Counts characters by code point, so an emoji or accented letter counts once. */
+/** Counts Unicode code points. */
 function charCount(s) {
   return [...s].length;
 }
 
-/** True for a string that is not empty after trimming. */
 function isFilled(v) {
   return typeof v === 'string' && v.trim() !== '';
 }
 
 /**
  * Returns `lineAt(offset)` for `text`: the 1-based line number of `offset`,
- * that is 1 plus the newlines before it. Line starts are indexed once and
- * searched in O(log n), so scanners stay linear however many findings a body
- * produces.
+ * that is 1 plus the newlines before it. Line starts are indexed once, in
+ * O(n) for a text of n characters, and each lookup is a binary search in
+ * O(log L) for its L lines.
  */
 function lineLocator(text) {
   const starts = [0];
@@ -483,9 +497,6 @@ function codePointText(cp, fallback) {
  * unmasked (a possible false finding), never mask prose. Inline code follows
  * kramdown's span parser on the lines every hypothesis reads as running text
  * (see "inline code" below).
- *
- * The model was checked against kramdown's own output on more than 140,000
- * generated documents: none had live markup masked.
  */
 
 /*
@@ -500,9 +511,18 @@ const RUBY_SPACE_CHAR_RE = /^[ \t\n\v\f\r]$/;
 const NCNAME = '[\\p{Alpha}_][-\\p{Alpha}\\p{Nd}._]*';
 const UNAME = `(?:${NCNAME}:)?${NCNAME}`;
 const RUBY_WORD = '[\\p{Alpha}\\p{M}\\p{Nd}\\p{Pc}]';
-/** kramdown `HTML_TAG_RE` (sticky). Groups: 1 name, 2 attributes, 5 the self-closing slash. */
+/**
+ * kramdown `HTML_TAG_RE` (sticky). Groups: 1 name, 2 attributes, 5 the
+ * self-closing slash. Of the ways kramdown's `\s*` after the name can split
+ * the whitespace there, only two can lead to a match: taking all of it, when
+ * `/>` or `>` follows, or all but its last character, which then begins the
+ * first attribute; every shorter split repeats that second attempt. Only
+ * those two are tried, which gives the same match and keeps whitespace runs
+ * from costing quadratic time.
+ */
 const KD_TAG_RE = new RegExp(
-  `<(?=(${UNAME}))\\1${RUBY_SPACE}*`
+  `<(?=(${UNAME}))\\1`
+  + `(?:${RUBY_SPACE}*(?=\\/?>)|(?:${RUBY_SPACE}(?=${RUBY_SPACE}))*(?=${RUBY_SPACE}(?!${RUBY_SPACE})))`
   + `((?:(?=(${RUBY_SPACE}+${UNAME}(?:${RUBY_SPACE}*=${RUBY_SPACE}*(?:${RUBY_WORD}+|(["'])[\\s\\S]*?\\4))?))\\3)*)`
   + `${RUBY_SPACE}*(\\/)?>`,
   'uy',
@@ -516,6 +536,8 @@ const KD_ATTRIBUTE_RE = new RegExp(
 );
 /** kramdown `AUTOLINK_START` (sticky); Ruby's `.` is anything but a line feed. */
 const KD_AUTOLINK_RE = /<(?:(?:mailto|https?|ftps?):[^\n]+?|[\p{Alpha}\p{Nd}\-_.]+?@[\p{Alpha}\p{Nd}\-_.]+?)>/uy;
+/** The schemes `KD_AUTOLINK_RE` accepts after the `<`, each with its colon. */
+const KD_AUTOLINK_SCHEMES = ['mailto:', 'https:', 'http:', 'ftps:', 'ftp:'];
 /** kramdown `HTML_RAW_START`: where raw HTML parsing looks for the next tag. */
 const KD_RAW_START_RE = /<(?=[\p{Alpha}_/?]|!--)/gu;
 /** kramdown `HTML_MARKDOWN_ATTR_MAP` values. */
@@ -524,12 +546,10 @@ const MARKDOWN_ATTR_MODES = new Set(['0', '1', 'span', 'block']);
 const BLANK_LINE_RE = /^[ \t]*$/;
 /** kramdown-parser-gfm `FENCED_CODEBLOCK_START`. */
 const FENCE_START_RE = /^ {0,3}([~`]{3,})/;
-/** Rest of an opening fence line: at most one word of info (kramdown's `\s*?(\S+?)?\s*?\n`). */
-const FENCE_TAIL_RE = /^[ \t\r\f\v]*[^ \t\r\n\f\v]*[ \t\r\f\v]*$/;
 /** kramdown `LIST_START_UL` / `LIST_START_OL`: indentation, marker, rest of the line. */
 const LIST_START_RE = /^( {0,3})(?:([+*-])|\d+\.)([\t| ].*)$/;
-/** kramdown `LIST_ITEM_IAL_CHECK`: an item whose first line is empty or only an IAL. */
-const LIST_ITEM_EMPTY_RE = /^[ \t]*(?:\{:(?![\w-]*:|\/)(?:\\\}|[^}])+\})?[ \t]*$/;
+/** The IAL of kramdown `LIST_ITEM_IAL_CHECK`, matched against the whole line without its surrounding spaces and tabs (see `isEmptyItemLine`). */
+const LIST_ITEM_IAL_RE = /^\{:(?![\w-]*:|\/)(?:\\\}|[^}])+\}$/;
 /** kramdown `HR_START`. */
 const HR_LINE_RE = /^ {0,3}([-*_])[ \t]*\1[ \t]*\1(?:\1|[ \t])*$/;
 /** kramdown `EOB_MARKER`. */
@@ -560,13 +580,20 @@ const MATH_BLOCK_RE = /^ {0,3}\\?\$\$/;
 /** Above this many open readings the model stops masking for the rest of the body. */
 const MAX_HYPOTHESES = 64;
 /**
- * Lines that searches for the end of a fence or block extension inside list
- * items may read, per line of the body and in all. Such a search reads the
- * lines through the item's extraction, which top-level indexes cannot
- * answer, so a body of unclosed openers would otherwise take quadratic time;
- * once the budget is spent the model stops masking for the rest of the body.
+ * Work that searches for the end of a fence or block extension may do, per
+ * line of the body, per character of it and in all. A search inside list
+ * items reads lines through the item's extraction, which top-level indexes
+ * cannot answer, and pays one unit per line read, and a fence search there
+ * one more per character it examines of a line that starts like a fence. A
+ * top-level fence search pays one unit per closing-fence-shaped line it
+ * visits. A fence search at either depth also pays one unit per character it
+ * compares with the opening run, so the per-character allowance lets a body
+ * with very long fence lines be read whole. A body of unclosed openers would
+ * otherwise take quadratic time; once the budget is spent the model stops
+ * masking for the rest of the body.
  */
 const LOOKAHEAD_PER_LINE = 64;
+const LOOKAHEAD_PER_CHAR = 4;
 const LOOKAHEAD_BASE = 65536;
 /** Scanning allowed to the inline-code walk, per character of text and in all. */
 const SPAN_WORK_PER_CHAR = 32;
@@ -594,8 +621,6 @@ const LIQUID_TAG_RE = /\{\{[^`<\n]*?\}\}|\{%[^`<\n]*?%\}/g;
 const STRIKE_END_RE = /[^ \t\n\v\f\r~]~~/g;
 /** kramdown `TABLE_LINE`: a line kramdown may read as a table row. */
 const TABLE_LINE_RE = /^\||[^\\]\|/;
-/** What Ruby's `String#strip` removes. */
-const RUBY_STRIP_RE = /^[\0\t\n\v\f\r ]+|[\0\t\n\v\f\r ]+$/g;
 /** Text after raw HTML on a line that could carry span markup on to the next line. */
 const RESUME_DANGER_RE = /[`<\]]|\$\$|\{:|~~/;
 
@@ -607,27 +632,67 @@ function leadingSpaces(s) {
   return /^ */.exec(s)[0].length;
 }
 
+/** `s` without its trailing spaces and tabs, read once from the end. */
+function trimSpaceTabEnd(s) {
+  let end = s.length;
+  while (end > 0 && (s[end - 1] === ' ' || s[end - 1] === '\t')) end -= 1;
+  return end === s.length ? s : s.slice(0, end);
+}
+
+/** True for the characters Ruby's `String#strip` removes: NUL, tab, line feed, vertical tab, form feed, carriage return and space. */
+function isRubyStripChar(c) {
+  return c === ' ' || c === '\t' || c === '\n' || c === '\v' || c === '\f' || c === '\r' || c === '\0';
+}
+
+/** `s` as Ruby's `String#strip` leaves it: without its leading and trailing `isRubyStripChar` characters, each read once. */
+function rubyStrip(s) {
+  let from = 0;
+  while (from < s.length && isRubyStripChar(s[from])) from += 1;
+  let to = s.length;
+  while (to > from && isRubyStripChar(s[to - 1])) to -= 1;
+  return s.slice(from, to);
+}
+
 /* ---- kramdown list extraction ------------------------------------------ */
+
+/**
+ * kramdown `LIST_ITEM_IAL_CHECK`: true when an item's first line, `content`,
+ * is empty or only an IAL between spaces and tabs. The spaces and tabs are
+ * stripped first, so time is linear in the line's length.
+ */
+function isEmptyItemLine(content) {
+  let from = 0;
+  while (from < content.length && (content[from] === ' ' || content[from] === '\t')) from += 1;
+  const core = trimSpaceTabEnd(content.slice(from));
+  return core === '' || LIST_ITEM_IAL_RE.test(core);
+}
 
 /**
  * The list item a line opens, following kramdown's `parse_first_list_line`:
  * `{ indent, kind, content }`, where `indent` is the content indentation
  * relative to the enclosing block and `content` the item's first line as its
- * content sees it. `m` is a `LIST_START_RE` match.
+ * content sees it. `m` is a `LIST_START_RE` match. kramdown expands the tabs
+ * in the leading whitespace of `content` one run at a time: the run's first
+ * tab reaches the next multiple of four columns, counting the marker and the
+ * indentation before it, and each further tab adds four. One pass over that
+ * whitespace gives the same width, so time is linear in the line's length.
  */
 function openItem(m) {
   const kind = m[2] ? 'bullet' : 'ordered';
   let indent = m[0].length - m[3].length;
   let content = m[3];
-  if (LIST_ITEM_EMPTY_RE.test(content)) {
+  if (isEmptyItemLine(content)) {
     indent = 4;
   } else {
-    while (/^ *\t/.test(content)) {
-      const temp = leadingSpaces(content) + indent;
-      const expand = (all, sp, tabs) => sp + ' '.repeat(4 - (temp % 4) + (tabs.length - 1) * 4);
-      content = content.replace(/^( *)(\t+)/, expand);
+    let width = 0;
+    let i = 0;
+    for (; i < content.length; i += 1) {
+      if (content[i] === ' ') width += 1;
+      else if (content[i] === '\t') width += 4 - ((width + indent) % 4);
+      else break;
     }
-    indent += leadingSpaces(content);
+    indent += width;
+    content = content.slice(i);
   }
   content = content.replace(/^\s*/, '');
   return { indent, kind, nested: LIST_START_RE.test(content), content };
@@ -743,68 +808,177 @@ function blockView(texts, index, items, depth) {
 
 /* ---- fences and raw HTML ----------------------------------------------- */
 
-/**
- * Line of the fence closing an opening line, following kramdown-parser-gfm
- * 1.1.0 `FENCED_CODEBLOCK_MATCH` exactly, or -1 when there is none. `view`
- * is the opening line as its block sees it; `next(j)` returns line `j` the
- * same way (`null` once the block has ended), and `misses`, given only when
- * every reading sees the same lines (the top level), remembers closing
- * patterns no later line matches. `charge`, given where no `misses` can be
- * kept (inside list items), is called before each line test and returns
- * false once the lookahead budget is spent; the result is then `null`
- * (unknown).
- *
- * kramdown's fence run `([~`]){3,}` can backtrack: a run of N characters may
- * act as a shorter run of k (3 ≤ k ≤ N) with the rest taken as info, so
- * "````" can close at "```". Each k is tried from N down, and for each the
- * first line holding the k-character prefix, more of its last character and
- * nothing else closes the fence.
- */
-function kramdownFenceClose(view, index, lineCount, next, misses = null, charge = null) {
-  const m = FENCE_START_RE.exec(view);
-  if (!m) return -1;
-  const run = m[1];
-  const after = view.slice(m[0].length);
-  // Lines are fetched only as far as a search needs them.
-  const seen = [];
-  let ended = false;
-  const viewAt = (i) => {
-    while (!ended && seen.length <= i) {
-      const j = index + 1 + seen.length;
-      const v = j < lineCount ? next(j) : null;
-      if (v === null) ended = true;
-      else seen.push(v);
-    }
-    return i < seen.length ? seen[i] : null;
-  };
-  for (let k = run.length; k >= 3; k -= 1) {
-    const prefix = run.slice(0, k);
-    if (!FENCE_TAIL_RE.test(run.slice(k) + after)) continue;
-    const close = new RegExp(`^ {0,3}${escapeRegExp(prefix)}${escapeRegExp(prefix[k - 1])}*[ \\t\\r\\f\\v]*$`);
-    const missFrom = misses?.get(close.source);
-    if (missFrom !== undefined && index + 1 >= missFrom) continue;
-    for (let i = 0; ; i += 1) {
-      if (charge !== null && !charge()) return null;
-      const v = viewAt(i);
-      if (v === null) {
-        // No line from here on closes such a fence; the same holds for any
-        // later opener reading the same lines.
-        misses?.set(close.source, Math.min(index + 1, missFrom ?? Infinity));
-        break;
-      }
-      if (close.test(v)) return index + 1 + i;
-    }
-  }
-  return -1;
+/** True for the whitespace kramdown-parser-gfm's fence patterns allow around info and after a closing run. */
+function isFenceSpace(c) {
+  return c === ' ' || c === '\t' || c === '\r' || c === '\f' || c === '\v';
 }
 
 /**
- * Charges one line read by a search inside list items to the body's
- * lookahead budget (`LOOKAHEAD_PER_LINE`); false once it is spent, and from
- * then on, with `ctx.exhausted` set.
+ * Whether `s` may follow the run kramdown-parser-gfm takes as an opening
+ * fence's (`\s*?(\S+?)?\s*?\n`): at most one word, with only spaces, tabs,
+ * carriage returns, form feeds and vertical tabs around it and no line feed.
+ * With `spaced` false no whitespace may come before the word, as when the
+ * last characters of the fence run begin it. Each character is read once.
  */
-function chargeLookahead(ctx) {
-  ctx.lookahead -= 1;
+function isFenceInfo(s, spaced) {
+  let i = 0;
+  if (spaced) while (i < s.length && isFenceSpace(s[i])) i += 1;
+  while (i < s.length && s[i] !== '\n' && !isFenceSpace(s[i])) i += 1;
+  while (i < s.length && isFenceSpace(s[i])) i += 1;
+  return i === s.length;
+}
+
+/**
+ * The run of a line shaped like a closing fence: up to three spaces, three
+ * or more `~` and backtick characters, then only the whitespace
+ * `isFenceSpace` accepts. Returns `{ from, to, repeat, read }`: the run is
+ * `v.slice(from, to)`, the repetition of its last character that ends it
+ * begins at `repeat`, and `read` counts the characters examined from the
+ * first that could belong to a run. Any other line gives `from` -1 (with
+ * `read`). Time is linear in `read`.
+ */
+function fenceCloseRun(v) {
+  let from = 0;
+  while (from < 3 && v[from] === ' ') from += 1;
+  let to = from;
+  while (to < v.length && (v[to] === '~' || v[to] === '`')) to += 1;
+  let end = to;
+  if (to - from >= 3) while (end < v.length && isFenceSpace(v[end])) end += 1;
+  if (to - from < 3 || end < v.length) return { from: -1, to: -1, repeat: -1, read: end - from };
+  let repeat = to - 1;
+  while (repeat > from && v[repeat - 1] === v[to - 1]) repeat -= 1;
+  return { from, to, repeat, read: end - from };
+}
+
+/**
+ * The lines of `texts` shaped like closing fences (see `fenceCloseRun`), as
+ * parallel arrays `{ lines, from, to, repeat }` in ascending line order.
+ * Built once per body, in time linear in its length, for the top level,
+ * where every line reads as written.
+ */
+function fenceCloseLines(texts) {
+  const out = { lines: [], from: [], to: [], repeat: [] };
+  for (let j = 0; j < texts.length; j += 1) {
+    const c = fenceCloseRun(texts[j]);
+    if (c.from === -1) continue;
+    out.lines.push(j);
+    out.from.push(c.from);
+    out.to.push(c.to);
+    out.repeat.push(c.repeat);
+  }
+  return out;
+}
+
+/**
+ * Line of the fence closing an opening line, following kramdown-parser-gfm
+ * 1.1.0 `FENCED_CODEBLOCK_MATCH` exactly; -1 when there is none, and null
+ * (unknown) once the body's lookahead budget (`LOOKAHEAD_PER_LINE`) is spent.
+ * `view` is the opening line as its block sees it. Inside list items
+ * `next(j)` returns line `j` the same way (`null` once the block has ended),
+ * read in increasing `j`, and each line read is charged to the budget. At
+ * the top level `next` is null: every line reads as written, so the search
+ * visits only the closing-fence-shaped lines of an index built once per body
+ * (`ctx.fenceCloses`), and `ctx.fenceMisses` remembers, per opening run,
+ * from which line on no line closes it, so a later opener with the same run
+ * reads nothing again. Every comparison is charged to the budget at either
+ * depth.
+ *
+ * kramdown's fence run `([~`]){3,}` can backtrack: a run of N characters may
+ * act as a shorter run of k (3 ≤ k ≤ N) with the rest taken as info, so
+ * "````" can close at "```". The rest of the opening line allows k = N when
+ * it is at most one word between whitespace, and every k < N when, in
+ * addition, no whitespace comes before that word, which the run's last
+ * N − k characters then begin. A line closes k when it holds up to three
+ * spaces, the run's first k characters, more of its k-th character and then
+ * only whitespace: for a line whose run shares p leading characters with
+ * the opener's and ends in a repetition starting at its (r + 1)-th
+ * character, exactly the k from max(3, r + 1) to p. The fence takes the
+ * longest allowed k that some line closes, and the first line closing it.
+ * One pass compares each line's run once, so time is linear in the lines
+ * read.
+ */
+function kramdownFenceClose(ctx, view, index, next) {
+  const m = FENCE_START_RE.exec(view);
+  if (m === null) return -1;
+  const run = m[1];
+  const n = run.length;
+  const after = view.slice(m[0].length);
+  let whole = isFenceInfo(after, true);
+  let shorter = n > 3 && isFenceInfo(after, false);
+  const known = next === null ? ctx.fenceMisses.get(run) : undefined;
+  if (known !== undefined) {
+    if (index + 1 >= known.whole) whole = false;
+    if (index + 1 >= known.shorter) shorter = false;
+  }
+  if (!whole && !shorter) return -1;
+  // The longest allowed k that line `v`, whose run is `v.slice(from, to)`
+  // ending in a repetition from `repeat`, closes (0 for none), charging
+  // `cost` units and each character compared; null once the budget is spent.
+  const longest = (v, from, to, repeat, cost) => {
+    const limit = Math.min(to - from, n);
+    let p = 0;
+    while (p < limit && v[from + p] === run[p]) p += 1;
+    if (!chargeLookahead(ctx, cost + p)) return null;
+    const low = Math.max(3, repeat - from + 1);
+    if (whole && p === n && low <= n) return n;
+    const k = shorter ? Math.min(p, n - 1) : 0;
+    return k >= low ? k : 0;
+  };
+  // The longest shorter k closed so far and the first line closing it.
+  let best = 0;
+  let bestAt = -1;
+  // Takes line `j`'s answer; true once nothing later can change the result.
+  const settled = (j, k) => {
+    if (k > best) {
+      best = k;
+      bestAt = j;
+    }
+    return k === n || (!whole && k === n - 1);
+  };
+  if (next === null) {
+    if (ctx.fenceCloses === null) ctx.fenceCloses = fenceCloseLines(ctx.texts);
+    const { lines, from, to, repeat } = ctx.fenceCloses;
+    for (let i = firstIndexAfter(lines, index); i < lines.length; i += 1) {
+      const j = lines[i];
+      const k = longest(ctx.texts[j], from[i], to[i], repeat[i], 1);
+      if (k === null) return null;
+      if (settled(j, k)) return j;
+    }
+    // Every later line was read: none closes the whole run when that was
+    // searched for, nor any shorter one when `best` is 0, and the same holds
+    // for any later opener with this run.
+    if (whole || (shorter && best === 0)) {
+      const entry = known ?? { whole: Infinity, shorter: Infinity };
+      if (whole) entry.whole = Math.min(entry.whole, index + 1);
+      if (shorter && best === 0) entry.shorter = Math.min(entry.shorter, index + 1);
+      ctx.fenceMisses.set(run, entry);
+    }
+    return bestAt;
+  }
+  for (let j = index + 1; j < ctx.texts.length; j += 1) {
+    if (!chargeLookahead(ctx)) return null;
+    const v = next(j);
+    if (v === null) break;
+    const c = fenceCloseRun(v);
+    if (c.from === -1) {
+      if (!chargeLookahead(ctx, c.read)) return null;
+      continue;
+    }
+    const k = longest(v, c.from, c.to, c.repeat, c.read);
+    if (k === null) return null;
+    if (settled(j, k)) return j;
+  }
+  return bestAt;
+}
+
+/**
+ * Charges `cost` units of work by a search for the end of a fence or block
+ * extension (a line read, or characters examined) to the body's lookahead
+ * budget (`LOOKAHEAD_PER_LINE`); false once it is spent, and from then on,
+ * with `ctx.exhausted` set.
+ */
+function chargeLookahead(ctx, cost = 1) {
+  ctx.lookahead -= cost;
   if (ctx.lookahead < 0) ctx.exhausted = true;
   return !ctx.exhausted;
 }
@@ -830,8 +1004,8 @@ function extensionStopLines(texts) {
   return { generic, named };
 }
 
-/** The first entry of the ascending `list` greater than `index`, or -1. */
-function firstAfter(list, index) {
+/** Position in the ascending `list` of its first entry greater than `index` (`list.length` when none), in O(log n). */
+function firstIndexAfter(list, index) {
   let lo = 0;
   let hi = list.length;
   while (lo < hi) {
@@ -839,7 +1013,13 @@ function firstAfter(list, index) {
     if (list[mid] <= index) lo = mid + 1;
     else hi = mid;
   }
-  return lo < list.length ? list[lo] : -1;
+  return lo;
+}
+
+/** The first entry of the ascending `list` greater than `index`, or -1. */
+function firstAfter(list, index) {
+  const at = firstIndexAfter(list, index);
+  return at < list.length ? list[at] : -1;
 }
 
 /**
@@ -1094,6 +1274,42 @@ function findIn(w, needle, from, to) {
 }
 
 /**
+ * Index of the first `ch` at or after `from` in `text`, or -1. `seen`
+ * (`{ from, at }`) holds the last answer computed and is reused for any
+ * `from` it still answers, so queries at increasing offsets read the text
+ * once in all.
+ */
+function nextIndex(seen, text, ch, from) {
+  if (seen.from === -1 || from < seen.from || (seen.at !== -1 && from > seen.at)) {
+    seen.from = from;
+    seen.at = text.indexOf(ch, from);
+  }
+  return seen.at;
+}
+
+/**
+ * Length of the kramdown autolink (`KD_AUTOLINK_RE`) at `w.text[p]`, or 0.
+ * After a scheme the link ends at the first `>` at least two characters past
+ * the colon, with no line feed before it; the next `>` and line feed are
+ * found through `w.ahead`, so a line full of unclosed `<https:` reads in
+ * linear time. The address form cannot read past a `<` and is matched
+ * directly.
+ */
+function autolinkLength(w, p) {
+  const t = w.text;
+  const scheme = KD_AUTOLINK_SCHEMES.find((s) => t.startsWith(s, p + 1));
+  if (scheme === undefined) {
+    KD_AUTOLINK_RE.lastIndex = p;
+    const m = KD_AUTOLINK_RE.exec(t);
+    return m === null ? 0 : m[0].length;
+  }
+  const rest = p + 1 + scheme.length;
+  const gt = nextIndex(w.ahead.gt, t, '>', rest + 1);
+  const lf = nextIndex(w.ahead.lf, t, '\n', rest);
+  return gt !== -1 && (lf === -1 || gt < lf) ? gt + 1 - p : 0;
+}
+
+/**
  * Charges `cost` characters of scanning to the walk and stops it once its
  * budget, proportional to the text's length, is spent: pathological text
  * then loses masking instead of taking quadratic time.
@@ -1218,12 +1434,20 @@ function spanRawEnd(w, from, to, name) {
   return -1;
 }
 
-/** kramdown `parse_span_html` (after `parse_autolink`) at a `<`. */
+/**
+ * kramdown `parse_span_html` (after `parse_autolink`) at a `<`. An autolink
+ * on a line every reading treats as running text, within that line, is
+ * noted in `w.autolinks` as `[line, start, end)`: kramdown certainly renders
+ * it as a link, not as a tag.
+ */
 function spanAngle(w, to, p) {
   const t = w.text;
-  KD_AUTOLINK_RE.lastIndex = p;
-  const auto = KD_AUTOLINK_RE.exec(t);
-  if (auto !== null && p + auto[0].length <= to) return consumeSpan(w, p + auto[0].length, to);
+  const auto = autolinkLength(w, p);
+  if (auto > 0 && p + auto <= to) {
+    const end = consumeSpan(w, p + auto, to);
+    if (!w.stopped && w.info[w.line].trusted) w.autolinks.push([w.line, p, end]);
+    return end;
+  }
   const after = p + 1 < to ? String.fromCodePoint(t.codePointAt(p + 1)) : '';
   if (!(SPAN_HTML_NEXT_RE.test(after) || t.startsWith('!--', p + 1))) {
     // Not HTML: `<<` is a typographic symbol, which hides its second `<`.
@@ -1450,7 +1674,9 @@ function walkText(text) {
     lineEnd: 0,
     stopped: false,
     codes: [],
+    autolinks: [],
     misses: new Map(),
+    ahead: { gt: { from: -1, at: -1 }, lf: { from: -1, at: -1 } },
     work: SPAN_WORK_PER_CHAR * text.length + SPAN_WORK_BASE,
   };
   walkSpans(w, 0, text.length);
@@ -1468,11 +1694,12 @@ function walkText(text) {
  * own. A lone backtick that opens a trimmed cell before whitespace is then
  * literal, so such a cell renders the HTML inside it (verified). Each cell is
  * rebuilt the same way and walked, and a span is kept only when its rewrite
- * is code there.
+ * is code there. The row's trailing spaces and tabs and each cell's
+ * surrounding `rubyStrip` characters are removed in one pass each.
  */
 function tableRowCodes(text, codes) {
   if (text.includes('<code')) return [];
-  const row = text.replace(/[ \t]+$/, '');
+  const row = trimSpaceTabEnd(text);
   const spans = [];
   for (let i = 0; i < row.length;) {
     if (row[i] !== '`') {
@@ -1519,7 +1746,7 @@ function tableRowCodes(text, codes) {
   }
   addRaw(row.slice(from));
   const cellCodes = cells.map((cell) => {
-    const trimmed = cell.replace(RUBY_STRIP_RE, '');
+    const trimmed = rubyStrip(cell);
     const lead = cell.length - cell.replace(/^[\0\t\n\v\f\r ]+/, '').length;
     return new Set(walkText(trimmed).codes.map(([, a, b]) => `${a + lead},${b + lead}`));
   });
@@ -1534,8 +1761,11 @@ function tableRowCodes(text, codes) {
  * as `[line, start, end)` with columns into each line's text. `info[j]`
  * holds whether line `j` is certainly running text (`trusted`) and the
  * column where block parsing resumed after raw HTML on it (`resume`, or -1).
+ * The autolinks kramdown certainly renders as links (see `spanAngle`) are
+ * added to `autolinks` in the same form; on a line kramdown may read as a
+ * table row, only those holding no `|`, where it splits the row into cells.
  */
-function runCodeSpans(texts, info, s, e) {
+function runCodeSpans(texts, info, s, e, autolinks) {
   const starts = [];
   let length = 0;
   for (let j = s; j <= e; j += 1) {
@@ -1551,10 +1781,21 @@ function runCodeSpans(texts, info, s, e) {
     lineEnd: 0,
     stopped: false,
     codes: [],
+    autolinks: [],
     misses: new Map(),
+    ahead: { gt: { from: -1, at: -1 }, lf: { from: -1, at: -1 } },
     work: SPAN_WORK_PER_CHAR * length + SPAN_WORK_BASE,
   };
   walkSpans(w, 0, w.text.length);
+  const tableLines = new Map();
+  const isTableLine = (k) => {
+    if (!tableLines.has(k)) tableLines.set(k, TABLE_LINE_RE.test(w.texts[k]));
+    return tableLines.get(k);
+  };
+  for (const [k, a, b] of w.autolinks) {
+    if (isTableLine(k) && w.text.slice(a, b).includes('|')) continue;
+    autolinks.push([s + k, a - starts[k], b - starts[k]]);
+  }
   const out = [];
   const byLine = new Map();
   for (const [k, a, b] of w.codes) {
@@ -1568,20 +1809,26 @@ function runCodeSpans(texts, info, s, e) {
   return out;
 }
 
-/** Inline code regions of every run of lines between blank lines and fences. */
+/**
+ * Inline code regions of every run of lines between blank lines and fences.
+ * The autolinks the same walks find are added to `ctx.autolinks` as
+ * `{ start, end }` offsets in the body.
+ */
 function inlineCodeRegions(ctx, info) {
   const { lines, texts } = ctx;
   const out = [];
+  const autolinks = [];
   const isBreak = (j) => info[j].code || BLANK_LINE_RE.test(texts[j]);
   for (let s = 0; s < info.length; s += 1) {
     if (isBreak(s)) continue;
     let e = s;
     while (e + 1 < info.length && !isBreak(e + 1)) e += 1;
-    for (const [line, a, b] of runCodeSpans(texts, info, s, e)) {
+    for (const [line, a, b] of runCodeSpans(texts, info, s, e, autolinks)) {
       out.push({ start: lines[line].start + a, end: lines[line].start + b, kind: 'inline' });
     }
     s = e;
   }
+  for (const [line, a, b] of autolinks) ctx.autolinks.push({ start: lines[line].start + a, end: lines[line].start + b });
   return out;
 }
 
@@ -1742,19 +1989,19 @@ function blockLine(r, index, view, fresh, ctx) {
   // Fenced code. A search the lookahead budget cut short leaves the line
   // uncertain, and `findCodeRegions` stops masking after it.
   if (FENCE_START_RE.test(view)) {
-    const misses = depth === 0 ? ctx.fenceMisses : null;
-    const charge = depth === 0 ? null : () => chargeLookahead(ctx);
-    const close = kramdownFenceClose(view, index, texts.length, blockView(texts, index, r.items, depth), misses, charge);
+    const close = kramdownFenceClose(ctx, view, index, depth === 0 ? null : blockView(texts, index, r.items, depth));
     if (close === null) return [lazyTextStep(r)];
     if (close === -1) return [textStep({ ...r, para: true })];
     const opened = skip(r, close, 'code');
     if (!r.lazy || fresh) return [opened];
     // A fence in a lazy run may be swallowed by the block before it; it may
-    // also be a top-level fence if the run is not what it seems.
+    // also be a top-level fence if the run is not what it seems. When the
+    // budget cuts that search short, the text reading below already keeps
+    // the line uncertain and masking stops after it.
     const out = [opened];
     if (depth > 0) {
-      const top = kramdownFenceClose(texts[index], index, texts.length, (j) => texts[j], ctx.fenceMisses);
-      if (top !== -1 && top !== close) out.push(skip({ ...r, items: [] }, top, 'code'));
+      const top = kramdownFenceClose(ctx, texts[index], index, null);
+      if (top !== null && top !== -1 && top !== close) out.push(skip({ ...r, items: [] }, top, 'code'));
     }
     out.push(lazyTextStep(r));
     return out;
@@ -1808,7 +2055,13 @@ function blockLine(r, index, view, fresh, ctx) {
 
 /**
  * Code regions of a Markdown body, as sorted, non-overlapping
- * `{ start, end, kind: 'fence' | 'inline' }` offsets into `body`.
+ * `{ start, end, kind: 'fence' | 'inline' }` offsets into `body`. When
+ * `found` is given, `found.autolinks` is set to the `{ start, end }` offsets
+ * of the autolinks kramdown certainly renders as links (see `spanAngle`), in
+ * the same lines and under the same rules as inline code, and
+ * `found.trustedLines` to the set of start offsets of the lines every reading
+ * treats as running text outside a lazy run (never raw HTML, code or the
+ * content of an extension).
  *
  * - Fenced blocks span whole lines, opening and closing fence included. A
  *   fence must be closed; CommonMark would run an unclosed fence to the end,
@@ -1834,23 +2087,25 @@ function blockLine(r, index, view, fresh, ctx) {
  *   after it, and kramdown reads a lone carriage return as a line break; in
  *   either case nothing from that point on is treated as code.
  * - When more readings stay open than `MAX_HYPOTHESES`, nothing after the
- *   line is treated as code. When a search for the end of a fence or
- *   extension inside list items finds the lookahead budget
+ *   line is treated as code. When a search for the end of a fence (at any
+ *   depth) or of an extension inside list items finds the lookahead budget
  *   (`LOOKAHEAD_PER_LINE`) spent, the line itself is left uncertain too and
  *   nothing after it is treated as code: an unknown end could shift every
  *   later pairing.
  */
-function findCodeRegions(body) {
+function findCodeRegions(body, found = null) {
   const lines = splitLines(body);
   const texts = lines.map((line) => stripCr(line.text));
   const ctx = {
     body,
     lines,
     texts,
+    autolinks: [],
     budget: 0,
     fenceMisses: new Map(),
+    fenceCloses: null,
     extensionStops: null,
-    lookahead: LOOKAHEAD_PER_LINE * lines.length + LOOKAHEAD_BASE,
+    lookahead: LOOKAHEAD_PER_LINE * lines.length + LOOKAHEAD_PER_CHAR * body.length + LOOKAHEAD_BASE,
     exhausted: false,
   };
   const loneCr = body.search(/\r(?!\n)/);
@@ -1897,6 +2152,11 @@ function findCodeRegions(body) {
   }
   closeCode(info.length - 1);
   for (const region of inlineCodeRegions(ctx, info)) regions.push(region);
+  if (found !== null) {
+    found.autolinks = ctx.autolinks.sort((a, b) => a.start - b.start);
+    found.trustedLines = new Set();
+    for (let k = 0; k < info.length; k += 1) if (info[k].trusted) found.trustedLines.add(lines[k].start);
+  }
   return regions.sort((a, b) => a.start - b.start);
 }
 
@@ -2015,7 +2275,10 @@ function markupOutsideCode(body, masked, tagRe, withLists = false) {
 const FM_DELIMITER_RE = /^---[ \t]*$/;
 const FM_BLANK_RE = /^[ \t]*$/;
 const FM_COMMENT_RE = /^[ \t]*#/;
-const FM_KEY_RE = /^([a-z_][a-z0-9_]*):(?:[ \t]+(.*?))?[ \t]*$/;
+/** The `key:` that opens a `key: value` line (see `readKeyLine`). Group 1: the key. */
+const FM_KEY_RE = /^([a-z_][a-z0-9_]*):/;
+/** The characters a front-matter value may not hold: JavaScript's line terminators. */
+const FM_LINE_TERMINATOR_RE = /[\n\r\u2028\u2029]/;
 const FM_TRAILER_RE = /^(?:[ \t]*|[ \t]+#.*)$/;
 const FLOW_BARE_ITEM_RE = /[^,[\]{}"'#]+/y;
 const NOT_CLOSED_QUOTE = 'a double-quoted string must close on the same line';
@@ -2056,6 +2319,26 @@ const YAML_TIME_RE = new RegExp(
 /** Defines an own enumerable property, so a key such as `__proto__` cannot alter the prototype. */
 function setOwn(target, key, value) {
   Object.defineProperty(target, key, { value, enumerable: true, writable: true, configurable: true });
+}
+
+/**
+ * Reads a front-matter line as `key: value`: a lowercase key, a colon, and
+ * then either nothing or a space or tab followed by the value. Returns
+ * `{ key, value }`, with the value stripped of the spaces and tabs around it
+ * (`''` when nothing else follows the colon), or null when the line is not
+ * of that form or its value holds a line terminator (`\n`, `\r`, U+2028 or
+ * U+2029). Each character is read at most twice, so time is linear in the
+ * line's length.
+ */
+function readKeyLine(line) {
+  const m = FM_KEY_RE.exec(line);
+  if (m === null) return null;
+  const rest = line.slice(m[0].length);
+  if (rest !== '' && rest[0] !== ' ' && rest[0] !== '\t') return null;
+  if (FM_LINE_TERMINATOR_RE.test(rest)) return null;
+  let from = 0;
+  while (from < rest.length && (rest[from] === ' ' || rest[from] === '\t')) from += 1;
+  return { key: m[1], value: trimSpaceTabEnd(rest.slice(from)) };
 }
 
 /**
@@ -2161,7 +2444,7 @@ function readFlowList(s) {
       // handles; any such character is reported rather than dereferenced.
       if (m === null) return { error: `unexpected ${JSON.stringify(c)} in a flow list` };
       // YAML trims only spaces and tabs, so a no-break space stays in the tag.
-      const item = m[0].replace(/[ \t]+$/, '');
+      const item = trimSpaceTabEnd(m[0]);
       const kind = plainScalarKind(item);
       if (kind !== null) {
         return { error: `bare ${item} in a flow list is read by YAML as ${kind}, not text; write "${item}"` };
@@ -2215,9 +2498,29 @@ function parseValue(key, raw) {
   }
   // A plain value: dates (`2026-02-10`) and anything else are kept as the raw
   // string, so `published: false` yields 'false' for the schema to reject.
-  const bare = raw.replace(/[ \t]+#.*$/, '').trim();
+  const bare = withoutPlainComment(raw).trim();
   if (bare === '') return { error: `${key} has no value` };
   return { value: bare };
+}
+
+/**
+ * A plain value `raw` without its trailing comment: everything from the
+ * first run of spaces or tabs that is followed by `#` with no line
+ * terminator (`\n`, `\r`, U+2028, U+2029) after that `#` is removed, and
+ * `raw` is returned whole when there is no such run. Each character is read
+ * at most twice, so time is linear in the value's length.
+ */
+function withoutPlainComment(raw) {
+  let from = raw.length;
+  while (from > 0 && !'\n\r\u2028\u2029'.includes(raw[from - 1])) from -= 1;
+  for (let i = from; i < raw.length; i += 1) {
+    if (raw[i] !== ' ' && raw[i] !== '\t') continue;
+    let j = i;
+    while (j < raw.length && (raw[j] === ' ' || raw[j] === '\t')) j += 1;
+    if (raw[j] === '#') return raw.slice(0, i);
+    i = j;
+  }
+  return raw;
 }
 
 /**
@@ -2252,9 +2555,11 @@ function parseValue(key, raw) {
  *
  * @param {string} text Full article source.
  * @returns {{ data: Record<string, string | string[]>, body: string, errors: string[] }}
- *   `data` is a plain object. `errors` name the 1-based file line, as in
- *   `front matter line 3: title must be a double-quoted string`, and carry no
- *   path prefix; the caller adds it.
+ *   `data` is a plain object. An error about one front-matter line names its
+ *   1-based file line, as in
+ *   `front matter line 3: title must be a double-quoted string`; an error
+ *   about the whole file (missing or unclosed front matter) names no line.
+ *   No error carries a path prefix; the caller adds it.
  */
 export function parseArticle(text) {
   const src = asText(text, 'text');
@@ -2282,15 +2587,15 @@ export function parseArticle(text) {
     const line = stripCr(lines[i].text);
     const n = i + 1;
     if (FM_BLANK_RE.test(line) || FM_COMMENT_RE.test(line)) continue;
-    const m = FM_KEY_RE.exec(line);
+    const m = readKeyLine(line);
     if (m) {
-      const key = m[1];
+      const { key } = m;
       if (seen.has(key)) {
         errors.push(`front matter line ${n}: duplicate key ${key}`);
         continue;
       }
       seen.add(key);
-      const parsed = parseValue(key, m[2] ?? '');
+      const parsed = parseValue(key, m.value);
       if (parsed.error) errors.push(`front matter line ${n}: ${parsed.error}`);
       else setOwn(data, key, parsed.value);
     } else if (/^[ \t]/.test(line)) {
@@ -2423,14 +2728,18 @@ function preview(src) {
 /**
  * Attributes of one tag as a `Map` of lowercase name to entity-decoded value
  * (`''` for an attribute without a value). The first occurrence of a name
- * wins, as in browsers.
+ * wins, as in browsers; kramdown renders the last one instead, so each name
+ * that occurs again is added to `repeated` when it is given.
  */
-function readAttributes(source) {
+function readAttributes(source, repeated) {
   const attrs = new Map();
   const inner = source.replace(/^<[a-zA-Z][a-zA-Z0-9-]*/, '').replace(/\/?>$/, '');
   for (const m of inner.matchAll(ATTR_RE)) {
     const name = m[1].toLowerCase();
-    if (attrs.has(name)) continue;
+    if (attrs.has(name)) {
+      repeated?.add(name);
+      continue;
+    }
     const raw = m[2] ?? m[3] ?? m[4];
     attrs.set(name, raw === undefined ? '' : decodeEntities(raw));
   }
@@ -2438,24 +2747,486 @@ function readAttributes(source) {
 }
 
 /**
+ * Attribute-list work `imageAttributeLists` may spend, per character of the
+ * body and in all. Overlapping lists (`'{:a: '.repeat(n) + '}'`) all end at
+ * the same `}`, and every image may name the same definitions, so reading
+ * each list for each image could take quadratic time.
+ */
+const ATTRIBUTE_LIST_WORK_PER_CHAR = 4;
+const ATTRIBUTE_LIST_WORK_BASE = 65536;
+
+/** kramdown's attribute and ALD name `ALD_ID_NAME` (Ruby's `\w` is ASCII, as here), sticky. */
+const LIST_NAME_AT_RE = /\w[\w-]*/y;
+
+/** The `name:` that starts the text of an ALD definition `{:name: …}`, sticky. */
+const ALD_NAME_AT_RE = /(\w[\w-]*):/y;
+
+/** A quote that can close an attribute-list value: one followed by Ruby whitespace or the end. */
+const LIST_VALUE_CLOSE_RE = /["'](?=[ \t\n\v\f\r]|$)/g;
+
+/** Text of a span extension tag `{::name}`, `{::name …}` or self-closing `{::name …/}` (kramdown `EXT_START_STR`). */
+const SPAN_EXTENSION_TAG_RE = /^:(\w+)(?:[ \t\n\v\f\r][\s\S]*|\/)?$/;
+
+/** Text of a span extension stop tag `{:/}` or `{:/name}`, which kramdown renders as text after an image. */
+const SPAN_EXTENSION_STOP_RE = /^\/(?:\w[\w-]*)?$/;
+
+/** The extensions kramdown knows; it renders any other `{::name}` as text. */
+const KNOWN_EXTENSIONS = new Set(['comment', 'nomarkdown', 'options']);
+
+const LIST_ESCAPES = 'attribute list on the image cannot be checked; remove its backslash escapes';
+const LIST_OPTIONS = 'attribute list on the image cannot be checked after {::options} with content; write {::options … /}';
+const LIST_BUDGET = 'too many attribute lists to check; simplify the markup';
+
+/**
+ * Reads the text of a kramdown attribute list (between `{:` and `}`, or after
+ * an ALD's `name:`) as `parse_attribute_list` in kramdown 2.4.0 does. Items
+ * start at the beginning or after whitespace and end before whitespace or the
+ * end, and the scan resumes where an item ended. `key="value"` or
+ * `key='value'` sets an attribute: its value runs to the first matching quote
+ * that whitespace or the end follows, so it may hold spaces and other quotes
+ * but not U+0002 (kramdown's `[^\}\2]` is an octal escape, not a
+ * back-reference), and a quoted value never starts an item. A bare name
+ * refers to an ALD; an unquoted value, `#id` and `.class` set nothing an
+ * image check needs. Returns `{ pairs, refs }`: `[key, value]` in order, with
+ * keys as written, and the names referred to. Returns `null` for text holding
+ * a backslash, whose `\}` and `\"` escapes also move where kramdown ends the
+ * list and the value.
+ */
+function parseAttributeList(text) {
+  if (text.includes('\\')) return null;
+  const pairs = [];
+  const refs = [];
+  const closers = { '"': [], "'": [] };
+  for (const m of text.matchAll(LIST_VALUE_CLOSE_RE)) closers[m[0]].push(m.index);
+  const next = { '"': 0, "'": 0 };
+  const barriers = [];
+  for (let k = text.indexOf('\u0002'); k !== -1; k = text.indexOf('\u0002', k + 1)) barriers.push(k);
+  let barrier = 0;
+  let resume = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    if (i > 0 && (i - 1 < resume || !RUBY_SPACE_CHAR_RE.test(text[i - 1]))) continue;
+    LIST_NAME_AT_RE.lastIndex = i;
+    const name = LIST_NAME_AT_RE.exec(text);
+    if (name === null) continue;
+    const after = i + name[0].length;
+    const quote = text[after + 1];
+    if (text[after] === '=' && (quote === '"' || quote === "'")) {
+      // Value starts only grow, so the first closer and U+0002 at or after each one are found by moving forward.
+      const list = closers[quote];
+      while (next[quote] < list.length && list[next[quote]] < after + 2) next[quote] += 1;
+      while (barrier < barriers.length && barriers[barrier] < after + 2) barrier += 1;
+      if (next[quote] < list.length
+        && (barrier === barriers.length || list[next[quote]] < barriers[barrier])) {
+        const close = list[next[quote]];
+        pairs.push([name[0], text.slice(after + 2, close)]);
+        resume = close + 1;
+        i = close;
+        continue;
+      }
+    }
+    if (after === text.length || RUBY_SPACE_CHAR_RE.test(text[after])) refs.push(name[0]);
+  }
+  return { pairs, refs };
+}
+
+/**
+ * The kramdown attribute lists of a body that can set attributes of its
+ * images, read as kramdown 2.4.0 applies them:
+ *   - `spanLists(end)`: the span IALs that start right where an image ends,
+ *     chained, as kramdown applies `{: .a}{: src="…"}` to the image both
+ *     times; a self-closing extension tag (`{::comment /}`) adds no element,
+ *     so the chain goes on after it;
+ *   - `definitionLists(start, end)`: the block IALs on the lines right after
+ *     and right before a link definition whose lines run from `start` to
+ *     `end`, which kramdown applies to every image that uses the definition;
+ *   - `blockListsStart(start)`: the start of the first of the block IAL
+ *     lines directly before the line starting at `start`, or `start`;
+ *   - `effect(lists)`: what such lists give an image, through every ALD
+ *     (`{:name: …}`) they name, every definition of that name and the names
+ *     those name in turn, as `{ srcs, alts, srcset, problem }`: the `src`
+ *     and `alt` values set, in any letter case, whether `srcset` is set, and
+ *     a message when the lists cannot be read with certainty.
+ * A list runs from a `{:` outside code to the first `}` after it, read from
+ * the original text, as kramdown matches it there. Where this reading could
+ * differ from kramdown's it reports `problem` rather than guess: a list
+ * holding a backslash, as kramdown's `\}` escape moves its end; an
+ * `{::options}` block with content, after which kramdown goes on applying
+ * lists to the image; and work beyond `ATTRIBUTE_LIST_WORK_PER_CHAR`. ALD
+ * definitions count wherever they stand outside code (kramdown also reads
+ * them in blockquotes and list items, and resolves them after the whole
+ * body is parsed); one that kramdown would not read only adds values to
+ * check.
+ */
+function imageAttributeLists(body, masked) {
+  const ends = new Map();
+  const alds = new Map();
+  const braces = [];
+  for (let k = body.indexOf('}'); k !== -1; k = body.indexOf('}', k + 1)) braces.push(k);
+  let b = 0;
+  for (let s = masked.indexOf('{:'); s !== -1; s = masked.indexOf('{:', s + 2)) {
+    while (b < braces.length && braces[b] < s + 2) b += 1;
+    // No later `{:` closes either.
+    if (b === braces.length) break;
+    ends.set(s, braces[b]);
+    ALD_NAME_AT_RE.lastIndex = s + 2;
+    const ald = ALD_NAME_AT_RE.exec(body);
+    if (ald !== null) {
+      if (!alds.has(ald[1])) alds.set(ald[1], []);
+      alds.get(ald[1]).push([s + 2 + ald[0].length, braces[b]]);
+    }
+  }
+
+  let work = ATTRIBUTE_LIST_WORK_PER_CHAR * body.length + ATTRIBUTE_LIST_WORK_BASE;
+  const parsed = new Map();
+  const read = ([from, to]) => {
+    if (!parsed.has(from)) {
+      work -= to - from;
+      const list = work < 0 ? { problem: LIST_BUDGET } : parseAttributeList(body.slice(from, to));
+      parsed.set(from, list ?? { problem: LIST_ESCAPES });
+    }
+    return parsed.get(from);
+  };
+
+  const chains = new Map();
+  const spanLists = (end) => {
+    if (chains.has(end)) return chains.get(end);
+    const chain = { lists: [], problem: undefined };
+    for (let s = end; ends.has(s);) {
+      const close = ends.get(s);
+      work -= close + 1 - s;
+      if (work < 0) {
+        chain.problem = LIST_BUDGET;
+        break;
+      }
+      const text = body.slice(s + 2, close);
+      // `{:}` and stop tags are text, and lists after text apply to nothing.
+      if (text === '' || SPAN_EXTENSION_STOP_RE.test(text)) break;
+      if (text.includes('\\')) {
+        chain.problem = LIST_ESCAPES;
+        break;
+      }
+      const extension = SPAN_EXTENSION_TAG_RE.exec(text);
+      if (extension === null) {
+        chain.lists.push([s + 2, close]);
+      } else if (!KNOWN_EXTENSIONS.has(extension[1])) {
+        break;
+      } else if (!text.endsWith('/')) {
+        // A comment or raw element now follows the image; `options` adds none.
+        if (extension[1] === 'options') chain.problem = LIST_OPTIONS;
+        break;
+      }
+      s = close + 1;
+    }
+    chains.set(end, chain);
+    return chain;
+  };
+
+  // The block IALs: a list that opens the content of its line (`containerContentStart`) and is
+  // followed on the line of its `}` by whitespace only. `{:}` is text, `{::…}` and `{:/…}` are
+  // extensions, and `{:name: …}` is read as an ALD first. Each is found by the start of its line
+  // (`byLine`) and by the start of the line after its `}` (`byNext`).
+  const byLine = new Map();
+  const byNext = new Map();
+  let lineStart = 0;
+  let lineEnd = -1;
+  let content = -1;
+  for (const [s, close] of ends) {
+    if (s > lineEnd) {
+      lineStart = body.lastIndexOf('\n', s - 1) + 1;
+      const nl = body.indexOf('\n', s);
+      lineEnd = nl === -1 ? body.length : nl;
+      content = containerContentStart(body, lineStart, lineEnd).at;
+    }
+    if (s !== content || close === s + 2 || body[s + 2] === ':' || body[s + 2] === '/') continue;
+    ALD_NAME_AT_RE.lastIndex = s + 2;
+    if (ALD_NAME_AT_RE.test(body)) continue;
+    const nl = body.indexOf('\n', close);
+    const rest = body.slice(close + 1, nl === -1 ? body.length : nl);
+    if (!RUBY_BLANK_LINE_RE.test(rest)) continue;
+    const list = { range: [s + 2, close], lineStart, next: nl === -1 ? -1 : nl + 1 };
+    byLine.set(lineStart, list);
+    if (list.next !== -1) byNext.set(list.next, list);
+  }
+
+  const definitionLists = (start, end) => {
+    const lists = [];
+    // kramdown applies the block IALs right after a definition to it, and those right before it
+    // when nothing before them takes them, as a blank line or another IAL does not; here the
+    // lines before are taken whenever they are there.
+    const nl = body.indexOf('\n', end);
+    for (let at = nl === -1 ? -1 : nl + 1; byLine.has(at);) {
+      const list = byLine.get(at);
+      lists.push(list.range);
+      at = list.next;
+    }
+    for (let at = start; byNext.has(at);) {
+      const list = byNext.get(at);
+      lists.push(list.range);
+      at = list.lineStart;
+    }
+    return lists;
+  };
+
+  // The start of the first line of the block IALs that directly precede the line starting at
+  // `start`, or `start` when none does.
+  const blockListsStart = (start) => {
+    let at = start;
+    while (byNext.has(at)) at = byNext.get(at).lineStart;
+    return at;
+  };
+
+  const effect = (lists) => {
+    const result = { srcs: [], alts: [], srcset: false, problem: undefined };
+    const named = new Set();
+    const queue = [...lists];
+    for (let q = 0; q < queue.length; q += 1) {
+      const list = read(queue[q]);
+      if (list.problem !== undefined) {
+        result.problem = list.problem;
+        break;
+      }
+      work -= 1 + list.pairs.length + list.refs.length;
+      if (work < 0) {
+        result.problem = LIST_BUDGET;
+        break;
+      }
+      for (const [key, value] of list.pairs) {
+        const name = key.toLowerCase();
+        if (name === 'src') result.srcs.push(value);
+        else if (name === 'alt') result.alts.push(value);
+        else if (name === 'srcset') result.srcset = true;
+      }
+      // kramdown ignores a name nothing defines.
+      for (const ref of list.refs) {
+        if (named.has(ref) || !alds.has(ref)) continue;
+        named.add(ref);
+        for (const definition of alds.get(ref)) queue.push(definition);
+      }
+    }
+    return result;
+  };
+
+  return { spanLists, definitionLists, blockListsStart, effect };
+}
+
+/** A character JavaScript's `\s` matches. */
+const JS_WHITESPACE_RE = /\s/;
+
+/** A line terminator as a multiline regular expression's `^` and `$` read it. */
+function isLineTerminator(c) {
+  return c === '\n' || c === '\r' || c === '\u2028' || c === '\u2029';
+}
+
+/**
+ * Link reference definitions `[id]: dest "title"` in `text`, in order, as
+ * `{ start, end, label, dest }`: `label` and `dest` are `[start, end)` spans
+ * and `end` is where the definition's line ends. Like kramdown, `dest` runs
+ * to the end of the line, spaces included, before an optional title; it may
+ * stand on the line after `]:`, and the title on the line after `dest`.
+ *
+ * The result is exactly that of matching
+ * `/^ {0,3}\[([^\]\n]+)\]:[ \t]*\n?[ \t]*(<[^>\n]*>|[^\n]*?\S)(?:(?:[ \t]*\n|[ \t]+)[ \t]*(["'])[^\n]*?\3)?[ \t]*$/gm`
+ * with `matchAll` (groups 1 and 2 are `label` and `dest`). That pattern
+ * backtracks over every split of a long run of spaces or quotes, so each of
+ * its decisions is read here from tables built in one pass from the end of
+ * `text`, and the time is linear in its length:
+ *   - `finish(e)`: where a definition whose `dest` ends at `e` ends, taking
+ *     the title when one closes on its line (the pattern tries the title
+ *     first), or -1;
+ *   - `nextGood[e]`: the first end at or after `e` that `finish` accepts
+ *     after a non-whitespace character, the lazy `dest`'s first success.
+ */
+function linkDefinitions(text) {
+  const out = [];
+  if (!text.includes(']:')) return out;
+  const n = text.length;
+  const NONE = -1;
+  // First index at or after i that is not a space or tab.
+  const skip = new Int32Array(n + 1);
+  // Whether `[ \t]*$` matches at i.
+  const endOk = new Uint8Array(n + 1);
+  const nextNl = new Int32Array(n + 1);
+  // First `]` or line feed, and first `>` or line feed, at or after i.
+  const labelStop = new Int32Array(n + 1);
+  const angleStop = new Int32Array(n + 1);
+  // First quote of each kind at or after i, before a line feed, after which `[ \t]*$` matches.
+  const closeDouble = new Int32Array(n + 1);
+  const closeSingle = new Int32Array(n + 1);
+  skip[n] = n;
+  endOk[n] = 1;
+  nextNl[n] = n;
+  labelStop[n] = n;
+  angleStop[n] = n;
+  closeDouble[n] = NONE;
+  closeSingle[n] = NONE;
+  for (let i = n - 1; i >= 0; i -= 1) {
+    const c = text[i];
+    const spaceOrTab = c === ' ' || c === '\t';
+    skip[i] = spaceOrTab ? skip[i + 1] : i;
+    endOk[i] = isLineTerminator(c) || (spaceOrTab && endOk[i + 1] === 1) ? 1 : 0;
+    nextNl[i] = c === '\n' ? i : nextNl[i + 1];
+    labelStop[i] = c === ']' || c === '\n' ? i : labelStop[i + 1];
+    angleStop[i] = c === '>' || c === '\n' ? i : angleStop[i + 1];
+    closeDouble[i] = c === '\n' ? NONE : c === '"' && endOk[i + 1] === 1 ? i : closeDouble[i + 1];
+    closeSingle[i] = c === '\n' ? NONE : c === "'" && endOk[i + 1] === 1 ? i : closeSingle[i + 1];
+  }
+  const finish = (e) => {
+    // The title's opening quote: after spaces, a line feed and spaces, or after at least one space.
+    const w = skip[e];
+    const t = w < n && text[w] === '\n' ? skip[w + 1] : w > e ? w : NONE;
+    if (t !== NONE && t < n && (text[t] === '"' || text[t] === "'")) {
+      const u = (text[t] === '"' ? closeDouble : closeSingle)[t + 1];
+      if (u !== NONE) return skip[u + 1];
+    }
+    return endOk[e] === 1 ? skip[e] : NONE;
+  };
+  const nextGood = new Int32Array(n + 2);
+  nextGood[n + 1] = NONE;
+  for (let e = n; e >= 1; e -= 1) {
+    nextGood[e] = !JS_WHITESPACE_RE.test(text[e - 1]) && finish(e) !== NONE ? e : nextGood[e + 1];
+  }
+  let from = 0;
+  for (let p = 0; p < n; p += 1) {
+    if (p < from || (p > 0 && !isLineTerminator(text[p - 1]))) continue;
+    let i = p;
+    while (i < p + 3 && text[i] === ' ') i += 1;
+    if (text[i] !== '[') continue;
+    const j = labelStop[i + 1];
+    if (j === i + 1 || j >= n - 1 || text[j] !== ']' || text[j + 1] !== ':') continue;
+    const b = skip[j + 2];
+    const s = b < n && text[b] === '\n' ? skip[b + 1] : b;
+    let e = NONE;
+    let end = NONE;
+    if (s < n && text[s] === '<') {
+      const f = angleStop[s + 1];
+      if (f < n && text[f] === '>') {
+        end = finish(f + 1);
+        if (end !== NONE) e = f + 1;
+      }
+    }
+    if (e === NONE && s < n) {
+      const g = nextGood[s + 1];
+      if (g !== NONE && g - 1 < nextNl[s]) {
+        e = g;
+        end = finish(g);
+      }
+    }
+    if (e === NONE) continue;
+    out.push({ start: p, end, label: [i + 1, j], dest: [s, e] });
+    from = end;
+  }
+  return out;
+}
+
+/**
+ * Where the content of the line starting at `p` (and ending at `lineEnd`)
+ * begins once the markers of the blocks that contain it are passed:
+ * blockquote `>`, list markers (`-`, `+`, `*`, `1.` or `1)` before a space
+ * or tab), definition markers (`:` before a space or tab) and footnote
+ * labels (`[^…]:`), in any order and with any spaces and tabs around them.
+ * Returns `{ at, markers }`, `markers` counting the markers passed. kramdown
+ * parses such content as blocks of its own, link definitions and attribute
+ * lists included. Time is linear in the line's length.
+ */
+function containerContentStart(text, p, lineEnd) {
+  const spaceOrTab = (k) => text[k] === ' ' || text[k] === '\t';
+  let i = p;
+  let markers = 0;
+  for (;;) {
+    while (i < lineEnd && spaceOrTab(i)) i += 1;
+    const c = text[i];
+    let next = -1;
+    if (c === '>') next = i + 1;
+    else if ((c === '-' || c === '+' || c === '*' || c === ':') && spaceOrTab(i + 1)) next = i + 1;
+    else if (c >= '0' && c <= '9') {
+      let k = i;
+      while (k < lineEnd && k < i + 9 && text[k] >= '0' && text[k] <= '9') k += 1;
+      if ((text[k] === '.' || text[k] === ')') && spaceOrTab(k + 1)) next = k + 1;
+    } else if (c === '[' && text[i + 1] === '^') {
+      const close = text.indexOf(']', i + 2);
+      if (close > i + 2 && close < lineEnd && text[close + 1] === ':') next = close + 2;
+    }
+    if (next === -1 || next > lineEnd) return { at: i, markers };
+    i = next;
+    markers += 1;
+  }
+}
+
+/**
+ * Link reference definitions that `linkDefinitions` does not see because a
+ * block contains them: lines whose content, after `containerContentStart`,
+ * is a definition `[id]: dest "title"` on that line, when at least one
+ * container marker or more than three spaces of indentation (or a tab)
+ * precede it. kramdown reads definitions in blockquotes, list items,
+ * definition lists and footnotes as definitions of the whole document. Each
+ * is `{ start, end, label, dest }` as from `linkDefinitions`, with `start`
+ * the line's start. Time is linear in `text`'s length.
+ */
+function containerLinkDefinitions(text) {
+  const out = [];
+  if (!text.includes(']:')) return out;
+  for (let p = 0; p < text.length;) {
+    const nl = text.indexOf('\n', p);
+    const lineEnd = nl === -1 ? text.length : nl;
+    const { at, markers } = containerContentStart(text, p, lineEnd);
+    const indent = text.slice(p, at);
+    if (text[at] === '[' && (markers > 0 || indent.length > 3 || indent.includes('\t'))) {
+      const [definition] = linkDefinitions(text.slice(at, lineEnd));
+      if (definition !== undefined) {
+        out.push({
+          start: p,
+          end: at + definition.end,
+          label: [at + definition.label[0], at + definition.label[1]],
+          dest: [at + definition.dest[0], at + definition.dest[1]],
+        });
+      }
+    }
+    p = lineEnd + 1;
+  }
+  return out;
+}
+
+/**
  * Every image in a body, outside code, ordered by position:
- * `{ offset, alt, src, html, srcset }`. Covers Markdown inline images,
- * reference images resolved against link definitions (the last definition of
- * a label wins, as in kramdown; unresolved references render as text and are
- * ignored), and raw `<img>` tags. Markdown images are matched within one
- * paragraph (`paragraphSpans`), and an inline image is kept only when it closes
- * as kramdown requires (`inlineImageEnd`). Positions are found in the masked
- * body; alt text and sources are read from the original. A Markdown image with
- * an empty or whitespace destination has `src: ''`; an `<img>` without a `src`
- * attribute has `src: undefined`. When overlapping `<img>` tags exceed the
- * tag-reading budget (`IMAGE_TAG_WORK_PER_CHAR`), the tags from there on go
+ * `{ offset, alt, src, html, srcset, repeated, attributes, definition }`.
+ * Covers Markdown inline images, reference images resolved against link
+ * definitions (the last definition of a label wins, as in kramdown;
+ * unresolved references render as text and are ignored), and raw `<img>`
+ * tags. `trustedLines` holds the start offsets of the lines every reading
+ * treats as running text (`findCodeRegions`); a link definition elsewhere
+ * may be text to kramdown. Markdown images are matched
+ * within one paragraph (`paragraphSpans`), and an inline image is kept only
+ * when it closes as kramdown requires (`inlineImageEnd`). Positions are found
+ * in the masked body; alt text and sources are read from the original, with
+ * character references in alt text decoded, as the browser shows it. A
+ * Markdown image with an empty or whitespace destination has `src: ''`; an
+ * `<img>` without a `src` attribute has `src: undefined`, and `repeated`
+ * names its `src`, `alt` and `srcset` attributes that occur more than once.
+ * `attributes` is what the kramdown attribute lists right after the image
+ * give it (`imageAttributeLists`), or `undefined` when none applies. A
+ * reference image's `definition`, one object shared by every image of its
+ * label, holds what its link definitions give it: `src`, the distinct other
+ * sources that earlier definitions kramdown may render instead name
+ * (`others`), and the `attributes` of their attribute lists (or
+ * `undefined`). When
+ * overlapping `<img>` tags exceed the tag-reading budget
+ * (`IMAGE_TAG_WORK_PER_CHAR`), the tags from there on go
  * unread and one entry `{ offset, html: true, unchecked: true }` stands for
  * them, so validation fails instead of passing images it never read.
  */
-function collectImages(body, masked) {
+function collectImages(body, masked, trustedLines) {
   const images = [];
   const inlineSpans = [];
   const paragraphs = paragraphSpans(body);
+  const lists = imageAttributeLists(body, masked);
+  // What the attribute lists right after an image ending at `end` give it.
+  const listsFor = (end) => {
+    const chain = lists.spanLists(end);
+    if (chain.lists.length === 0 && chain.problem === undefined) return undefined;
+    const result = lists.effect(chain.lists);
+    result.problem ??= chain.problem;
+    return result;
+  };
   for (const [from, to] of paragraphs) {
     const text = masked.slice(from, to);
     const head = new RegExp(IMG_INLINE_HEAD_RE.source, 'gd');
@@ -2470,16 +3241,84 @@ function collectImages(body, masked) {
         continue;
       }
       const src = angle === undefined ? groupText(body, m, 3, from).trim() : unwrapAngle(angle);
-      images.push({ offset: from + m.index, alt: groupText(body, m, 1, from), src, html: false });
+      images.push({
+        offset: from + m.index,
+        alt: decodeEntities(groupText(body, m, 1, from)),
+        src,
+        html: false,
+        attributes: listsFor(from + end),
+      });
       inlineSpans.push([from + m.index, from + end]);
       head.lastIndex = end;
     }
   }
-  // kramdown overwrites a duplicate definition, so the last one for a label is the one rendered.
+  // kramdown renders the last definition of a label it reads as one. What is found here may also
+  // be text kramdown reads otherwise (inside raw HTML, continuing a paragraph, or as a header or
+  // table row), so a definition overrides the earlier ones only when it is `certain`, and every
+  // definition of a label from its last certain one on, in document order, is a source its images
+  // may load.
   const definitions = new Map();
-  for (const m of masked.matchAll(new RegExp(LINK_DEFINITION_RE.source, 'gmd'))) {
-    definitions.set(normalizeLabel(groupText(body, m, 1)), unwrapAngle(groupText(body, m, 2)));
+  const top = linkDefinitions(masked);
+  const found = [...top, ...containerLinkDefinitions(masked)].sort((a, b) => a.start - b.start);
+  const topLevel = new Set(top);
+  const certainEnds = new Set();
+  const lineEndAt = (p) => {
+    const nl = body.indexOf('\n', p);
+    return nl === -1 ? body.length : nl;
+  };
+  // Whether kramdown starts a block at the line starting at `start` (a real line start): first in
+  // the body, after a blank line, or after a certain definition, with any block IALs between.
+  const startsBlock = (start) => {
+    const at = lists.blockListsStart(start);
+    if (at === 0) return true;
+    const q = at - 1;
+    if (certainEnds.has(q) || (q > 0 && body[q - 1] === '\r' && certainEnds.has(q - 1))) return true;
+    return BLANK_LINE_RE.test(stripCr(body.slice(body.lastIndexOf('\n', q - 1) + 1, q)));
+  };
+  for (const definition of found) {
+    const { start, end, label, dest } = definition;
+    const firstEnd = lineEndAt(start);
+    // Certain: at the top level, on a line every reading treats as running text, and starting a
+    // block. kramdown tries the footnote, table and setext header parsers before the link
+    // definition one (`@block_parsers`), reads the destination only on the line of `]:`, and
+    // declines one holding a space before a quote, so a `[^` label, a table row, a line followed
+    // by `-` or `=`, a destination on the next line and any quote (a title included) leave it
+    // uncertain.
+    const certain = topLevel.has(definition)
+      && trustedLines.has(start)
+      && dest[0] < firstEnd
+      && body[label[0]] !== '^'
+      && !TABLE_LINE_RE.test(stripCr(body.slice(start, firstEnd)))
+      && !(firstEnd < body.length && (body[firstEnd + 1] === '-' || body[firstEnd + 1] === '='))
+      && !/["']/.test(body.slice(label[1], end))
+      && startsBlock(start);
+    if (certain) certainEnds.add(end);
+    const key = normalizeLabel(body.slice(label[0], label[1]));
+    if (!definitions.has(key)) definitions.set(key, []);
+    definitions.get(key).push({
+      src: unwrapAngle(body.slice(dest[0], dest[1])),
+      certain,
+      lists: lists.definitionLists(start, end),
+    });
   }
+  // Every image of a label shares one record, built on first use, so many images of a label with
+  // many definitions cost the sum of the two rather than their product.
+  const records = new Map();
+  const recordFor = (key) => {
+    if (!records.has(key)) {
+      const candidates = definitions.get(key);
+      let first = candidates.length - 1;
+      while (first > 0 && !candidates[first].certain) first -= 1;
+      const live = candidates.slice(first);
+      const src = live[live.length - 1].src;
+      const others = new Set();
+      for (let k = 0; k < live.length - 1; k += 1) others.add(live[k].src.trim());
+      others.delete(src);
+      const applied = live.flatMap((candidate) => candidate.lists);
+      records.set(key, { src, others: [...others], attributes: applied.length === 0 ? undefined : lists.effect(applied) });
+    }
+    return records.get(key);
+  };
   let span = 0;
   for (const [from, to] of paragraphs) {
     for (const m of masked.slice(from, to).matchAll(new RegExp(IMG_REFERENCE_RE.source, 'gd'))) {
@@ -2489,7 +3328,15 @@ function collectImages(body, masked) {
       const alt = groupText(body, m, 1, from);
       const label = normalizeLabel(m[2] ? groupText(body, m, 2, from) : alt);
       if (definitions.has(label)) {
-        images.push({ offset: at, alt, src: definitions.get(label), html: false });
+        const definition = recordFor(label);
+        images.push({
+          offset: at,
+          alt: decodeEntities(alt),
+          src: definition.src,
+          definition,
+          html: false,
+          attributes: listsFor(at + m[0].length),
+        });
       }
     }
   }
@@ -2500,26 +3347,38 @@ function collectImages(body, masked) {
       images.push({ offset: tag.start, html: true, unchecked: true });
       break;
     }
-    const attrs = readAttributes(body.slice(tag.start, tag.end + 1));
+    const repeated = new Set();
+    const attrs = readAttributes(body.slice(tag.start, tag.end + 1), repeated);
     images.push({
       offset: tag.start,
       alt: attrs.get('alt'),
       src: attrs.has('src') ? attrs.get('src').trim() : undefined,
       html: true,
       srcset: attrs.has('srcset'),
+      repeated: ['src', 'alt', 'srcset'].filter((name) => repeated.has(name)),
+      attributes: listsFor(tag.end + 1),
     });
   }
   return images.sort((a, b) => a.offset - b.offset);
 }
 
 /**
+ * A character reference a browser decodes in an attribute value: named,
+ * decimal or hexadecimal, ended by `;`. kramdown passes these through to the
+ * rendered attribute unchanged.
+ */
+const CHARACTER_REFERENCE_RE = /&#?[A-Za-z0-9]+;/;
+
+/**
  * Maps an image source to the public path it loads and applies the source
  * rules. `slug` is the article's slug (or `null` when the filename gave none,
  * which skips the folder rule). Returns `{ path }` or `{ error }`; `path` is
  * the root-relative file path the browser requests: percent-decoded, without
- * query or fragment, and with `.` segments removed. Backslashes and `..`
- * segments are rejected, and the article's folder prefix must be written
- * before any `.` segment.
+ * query or fragment, and with `.` segments removed. Character references
+ * anywhere, and before the query or fragment percent-encoding that is
+ * malformed or not UTF-8, control characters, backslashes and `..` segments
+ * are rejected, so the path checked is the path requested; the article's
+ * folder prefix must be written before any `.` segment.
  */
 function imagePublicPath(src, slug, kind) {
   const folder = kind === 'draft' ? 'drafts' : 'blog';
@@ -2537,12 +3396,24 @@ function imagePublicPath(src, slug, kind) {
   if (/^[/\\]{2}/.test(path)) return { error: `external images are not allowed (${preview(src)})` };
   if (!path.startsWith('/')) return { error: `page-relative image path ${preview(src)} is not allowed; ${hint}` };
 
+  // kramdown keeps character references in the rendered attribute and the browser decodes them
+  // before it reads the URL, so `&#46;&#46;`, `&percnt;2e` or `&bsol;` would become `..`, `%2e`
+  // or `\` after these checks, and the `#` of `&#46;` is no fragment.
+  if (CHARACTER_REFERENCE_RE.test(path)) {
+    return { error: `image path ${preview(src)} must not contain character references (&…;); write the characters themselves` };
+  }
   const bare = path.replace(/[?#].*$/, '');
   let decoded;
   try {
     decoded = decodeURIComponent(bare);
   } catch {
-    decoded = bare;
+    // A `%` without two hex digits, or escapes that are not UTF-8 (`%ff`). Checking the raw text
+    // instead would let a `%2e%2e` elsewhere in the path through, which the browser reads as `..`.
+    return { error: `image path ${preview(src)} has malformed percent-encoding; write % itself as %25` };
+  }
+  // The browser drops tabs and line breaks from a URL, so `.<tab>.` would load as `..`.
+  if (/[\u0000-\u001f\u007f]/.test(decoded)) {
+    return { error: `image path ${preview(src)} must not contain tabs, line breaks or other control characters` };
   }
   if (decoded.includes('\\')) return { error: `image path ${preview(src)} must not contain backslashes` };
   const segments = decoded.split('/');
@@ -2559,6 +3430,34 @@ function imagePublicPath(src, slug, kind) {
     }
   }
   return { path: normalized };
+}
+
+/**
+ * Findings for `attributes`, what kramdown attribute lists give an image
+ * (`collectImages`), whose own source is `src`. Every value they set is held
+ * to the image rules, whether kramdown renders it over the image's own or
+ * beside it (a `SRC` on a link definition renders before `src`, and browsers
+ * read the first): every `src` other than `src` must pass `sourceProblem`
+ * (the `imagePublicPath` and `imageExists` rules), no `alt` may be blank
+ * once character references are decoded, and `srcset` is rejected, as in an
+ * `<img>` tag.
+ */
+function attributeListErrors(attributes, src, sourceProblem) {
+  const errors = [];
+  const listError = (message) => errors.push(`attribute list on the image: ${message}`);
+  if (attributes.problem !== undefined) errors.push(attributes.problem);
+  if (attributes.srcset) listError('srcset is not supported; use a single src');
+  if (attributes.alts.some((alt) => decodeEntities(alt).trim() === '')) listError('alt text is blank');
+  for (const value of new Set(attributes.srcs.map((s) => s.trim()))) {
+    if (value === src) continue;
+    if (value === '') {
+      listError('src is empty');
+      continue;
+    }
+    const problem = sourceProblem(value);
+    if (problem !== null) listError(problem);
+  }
+  return errors;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -2591,7 +3490,13 @@ function futureDateMessage(path, date, today) {
  *     `/assets/blog/<slug>/` for a post, written as
  *     `{{ '/assets/…' | relative_url }}`, `{{ site.baseurl }}/assets/…` or
  *     `/assets/…`; empty, external, protocol-relative, `data:`, page-relative
- *     and `..` sources and `srcset` are rejected.
+ *     and `..` sources, sources whose character references, malformed
+ *     percent-encoding or control characters would make the browser request
+ *     another path, and `srcset` are rejected. The rules hold for what the
+ *     page renders: kramdown attribute lists that apply to an image (`{: …}`
+ *     right after it, those on the link definition it uses and the ALDs they
+ *     name) must set no `srcset`, no blank `alt` and only a `src` that passes
+ *     them too, and an `<img>` must not repeat `src`, `alt` or `srcset`.
  *
  * @param {object} args
  * @param {string} args.path Repository-relative path, such as `_posts/2026-01-15-foo.md` or `_drafts/foo.md`.
@@ -2624,13 +3529,14 @@ export function validateArticle({ path, data, body, kind, todayUtc, imageExists,
  *   `todoLines` are 1-based lines of `body` in ascending order.
  */
 function analyzeBody(body) {
-  const masked = maskCode(body, findCodeRegions(body));
+  const code = {};
+  const masked = maskCode(body, findCodeRegions(body, code));
   const todo = lineFindings(body);
   for (const m of masked.matchAll(/TODO:/g)) todo.note(m.index);
   return {
     lineAt: lineLocator(body),
     todoLines: todo.list().map((finding) => finding.line),
-    images: collectImages(body, masked),
+    images: collectImages(body, masked, code.trustedLines),
   };
 }
 
@@ -2745,22 +3651,56 @@ function validateWithAnalysis({ path, data, body, kind, todayUtc, imageExists, b
     errors.push(`${path}:${startLine + line - 1}: body still contains a TODO: placeholder`);
   }
 
-  // Images.
+  // Images. Each distinct source is checked once (`sourceProblem`, the rule it breaks or `null`), and
+  // what a label's link definitions give its images once, at the first image of the label.
+  const sources = new Map();
+  const sourceProblem = (value) => {
+    if (!sources.has(value)) {
+      const result = imagePublicPath(value, slug, kind);
+      let problem = null;
+      if (result.error) problem = result.error;
+      else if (typeof imageExists === 'function' && !imageExists(result.path)) {
+        problem = `image ${preview(result.path)} does not exist`;
+      }
+      sources.set(value, problem);
+    }
+    return sources.get(value);
+  };
+  const checkedDefinitions = new Set();
   for (const image of images) {
     if (image.unchecked) { bodyError(image.offset, 'too many overlapping <img> tags to check; simplify the markup'); continue; }
     const at = image.offset;
     const src = image.src ?? '';
     if (image.html && image.srcset) bodyError(at, 'srcset is not supported; use a single src');
+    // kramdown renders the last of a repeated attribute and browsers reading the tag as written the first.
+    for (const name of image.repeated ?? []) bodyError(at, `<img> repeats the ${name} attribute; write it once`);
     // kramdown renders an empty Markdown destination as `<img src="">`, which loads nothing.
     if (src === '') bodyError(at, image.html ? '<img> has no src' : 'image has no source');
     if (typeof image.alt !== 'string' || image.alt.trim() === '') {
       bodyError(at, `image has no alt text${src === '' ? '' : ` (${preview(src)})`}`);
     }
-    if (src === '') continue;
-    const result = imagePublicPath(src, slug, kind);
-    if (result.error) bodyError(at, result.error);
-    else if (typeof imageExists === 'function' && !imageExists(result.path)) {
-      bodyError(at, `image ${result.path} does not exist`);
+    if (src !== '') {
+      const problem = sourceProblem(src);
+      if (problem !== null) bodyError(at, problem);
+    }
+    const { definition } = image;
+    if (definition !== undefined && !checkedDefinitions.has(definition)) {
+      checkedDefinitions.add(definition);
+      // The other definitions of the label, any of which kramdown may render.
+      for (const other of definition.others) {
+        if (other === '') {
+          bodyError(at, 'another link definition of this image\'s label gives it no source');
+          continue;
+        }
+        const problem = sourceProblem(other);
+        if (problem !== null) bodyError(at, `another link definition of this image's label: ${problem}`);
+      }
+      if (definition.attributes !== undefined) {
+        for (const message of attributeListErrors(definition.attributes, src, sourceProblem)) bodyError(at, message);
+      }
+    }
+    if (image.attributes !== undefined) {
+      for (const message of attributeListErrors(image.attributes, src, sourceProblem)) bodyError(at, message);
     }
   }
   return errors;
@@ -2770,6 +3710,38 @@ function validateWithAnalysis({ path, data, body, kind, todayUtc, imageExists, b
 /* ------------------------------------------------------------------------ */
 /* Unsafe markup                                                             */
 /* ------------------------------------------------------------------------ */
+
+/**
+ * Start of a raw HTML start tag through its name, for attribute scanning.
+ * The name is one kramdown reads (REXML's `UNAME`: letters of any script,
+ * digits, `-`, `_`, `.` and one `prefix:`) or one a browser reads in the
+ * rendered page (an ASCII letter, then anything but whitespace, `/` and
+ * `>`), since kramdown copies unknown and custom elements, and the content
+ * of raw elements, through unchanged. Nothing follows the name in the
+ * pattern, so the search never backtracks into it; a tag that never closes
+ * is dropped by `markupOutsideCode`. Autolinks kramdown certainly renders as
+ * links are removed beforehand by `hideAutolinks`.
+ */
+const TAG_START_RE = new RegExp(`<(?:[a-zA-Z][^\\s/>]*|${UNAME})`, 'gu');
+
+/**
+ * `masked` with the `<` of each of `autolinks` (sorted `{ start, end }`
+ * offsets, from `findCodeRegions`) replaced by a space, so tag discovery
+ * passes over `<https://…>`, `<mailto:…>` and `<a@b.example>` where kramdown
+ * renders them as links: in running text on every reading. Anywhere else,
+ * as at the start of an HTML block (`<http:x onclick="…">`) or inside raw
+ * HTML, kramdown may keep the same text as a tag, so it is scanned like one.
+ */
+function hideAutolinks(masked, autolinks) {
+  if (autolinks.length === 0) return masked;
+  let out = '';
+  let pos = 0;
+  for (const { start } of autolinks) {
+    out += `${masked.slice(pos, start)} `;
+    pos = start + 1;
+  }
+  return out + masked.slice(pos);
+}
 
 /**
  * Notes every event-handler attribute and `javascript:` value in `source`,
@@ -2811,17 +3783,47 @@ function noteExtentRisks(found, text, extents, eventRe) {
 }
 
 /**
- * Finds markup in a Markdown body that could run script or change the page,
- * outside fenced and inline code (HTML shown as a code sample is never
- * flagged). The same patterns as the built-page prose scan:
+ * Notes every `javascript:` URL in a Markdown URL position of `masked` (the
+ * body with its code blanked) at the offset of its delimiter. The delimiters
+ * (`MD_URL_START_RE`) are found in `masked` itself, so each is a literal
+ * source character outside code; the URL after one is read in `masked`
+ * decoded once, at the first decoded character whose source offset
+ * (`decodeEntitiesMapped`) is not before the delimiter's end. One decoding
+ * and one forward pointer serve every delimiter, so dense delimiters such as
+ * `<<<<` or `](](` keep the scan linear.
+ */
+function noteMarkdownUrlRisks(found, masked) {
+  const { text, from } = masked.includes('&') ? decodeEntitiesMapped(masked) : { text: masked, from: null };
+  let k = 0;
+  for (const m of masked.matchAll(MD_URL_START_RE)) {
+    const end = m.index + m[0].length;
+    if (from === null) k = end;
+    else while (k < text.length && from[k] < end) k += 1;
+    JS_URL_DEST_RE.lastIndex = k;
+    if (JS_URL_DEST_RE.test(text)) found.note(m.index);
+  }
+}
+
+/**
+ * Finds markup in a Markdown body that could run script or change the page.
+ * Code the model identifies with certainty, fenced and inline code as
+ * kramdown reads them, is skipped. Forms it cannot decide, such as indented
+ * code, code inside a blockquote and other ambiguous cases, are scanned as
+ * prose, so HTML shown there as a code sample may be reported. The same
+ * patterns as the built-page prose scan:
  *   - opening `script`, `iframe`, `object`, `embed`, `form`, `base`, `meta`,
  *     `link` and `style` tags, in any letter case;
- *   - `on…=` event-handler attributes in any tag, and in kramdown attribute
- *     lists such as `{: onclick="…"}`, which add attributes to the rendered
- *     element;
+ *   - `on…=` event-handler attributes in any raw start tag, whatever name
+ *     kramdown or a browser reads for it (`<x:note>`, `<x_note>`, `<x.note>`,
+ *     `<é>`), except Markdown autolinks such as `<https://…>` in running
+ *     text, which kramdown renders as links (`hideAutolinks`), and in
+ *     kramdown attribute lists such as `{: onclick="…"}`, which add
+ *     attributes to the rendered element;
  *   - `javascript:` URLs (whitespace before the colon allowed, any letter
  *     case) in URL positions only: after `](`, after `]:`, after `<`, and
- *     after `=` inside a tag or attribute list.
+ *     after `=` inside a tag or attribute list, each read through the
+ *     character references a browser decodes there (`&#106;avascript:`,
+ *     `javascript&colon;`).
  *
  * This source scan does not evaluate Liquid or run kramdown; the built-page
  * prose scan over rendered HTML remains the check of record.
@@ -2832,13 +3834,14 @@ function noteExtentRisks(found, text, extents, eventRe) {
  */
 export function scanUnsafeMarkup(body) {
   const text = asText(body, 'body');
-  const masked = maskCode(text, findCodeRegions(text));
+  const code = {};
+  const masked = maskCode(text, findCodeRegions(text, code));
   const found = lineFindings(text);
   for (const m of masked.matchAll(UNSAFE_TAG_RE)) found.note(m.index);
-  const { tags, lists } = markupOutsideCode(text, masked, TAG_START_RE, true);
+  const { tags, lists } = markupOutsideCode(text, hideAutolinks(masked, code.autolinks), TAG_START_RE, true);
   noteExtentRisks(found, text, tags, TAG_EVENT_ATTR_RE);
   noteExtentRisks(found, text, lists, IAL_EVENT_ATTR_RE);
-  for (const m of masked.matchAll(JS_URL_MARKDOWN_RE)) found.note(m.index);
+  noteMarkdownUrlRisks(found, masked);
   return found.list();
 }
 
@@ -3147,9 +4150,10 @@ function analyzeArticle(text) {
  *   validate, typically those added or changed (default `[]`). `id`, such as the git blob id,
  *   names the text in `cache`; it must be a non-empty string when given, and an article
  *   without one is analysed afresh.
- * @param {Map<string, object>} [args.cache] Text analyses by `id`, owned by the caller and
- *   passed to every call that should share them (default: a new `Map` for this call). Its
- *   values are opaque; any not made here is replaced. Anything other than a `Map` is a `TypeError`.
+ * @param {Map<string, object> | null} [args.cache] Text analyses by `id`, owned by the caller
+ *   and passed to every call that should share them. Omitted, `null` or `undefined`, it is a
+ *   new `Map` for this call only. Its values are opaque; any not made here is replaced. Any
+ *   other value that is not a `Map` is a `TypeError`.
  * @param {string} [args.todayUtc] Today as `YYYY-MM-DD` in UTC (default: the current UTC date).
  * @returns {string[]} Errors, each starting with its path; path rules first, then the
  *   articles in input order. Identical messages are reported once.

@@ -5,75 +5,37 @@
  *
  *   node tests/visual/run-visual.mjs [--base <ref>]
  *
- * Builds the project fixture site twice with `tests/fixtures/build-fixture-site.mjs`,
- * once from the base revision (`git archive <base>`) and once from the working
- * tree, both holding only the working tree's fixture articles. It serves each
- * build on 127.0.0.1 with the site mounted at `/cabrillo-coast/` and runs
- * `tests/visual/blog-visual.spec.mjs` through Playwright Test twice:
- *   1. `--update-snapshots=all` against the base build, which writes the 12
- *      baseline screenshots into a temporary directory;
- *   2. `--update-snapshots=none` against the working-tree build, which
- *      compares every screenshot with its baseline pixel for pixel.
- * Both sides are rendered by the same Chromium build on the same machine in
- * one run, so no baseline image is ever committed.
+ * Builds the project fixture site twice with
+ * `tests/fixtures/build-fixture-site.mjs`, from the base revision
+ * (`git archive <base>`) and from the working tree, both with the working
+ * tree's fixture articles, and serves each on 127.0.0.1 at `/cabrillo-coast/`.
+ * Playwright Test runs `tests/visual/blog-visual.spec.mjs` twice: with
+ * `--update-snapshots=all` against the base, writing the baseline into a
+ * temporary directory, then with `--update-snapshots=none` against the
+ * working tree, comparing every screenshot with it. Both sides render in the
+ * same browser on the same machine, so no baseline is ever committed.
  *
- * Base revision: `--base <ref>`, or the branch's upstream (`@{upstream}`,
- * what is already pushed), or `HEAD` when git answers there is no upstream.
+ * Base: `--base <ref>`, else the upstream (`@{upstream}`, what is already
+ * pushed), else `HEAD` when git answers there is none.
  *
- * Deadlines: every child and request has a finite deadline from `DEADLINES`
- * in scripts/lib/subprocess.mjs: `gitQuery` for each git query, `gitLog`
- * for the commit messages, the fixture builder's own deadlines for each
- * build, `playwrightRun` for each Playwright run (SIGTERM, then SIGKILL, then
- * given up on) and `httpRequest` for each pre-flight request, body included.
- * Only a git that exited by itself gives an answer. The skip below needs git
- * to confirm that the base has no `_layouts/post.html`; a probe that was
- * killed, timed out or could not read the base fails the run instead. The
- * commit messages are streamed and git is stopped at the first trailer, so
- * the size of `<base>..HEAD` is never limited; a log that exceeds its
- * deadline or is killed fails the run too.
+ * Intent: a difference passes when `VISUAL_CHANGE_INTENDED=1` is set or a
+ * commit message in `<base>..HEAD`, a merge commit included, has a
+ * `Visual-Change: intended` trailer. Declared differences are still
+ * reported; operational failures are never accepted as intended.
  *
- * Outcomes and exit codes:
- *   0  The 12 screenshots are identical; or git confirms the base has no
- *      `_layouts/post.html` (the comparison is skipped with a notice); or the
- *      pages differ and the change is declared intended, either with
- *      `VISUAL_CHANGE_INTENDED=1` or with a `Visual-Change: intended` trailer
- *      in any commit message in `<base>..HEAD` (a pull request's merge commit
- *      included). Declared differences are still reported.
- *   1  The pages differ and the change is not declared; or a build, the
- *      pre-flight page check, the baseline run or the comparison run failed
- *      for any reason other than a screenshot difference, a Playwright run
- *      exceeded its deadline included; or git gave no answer about the base
- *      or its commit messages (it could not start, was killed, timed out or
- *      could not read the base commit's tree); or the temporary workspace
- *      could not be removed. Such failures are never accepted as an intended
- *      change. A comparison run that was interrupted (Playwright's exit 130),
- *      was killed or exited other than 0 or 1 is incomplete and fails. A run
- *      that exited 1 is classified case by case from its JSON results
- *      (`compare-results.json` in the workspace): intent is accepted only
- *      when all 12 cases ran and every failed case is solely a screenshot
- *      size or pixel difference with its actual image, reported either by
- *      `toHaveScreenshot` or by the spec's zero-tolerance comparison that
- *      runs after it (tests/visual/lib/pixels.mjs). Mixed or unknown
- *      failures, and results that cannot be read, fail whatever was
- *      declared, and each problem is printed with its case.
- *   2  Usage error, or git answers that the base revision names no commit.
- *   130 / 143  Interrupted by SIGINT / SIGTERM, also when the workspace then
- *      cannot be removed.
+ * Exit codes: 0 identical, skipped because git confirms the base has no
+ * `_layouts/post.html`, or different as declared; 1 an undeclared difference
+ * or an operational failure (a build, a Playwright run, git giving no answer,
+ * a workspace that cannot be removed); 2 a usage error or a base that names
+ * no commit; 130 / 143 interrupted by SIGINT / SIGTERM.
  *
- * Output: the temporary workspace (`blog-visual-*` under `os.tmpdir()`) is
- * removed at the end of every run. One that cannot be removed is reported
- * on stderr with its path and fails a run that would have exited 0 (a
- * failing run keeps its own code). The Playwright report
- * (`tests/visual/report/`) and test artefacts (`tests/visual/test-results/`,
- * with actual, expected and diff images) are left in place for inspection
- * and for the blog-checks workflow, which uploads the report when
- * verification fails. Both are git-ignored. The report always lands there
- * and is never opened, whatever Playwright's HTML-report variables the
- * caller's environment holds (`playwrightEnv`).
+ * Output: the `blog-visual-*` workspace under `os.tmpdir()` is removed every
+ * run. `tests/visual/report/` and `tests/visual/test-results/` are kept for
+ * inspection, both git-ignored; CI uploads the report when verification fails.
  *
- * Consumer: `scripts/verify.mjs` runs this as its last step, with inherited
- * output, `VISUAL_CHANGE_INTENDED` passed through and `JEKYLL_ENV` removed,
- * after it has already reported a missing Playwright Chromium.
+ * `scripts/verify.mjs` runs this as its last step. `JEKYLL_ENV` is removed
+ * from every git and Playwright child this runner starts (`gitEnv`,
+ * `playwrightEnv`); the fixture builder sets the environment of its own.
  */
 
 import fs from "node:fs";
@@ -212,12 +174,10 @@ const session = {
 /* Helpers                                                                   */
 /* ------------------------------------------------------------------------ */
 
-/** Prints one progress line. */
 function log(message) {
   console.log(`${LOG_PREFIX} ${message}`);
 }
 
-/** Prints one diagnostic line on stderr. */
 function warn(message) {
   console.error(`${LOG_PREFIX} ${message}`);
 }
@@ -228,11 +188,18 @@ function errorMessage(err) {
 }
 
 /**
- * Environment of every git command: the caller's, with `GIT_OPTIONAL_LOCKS=0`
- * so a read-only command never writes even an opportunistic index refresh.
+ * Environment of every git command, the queries and the streamed log alike:
+ * the caller's, with `GIT_OPTIONAL_LOCKS=0` so a read-only command never
+ * writes even an opportunistic index refresh, and without `JEKYLL_ENV`. A
+ * local production build without a Pages API token derives the wrong base
+ * path, so no child of this runner inherits that variable; `playwrightEnv`
+ * removes it from Playwright's environment too. `process.env` is not modified.
+ * @returns {Record<string, string | undefined>} a new environment object.
  */
-function gitEnv() {
-  return { ...process.env, GIT_OPTIONAL_LOCKS: "0" };
+export function gitEnv() {
+  const env = { ...process.env, GIT_OPTIONAL_LOCKS: "0" };
+  delete env.JEKYLL_ENV;
+  return env;
 }
 
 /**
@@ -524,8 +491,12 @@ export function createTrailerScanner() {
  * A log that gave no answer is an operational failure and throws, whatever
  * it printed: its `DEADLINES.gitLog` deadline expired, it was left running
  * after SIGKILL, it was killed by a signal this runner did not send, or it
- * could not start. A git that exited by itself with an error status did
- * answer; that fails safe, with a warning and no trailer counted.
+ * could not start. Otherwise a trailer recognised in git's own output before
+ * it exited or was stopped completes the scan and is credited, whatever the
+ * exit status; a last line without a line end counts only after git exited
+ * 0. A git that exited by itself with an error status and printed no
+ * recognised trailer did answer; that fails safe, with a warning and no
+ * trailer credited.
  * @param {string} sha Base commit id.
  * @returns {Promise<string | null>}
  * @throws {Error} when the log gave no answer; `main` exits 1.
@@ -568,7 +539,7 @@ async function declaredIntent(sha) {
   // `end()` only after a complete read: the last bytes of a log cut short are not the end of a line.
   if (scanner.found || (result.ok && scanner.end())) return `a "Visual-Change: intended" trailer in ${range}`;
   if (result.ok) return null;
-  // Fail safe: git answered with an error, so no trailer can be credited.
+  // Fail safe: git answered with an error and no trailer was recognised, so none is credited.
   warn(`cannot read the commit messages in ${range} (git log ${describeResult(result)}${detail}); no trailer counted`);
   return null;
 }
@@ -749,8 +720,11 @@ async function preflight(port) {
  * config's reporter settings neutralised. The HTML report then always goes
  * to the config's folder, `tests/visual/report/` (REPORT_DIR), which the
  * printed hints name and the blog-checks workflow uploads; it is never
- * opened, and no reporter is added. Every other variable passes through
- * unchanged, and `baseEnv` is not modified.
+ * opened, and no reporter is added. `JEKYLL_ENV` is removed as well, as in
+ * `gitEnv`: every build outside GitHub Pages is a development build, because
+ * a production build without a Pages API token derives the wrong base path.
+ * Every other variable passes through unchanged, and `baseEnv` is not
+ * modified.
  *
  * @example
  *   const env = playwrightEnv(process.env, {
@@ -801,12 +775,19 @@ export function playwrightEnv(baseEnv, { baseUrl, baselineDir, resultsFile }) {
 }
 
 /**
- * Runs the spec through Playwright Test against one served build and
- * resolves when the child closes. Supervised and asynchronous, never
- * `spawnSync`: the static servers live in this process's event loop and must
- * keep answering while the browser loads pages. At `DEADLINES.playwrightRun`
- * the child is sent SIGTERM, then SIGKILL, and is given up on if it still
- * runs, so a stalled run cannot keep the servers and the workspace alive.
+ * Runs the spec through Playwright Test against one served build. Supervised
+ * and asynchronous, never `spawnSync`: the static servers live in this
+ * process's event loop and must keep answering while the browser loads
+ * pages. At `DEADLINES.playwrightRun` the child is sent SIGTERM, then
+ * SIGKILL, and is given up on if it still runs, so a stalled run cannot keep
+ * the servers and the workspace alive.
+ *
+ * The promise resolves once, in one of three ways: when the child closed
+ * before its deadline, with its exit code or the signal that ended it; when
+ * Playwright could not be started, with code 1 after a warning; or when the
+ * deadline ended the run, a child still running that was given up on
+ * included, with `timedOut` true. While an interrupt is in progress it never
+ * resolves: the signal handler owns the exit code and the cleanup.
  *
  * @param {"all" | "none"} mode `all` writes the baseline; `none` only compares,
  *   so a missing baseline fails instead of being written.
@@ -815,8 +796,9 @@ export function playwrightEnv(baseEnv, { baseUrl, baselineDir, resultsFile }) {
  * @param {string} [resultsFile] Where the config's JSON reporter writes the
  *   run's results; without it no JSON report is written.
  * @returns {Promise<{ code: number | null, signal: string | null, timedOut: boolean }>}
- *   `timedOut` is true when the deadline ended the run; its code and signal
- *   then say nothing about the screenshots.
+ *   the child's exit code and signal, or code 1 when it could not be started;
+ *   `timedOut` is true when the deadline ended the run, and its code and
+ *   signal then say nothing about the screenshots.
  */
 function runPlaywright(mode, port, baselineDir, resultsFile) {
   const env = playwrightEnv(process.env, { baseUrl: `http://127.0.0.1:${port}${MOUNT}`, baselineDir, resultsFile });
@@ -1048,6 +1030,8 @@ function installSignalHandlers() {
 /**
  * Builds one side with the fixture builder and confirms both screenshotted
  * pages exist. Every failure is a build failure, never a visual difference.
+ * Each child the builder runs (git, tar, every Jekyll build) has its own
+ * deadline from `DEADLINES`.
  * @param {string} outDir
  * @param {string} [ref] Base commit id; the working tree when omitted.
  * @returns {Promise<string | null>} the problem found, or null when the build is complete.

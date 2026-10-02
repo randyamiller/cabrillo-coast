@@ -1,4 +1,4 @@
-/* Cabrillo Coast LLC — regression proof of the fixture builder's source provenance (AC-16, F-018) */
+/* Cabrillo Coast LLC — regression proof of the fixture builder's source provenance and draft privacy (AC-16, AC-02) */
 /**
  * The visual comparison (AC-16) is only meaningful while its baseline is
  * built from the base revision and its comparison from the working tree.
@@ -26,6 +26,18 @@
  *   - both stages hold the synthetic draft, which exists only there;
  *   - a `--ref` without `_layouts/post.html` exits 1 ("predates the blog")
  *     and one that names no commit exits 2.
+ *
+ * A second repository's HEAD tracks a draft image beside an article image,
+ * and `git` and `tar` wrappers first on PATH log the `JEKYLL_ENV` each child
+ * receives and the members of the archive before running the real commands.
+ * With `JEKYLL_ENV=production` in the caller's environment it proves that
+ *   - no git, tar or Jekyll child of either staging mode receives it;
+ *   - the archive of the revision, both stages and every build hold no real
+ *     draft image, and the archive and both stages keep the article image;
+ *   - an extraction that fails exits 1, removes the archive and leaves no
+ *     draft image in the stage;
+ *   - a draft image that reaches the stage regardless is removed and stops
+ *     the build with exit 1 before any fixture or synthetic file is added.
  *
  * Runs with `node --test tests/unit/fixture-staging.test.mjs` or as part of
  * `node --test "tests/**\/*.test.mjs"` (Node 22 or later, git, tar and a
@@ -249,5 +261,239 @@ describe('[AC-16][F-018] build-fixture-site.mjs refuses a --ref it cannot build'
     assert.match(result.stderr, /^build-fixture-site: cannot resolve --ref no-such-revision$/m);
     assert.ok(result.stderr.split('\n').includes(USAGE), result.stderr);
     assert.ok(!fs.existsSync(out), 'nothing was staged');
+  });
+});
+
+/* ------------------------------------------------------------------------ */
+/* Draft privacy and child environments                                      */
+/* ------------------------------------------------------------------------ */
+
+/** A published article's image, committed beside the tracked draft image. */
+const ARTICLE_IMAGE_REL = 'assets/blog/real-article/figure.svg';
+
+/*
+ * A repository whose HEAD tracks a draft image (force-added by the harness)
+ * and an article image, so the archive of a revision holds both unless the
+ * builder leaves `assets/drafts/` out of it.
+ */
+const PRIVACY_REPO = path.join(sandbox.parent, 'privacy-repo');
+createSiteRepo(sandbox.env, PRIVACY_REPO, { message: 'Add the blog' });
+write(PRIVACY_REPO, ARTICLE_IMAGE_REL, '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>\n');
+const PRIVACY_HEAD = commitAll(sandbox.env, PRIVACY_REPO, 'Add an article image');
+
+/** Quotes text as one POSIX shell word. */
+function shQuote(text) {
+  return `'${text.replace(/'/g, "'\\''")}'`;
+}
+
+/** Absolute path of the executable `name` on the sandbox's PATH. */
+function commandPath(name) {
+  for (const dir of (sandbox.env.PATH ?? '').split(path.delimiter)) {
+    if (dir === '') continue;
+    const candidate = path.join(dir, name);
+    const stat = fs.statSync(candidate, { throwIfNoEntry: false });
+    if (stat !== undefined && stat.isFile() && (stat.mode & 0o111) !== 0) return candidate;
+  }
+  throw new Error(`${name} is not on PATH`);
+}
+
+/**
+ * Writes `git` and `tar` wrappers into `<sandbox>/<name>/` and returns that
+ * folder, to put first on PATH. Each appends `<JEKYLL_ENV state>\t<args>` to
+ * `FAKE_GIT_LOG` or `FAKE_TAR_LOG` (the state is `unset`, or `set:` and the
+ * value) and runs the real command. Before extracting, the tar wrapper writes
+ * `tar -tf` of the archive to `FAKE_TAR_MEMBERS`. `tarMode` `fail` extracts
+ * and then exits 1, as an extraction that fails part-way would; `inject`
+ * extracts and then plants a draft image in the extraction folder.
+ * @param {string} name
+ * @param {{ tarMode?: 'pass' | 'fail' | 'inject' }} [options]
+ */
+function installChildWrappers(name, { tarMode = 'pass' } = {}) {
+  const bin = sandbox.folder(name);
+  const realGit = shQuote(commandPath('git'));
+  const realTar = shQuote(commandPath('tar'));
+  const state = '"${JEKYLL_ENV+set:}${JEKYLL_ENV-unset}"';
+  fs.writeFileSync(
+    path.join(bin, 'git'),
+    [
+      '#!/bin/sh',
+      ': "${FAKE_GIT_LOG:?FAKE_GIT_LOG is not set}"',
+      `printf '%s\\t%s\\n' ${state} "$*" >> "$FAKE_GIT_LOG"`,
+      `exec ${realGit} "$@"`,
+      '',
+    ].join('\n'),
+    { mode: 0o755 },
+  );
+  const extract = {
+    pass: [`exec ${realTar} "$@"`],
+    fail: [`${realTar} "$@" || exit 98`, 'exit 1'],
+    inject: [
+      `${realTar} "$@" || exit 98`,
+      '[ "$3" = "-C" ] || exit 97',
+      'mkdir -p "$4/assets/drafts/injected" && printf leak > "$4/assets/drafts/injected/leak.png"',
+    ],
+  }[tarMode];
+  fs.writeFileSync(
+    path.join(bin, 'tar'),
+    [
+      '#!/bin/sh',
+      ': "${FAKE_TAR_LOG:?FAKE_TAR_LOG is not set}" "${FAKE_TAR_MEMBERS:?FAKE_TAR_MEMBERS is not set}"',
+      `printf '%s\\t%s\\n' ${state} "$*" >> "$FAKE_TAR_LOG"`,
+      '[ "$1" = "-xf" ] || exit 96',
+      `${realTar} -tf "$2" > "$FAKE_TAR_MEMBERS" || exit 99`,
+      ...extract,
+      '',
+    ].join('\n'),
+    { mode: 0o755 },
+  );
+  return bin;
+}
+
+const PASS_BIN = installChildWrappers('bin-children');
+const FAILING_TAR_BIN = installChildWrappers('bin-tar-fails', { tarMode: 'fail' });
+const INJECTING_TAR_BIN = installChildWrappers('bin-tar-injects', { tarMode: 'inject' });
+
+/**
+ * Runs the privacy repository's copy of the builder with
+ * `JEKYLL_ENV=production` in its environment and `bin`, then the stand-in
+ * bundle, first on PATH. Every child logs into `<sandbox>/logs-<name>/`.
+ */
+async function runPrivacyBuilder(name, args, bin) {
+  const logs = sandbox.folder(`logs-${name}`);
+  const files = {
+    git: path.join(logs, 'git.log'),
+    tar: path.join(logs, 'tar.log'),
+    members: path.join(logs, 'tar-members.txt'),
+    bundle: path.join(logs, 'bundle.log'),
+  };
+  const result = await runNode([path.join(PRIVACY_REPO, 'tests', 'fixtures', 'build-fixture-site.mjs'), ...args], {
+    cwd: PRIVACY_REPO,
+    env: {
+      ...sandbox.env,
+      JEKYLL_ENV: 'production',
+      PATH: [bin, BIN, sandbox.env.PATH ?? ''].join(path.delimiter),
+      FAKE_GIT_LOG: files.git,
+      FAKE_TAR_LOG: files.tar,
+      FAKE_TAR_MEMBERS: files.members,
+      FAKE_BUNDLE_LOG: files.bundle,
+    },
+    timeoutMs: 60000,
+  });
+  return { ...result, logs: files };
+}
+
+/** The non-empty lines of a log file, or none when it was never written. */
+function readLines(file) {
+  if (!fs.existsSync(file)) return [];
+  return fs.readFileSync(file, 'utf8').split('\n').filter((line) => line !== '');
+}
+
+/** The wrapper log entries of `file` as `{ env, args }`. */
+function readChildLog(file) {
+  return readLines(file).map((line) => {
+    const tab = line.indexOf('\t');
+    return { env: line.slice(0, tab), args: line.slice(tab + 1) };
+  });
+}
+
+/** True when the POSIX path `rel` (a folder may end in `/`) is `assets/drafts` or lies below it. */
+function isDraftImagePath(rel) {
+  const trimmed = rel.replace(/\/+$/, '');
+  return trimmed === 'assets/drafts' || trimmed.startsWith('assets/drafts/');
+}
+
+describe('[AC-02][F-017] build-fixture-site.mjs keeps tracked draft images out of the archive and JEKYLL_ENV out of every child', { concurrency: 4 }, () => {
+  const refOut = path.join(sandbox.parent, 'out-privacy-ref');
+  const workOut = path.join(sandbox.parent, 'out-privacy-work');
+  const failOut = path.join(sandbox.parent, 'out-privacy-tar-fails');
+  const injectOut = path.join(sandbox.parent, 'out-privacy-tar-injects');
+  let refRun;
+  let workRun;
+  let failRun;
+  let injectRun;
+
+  before(async () => {
+    [refRun, workRun, failRun, injectRun] = await Promise.all([
+      runPrivacyBuilder('ref', [refOut, '--ref', PRIVACY_HEAD, '--fixtures-only'], PASS_BIN),
+      runPrivacyBuilder('work', [workOut, '--fixtures-only'], PASS_BIN),
+      runPrivacyBuilder('tar-fails', [failOut, '--ref', PRIVACY_HEAD, '--fixtures-only'], FAILING_TAR_BIN),
+      runPrivacyBuilder('tar-injects', [injectOut, '--ref', PRIVACY_HEAD, '--fixtures-only'], INJECTING_TAR_BIN),
+    ]);
+  });
+
+  test('[AC-02][F-017] the revision tracks a draft image and an article image', () => {
+    assert.equal(git(sandbox.env, PRIVACY_REPO, 'ls-tree', '-r', '--name-only', PRIVACY_HEAD, '--', 'assets'), [ARTICLE_IMAGE_REL, DRAFT_IMAGE_REL].sort().join('\n'));
+    assert.ok(exists(PRIVACY_REPO, DRAFT_IMAGE_REL), 'the working tree holds the draft image too');
+  });
+
+  test('[AC-16][F-018] with JEKYLL_ENV=production in the caller\'s environment, no git, tar or Jekyll child receives it', BUILD_CASE, () => {
+    expectExit(refRun, 0);
+    expectExit(workRun, 0);
+    const gitRuns = readChildLog(refRun.logs.git);
+    const subcommands = new Set(gitRuns.map(({ args }) => args.split(' ').find((arg) => !arg.startsWith('-'))));
+    for (const subcommand of ['rev-parse', 'ls-tree', 'archive']) {
+      assert.ok(subcommands.has(subcommand), `git ${subcommand} ran: ${[...subcommands].join(', ')}`);
+    }
+    const tarRuns = readChildLog(refRun.logs.tar);
+    assert.equal(tarRuns.length, 1, 'one tar extraction');
+    for (const run of [refRun, workRun]) {
+      for (const child of [...readChildLog(run.logs.git), ...readChildLog(run.logs.tar)]) {
+        assert.equal(child.env, 'unset', `JEKYLL_ENV reached ${child.args}`);
+      }
+      const builds = readJsonLines(run.logs.bundle);
+      assert.equal(builds.length, 3, 'three Jekyll builds');
+      for (const build of builds) assert.equal(build.jekyllEnv, null, `JEKYLL_ENV reached the build of ${build.source}`);
+    }
+  });
+
+  test('[AC-02][F-017] the archive of a revision leaves the tracked draft image out and keeps the rest of assets/', BUILD_CASE, () => {
+    expectExit(refRun, 0);
+    const members = readLines(refRun.logs.members);
+    assert.ok(members.includes(ARTICLE_IMAGE_REL), `the archive holds the article image: ${members.join(', ')}`);
+    assert.deepEqual(members.filter(isDraftImagePath), [], 'the archive holds nothing under assets/drafts/');
+    assert.ok(!exists(refOut, 'ref.tar'), 'the archive is removed once extracted');
+  });
+
+  test('[AC-02][F-017] neither stage nor any build holds the real draft image; both keep the article image', BUILD_CASE, () => {
+    expectExit(refRun, 0);
+    expectExit(workRun, 0);
+    for (const [run, out] of [[refRun, refOut], [workRun, workOut]]) {
+      const src = path.join(out, 'src');
+      const files = listFiles(src);
+      assert.deepEqual(files.filter(isDraftImagePath), [DRAFT_IMAGE], `${src}: only the synthetic draft image`);
+      assert.ok(files.includes(ARTICLE_IMAGE_REL), `${src} keeps the article image`);
+      for (const build of readJsonLines(run.logs.bundle)) {
+        assert.ok(!build.files.includes(DRAFT_IMAGE_REL), `the build of ${build.source} saw no real draft image`);
+      }
+    }
+  });
+
+  test('[AC-02][F-017] an extraction that fails exits 1, removes the archive and leaves no draft image in the stage', BUILD_CASE, () => {
+    expectExit(failRun, 1);
+    const src = path.join(failOut, 'src');
+    assert.match(failRun.stderr, new RegExp(`^${escapeRegExp(`build-fixture-site: tar exited with status 1: tar -xf ${path.join(failOut, 'ref.tar')} -C ${src}`)}$`, 'm'));
+    assert.ok(!exists(failOut, 'ref.tar'), 'the archive is removed after the failed extraction');
+    const members = readLines(failRun.logs.members);
+    assert.ok(members.includes(ARTICLE_IMAGE_REL), `the archive was complete: ${members.join(', ')}`);
+    assert.deepEqual(members.filter(isDraftImagePath), [], 'the archive held nothing under assets/drafts/');
+    const files = listFiles(src);
+    assert.ok(files.includes(ARTICLE_IMAGE_REL), `the extraction ran before failing: ${files.join(', ')}`);
+    assert.deepEqual(files.filter(isDraftImagePath), [], `${src} holds nothing under assets/drafts/`);
+    assert.deepEqual(readJsonLines(failRun.logs.bundle), [], 'nothing was built');
+  });
+
+  test('[AC-02][F-017] a draft image found in the stage is removed and stops the build with exit 1 before anything is added', BUILD_CASE, () => {
+    expectExit(injectRun, 1);
+    const src = path.join(injectOut, 'src');
+    assert.match(
+      injectRun.stderr,
+      new RegExp(`^${escapeRegExp(`build-fixture-site: the staged source held assets/drafts/, which staging must leave out; it was removed from ${src} and nothing was built`)}$`, 'm'),
+    );
+    assert.ok(!exists(injectOut, 'ref.tar'), 'the archive is removed');
+    const files = listFiles(src);
+    assert.ok(files.includes(ARTICLE_IMAGE_REL), `the extraction ran: ${files.join(', ')}`);
+    assert.ok(!exists(src, 'assets/drafts'), `${src} holds no assets/drafts/`);
+    assert.deepEqual(files.filter((file) => file.startsWith('_drafts/') || file.startsWith('_posts/')), [], 'no fixture or synthetic file was added');
+    assert.deepEqual(readJsonLines(injectRun.logs.bundle), [], 'nothing was built');
   });
 });

@@ -3,32 +3,40 @@
  * Shared helper for the built-output tests (AC-07). It is not a test file: its
  * name does not match `*.test.mjs`, so `node --test "tests/**\/*.test.mjs"`
  * only reaches it through the suites that import it:
- *   - `tests/static/built-pages.test.mjs`        all four exports
+ *   - `tests/static/built-pages.test.mjs`        all five exports
  *   - `tests/static/built-search-index.test.mjs` `parseStartTags`, `decodeEntities`
  *   - `tests/static/site-chrome.test.mjs`        `parseStartTags`, `decodeEntities`
- *   - `tests/unit/site-links.test.mjs`           all four exports
+ *   - `tests/unit/site-links.test.mjs`           all five exports
  *
  * Everything is synchronous, so consumers can call it at module top level or
  * inside `test()`. Importing the module has no side effects and nothing here
  * writes to the console; findings are returned for the caller to assert on.
  *
- * Why regular expressions instead of an HTML library: the repository adds no
- * runtime or test dependencies beyond Playwright, and the inputs are the
- * site's own pages, written by hand (`index.html`) or emitted by Jekyll,
- * kramdown and Liquid with every attribute value quoted and escaped. Two
- * properties make start tags reliable to find in that output:
- *   - Comments and start tags are read in one left-to-right scan, each
- *     consumed whole. A URL inside a comment is never read as a link, and
- *     `<!--` inside a quoted attribute value never opens a comment. A
- *     comment ends where the HTML tokenizer ends one (`-->`, `--!>`, the
- *     abrupt `<!-->` or `<!--->`, or the end of the input), and offsets
- *     point into the original text.
- *   - Escaped markup (`&lt;a href="/nope"&gt;` in a code sample) has no `<`,
- *     and Rouge splits highlighted `src=` text across `<span>` elements, so
- *     neither is ever read as a tag or an attribute.
- * `<script>` and `<style>` contents are scanned like any other text: blog
- * pages carry no inline scripts under their Content-Security-Policy, and the
- * home page's only script is external.
+ * Input: the site's own pages, written by hand (`index.html`) or emitted by
+ * Jekyll. Layout and Liquid output is quoted and escaped, but an article body
+ * is trusted author HTML that kramdown passes through unescaped, so a page
+ * can hold any markup a browser accepts: boolean and unquoted attributes,
+ * attributes with no space between them, `/` between attributes, malformed
+ * comments and raw-text elements. Escaped markup (`&lt;a href="/nope"&gt;`
+ * in a code sample) holds no `<`, and Rouge splits highlighted `src=` text
+ * across `<span>` elements, so neither is ever read as a tag or an attribute.
+ *
+ * `tokenizeHtml` reads that input with the tag, comment and bogus-comment
+ * states of the WHATWG HTML tokenizer, so every tag, attribute and comment
+ * boundary falls where a browser puts it, and offsets point into the
+ * original text. It only moves forward: each state reads one run with a
+ * sticky regular expression or searches ahead once, so its work stays linear
+ * in the input however malformed that is. It does not model tree
+ * construction (implied end tags, misnested elements, foreign content such
+ * as SVG and MathML) or the escaped states of script data, and it enters the
+ * raw-text states only when asked (`rawText`). `parseStartTags` reads
+ * without them, so `<script>` and `<style>` contents are scanned like any
+ * other text: blog pages carry no inline scripts under their
+ * Content-Security-Policy, and the home page's only script is external.
+ *
+ * Why no HTML library: the repository adds no runtime or test dependencies
+ * beyond Playwright, and these checks need only token boundaries, not a
+ * document tree.
  *
  * Link-checking model (`checkSiteLinks`): every `href`, `src` and
  * `data-index` value on every built HTML page is resolved the way a browser
@@ -47,13 +55,27 @@ import { URL, fileURLToPath } from 'node:url';
 
 /**
  * @typedef {object} StartTag
- * @property {string} name   Tag name, lowercased (`a`, `nav`, `use`).
+ * @property {string} name   Tag name, ASCII-lowercased (`a`, `nav`, `use`).
  * @property {Record<string, string>} attrs
- *   Attributes keyed by lowercased name; values entity-decoded, `""` for a
+ *   Attributes keyed by ASCII-lowercased name; values entity-decoded, `""` for a
  *   boolean attribute, first occurrence of a duplicate name wins.
  * @property {number} start  Offset of the tag's `<` in the original HTML.
  * @property {number} end    Exclusive end offset (`start + length`).
  * @property {string} source The tag's original text, `html.slice(start, end)`.
+ */
+
+/**
+ * @typedef {object} HtmlToken
+ * @property {'start-tag' | 'end-tag' | 'comment' | 'bogus-comment' | 'raw-text'} type
+ * @property {string} [name] Tags and raw text: the element name,
+ *   ASCII-lowercased, NUL replaced by U+FFFD.
+ * @property {{ name: string, value: string | null }[]} [attrs] Tags only:
+ *   every attribute in source order, duplicates included. Names are
+ *   ASCII-lowercased; values are raw (not entity-decoded) and `null` for a
+ *   boolean attribute; NUL is replaced by U+FFFD in both.
+ * @property {number} start Offset of the token's first character.
+ * @property {number} end   Exclusive end offset.
+ * @property {boolean} terminated `false` when the input ends inside the token.
  */
 
 /**
@@ -87,7 +109,6 @@ import { URL, fileURLToPath } from 'node:url';
  */
 const ENTITY_RE = /&(?:#(\d+)|#[xX]([0-9a-fA-F]+)|(amp|quot|lt|gt|apos|nbsp));/g;
 
-/** Replacement text for the named references in `ENTITY_RE`. */
 const NAMED_ENTITIES = Object.freeze({
   amp: '&',
   quot: '"',
@@ -98,31 +119,38 @@ const NAMED_ENTITIES = Object.freeze({
 });
 
 /**
- * An HTML comment, ended where the HTML tokenizer ends one: at `-->` or
- * `--!>`, at once for the abrupt empty comments `<!-->` and `<!--->`, or at
- * the end of the input when it is never closed. No capture groups.
+ * The runs `tokenizeHtml` reads, one per tokenizer state. Each is sticky
+ * (`y`): it matches at the offset it is given or not at all, and a `*` run
+ * always matches, so every state reads its characters exactly once.
+ * Whitespace is the tokenizer's: tab, LF, FF, CR and space.
  */
-const COMMENT_RE = /<!--(?:-?>|[\s\S]*?(?:--!?>|$))/g;
+const WHITESPACE_RUN_RE = /[\t\n\f\r ]*/y;
+const TAG_NAME_RUN_RE = /[^\t\n\f\r />]*/y;
+const ATTRIBUTE_NAME_RUN_RE = /[^\t\n\f\r />=]*/y;
+const DOUBLE_QUOTED_RUN_RE = /[^"]*/y;
+const SINGLE_QUOTED_RUN_RE = /[^']*/y;
+const UNQUOTED_RUN_RE = /[^\t\n\f\r >]*/y;
+
+/** The end of a comment: `-->`, or `--!>`, which the tokenizer accepts too. */
+const COMMENT_END_RE = /--!?>/g;
 
 /**
- * A start tag with quote-aware attributes. `\s` crosses newlines, so tags
- * written over several lines match. `<!DOCTYPE …>`, closing tags and comments
- * never match because the name must start with a letter.
+ * Elements whose content the tokenizer reads as raw text once their start
+ * tag is emitted: RCDATA (`textarea`, `title`), RAWTEXT (`style`, `xmp`,
+ * `iframe`, `noembed`, `noframes`, and `noscript` as a browser with
+ * scripting enabled reads it) and script data. Each maps to the search for
+ * its closer, the first `</name` in any ASCII case followed by whitespace,
+ * `/` or `>`.
  */
-const START_TAG_RE =
-  /<([a-zA-Z][\w:-]*)((?:\s+[^\s"'>\/=]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+))?)*)\s*\/?>/g;
+const RAW_TEXT_CLOSERS = new Map(
+  ['textarea', 'title', 'style', 'xmp', 'iframe', 'noembed', 'noframes', 'noscript', 'script'].map((name) => [
+    name,
+    new RegExp(`</${name}[\\t\\n\\f\\r />]`, 'gi'),
+  ]),
+);
 
-/**
- * A comment or a start tag, whichever begins first. Scanning with one
- * alternation consumes each construct whole, so `<!--` inside a quoted
- * attribute value never opens a comment and a tag inside a comment is never
- * read. The two alternatives cannot both match at one offset (`<!` against
- * `<` plus a letter), and the tag's groups are 1 (name) and 2 (attributes).
- */
-const MARKUP_RE = new RegExp(`${COMMENT_RE.source}|${START_TAG_RE.source}`, 'g');
-
-/** One attribute inside the attribute group captured by `START_TAG_RE`. */
-const ATTR_RE = /([^\s"'>\/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
+/** The element whose content is raw text to the end of the input. */
+const PLAINTEXT = 'plaintext';
 
 /** Attributes whose values `checkSiteLinks` resolves. */
 const CHECKED_ATTRIBUTES = new Set(['href', 'src', 'data-index']);
@@ -160,8 +188,14 @@ const INDEX_FILE = 'index.html';
  */
 function normalizeBase(baseurl) {
   if (typeof baseurl !== 'string') return '';
-  const trimmed = baseurl.trim().replace(/\/+$/, '').replace(/^\/+/, '');
-  return trimmed === '' ? '' : `/${trimmed}`;
+  const trimmed = baseurl.trim();
+  // Index scans rather than slash-run expressions: an unanchored /\/+$/
+  // retries every suffix of a long run of slashes that a non-slash ends.
+  let end = trimmed.length;
+  while (end > 0 && trimmed[end - 1] === '/') end -= 1;
+  let start = 0;
+  while (start < end && trimmed[start] === '/') start += 1;
+  return start === end ? '' : `/${trimmed.slice(start, end)}`;
 }
 
 /**
@@ -242,33 +276,144 @@ function realpathOrNull(file) {
 }
 
 /**
- * Parses the attribute group of one start tag.
+ * The attributes of one start-tag token as a record: values entity-decoded,
+ * `""` for a boolean attribute, the first of duplicate names kept.
  *
  * The result is an ordinary object rather than `Object.create(null)` so that
  * consumers can compare it with object literals under `node:assert/strict`,
  * which also compares prototypes. Keys are defined as own data properties, so
  * an attribute named `__proto__` or `constructor` is stored like any other,
  * and the duplicate check looks at own keys only.
- * @param {string} group
+ * @param {{ name: string, value: string | null }[]} list `HtmlToken.attrs`
  * @returns {Record<string, string>}
  */
-function parseAttributes(group) {
+function attributeRecord(list) {
   /** @type {Record<string, string>} */
   const attrs = {};
-  const re = new RegExp(ATTR_RE.source, 'g');
-  let match;
-  while ((match = re.exec(group)) !== null) {
-    const name = match[1].toLowerCase();
+  for (const { name, value } of list) {
     if (Object.hasOwn(attrs, name)) continue;
-    const raw = match[2] ?? match[3] ?? match[4];
     Object.defineProperty(attrs, name, {
-      value: raw === undefined ? '' : decodeEntities(raw),
+      value: value === null ? '' : decodeEntities(value),
       enumerable: true,
       writable: true,
       configurable: true,
     });
   }
   return attrs;
+}
+
+/**
+ * End offset of the run `re` (a sticky `*` expression) reads from `from`.
+ * @param {RegExp} re
+ * @param {string} text
+ * @param {number} from
+ * @returns {number}
+ */
+function runEnd(re, text, from) {
+  re.lastIndex = from;
+  re.test(text);
+  return re.lastIndex;
+}
+
+/**
+ * A tag or attribute name as the tokenizer stores it: ASCII letters
+ * lowercased (never other characters, as `toLowerCase` would) and NUL
+ * replaced by U+FFFD.
+ * @param {string} raw
+ * @returns {string}
+ */
+function tokenName(raw) {
+  return raw.replace(/[A-Z]+/g, (letters) => letters.toLowerCase()).replaceAll('\0', '\uFFFD');
+}
+
+/**
+ * Reads one start or end tag through the tag-name, attribute and
+ * self-closing states of the WHATWG tokenizer.
+ *   - The name runs to whitespace, `/` or `>`, so `<` is part of it.
+ *   - A `/` not followed by `>` is skipped, so `<script/src=…>` has a `src`.
+ *   - An attribute name runs to whitespace, `/`, `>` or `=`. It may hold
+ *     `<`, `"` and `'`, and a leading `=` is part of it.
+ *   - A quoted value runs to its closing quote. Any character after it other
+ *     than whitespace, `/` or `>` starts a new attribute, so `"x"onerror=`
+ *     is two attributes. An unquoted value runs to whitespace or `>`.
+ * @param {string} text
+ * @param {'start-tag' | 'end-tag'} type
+ * @param {number} start Offset of the `<`.
+ * @param {number} nameStart Offset of the name's first letter.
+ * @returns {HtmlToken}
+ */
+function readTag(text, type, start, nameStart) {
+  const { length } = text;
+  /** @type {{ name: string, value: string | null }[]} */
+  const attrs = [];
+  let i = runEnd(TAG_NAME_RUN_RE, text, nameStart);
+  const name = tokenName(text.slice(nameStart, i));
+  const token = (end, terminated) => ({ type, name, attrs, start, end, terminated });
+
+  for (;;) {
+    // Before attribute name.
+    i = runEnd(WHITESPACE_RUN_RE, text, i);
+    if (i >= length) return token(length, false);
+    if (text[i] === '>') return token(i + 1, true);
+    if (text[i] === '/') {
+      // Self-closing start tag: anything but `>` is read again as above.
+      i += 1;
+      if (i >= length) return token(length, false);
+      if (text[i] === '>') return token(i + 1, true);
+      continue;
+    }
+
+    const attrStart = i;
+    i = runEnd(ATTRIBUTE_NAME_RUN_RE, text, text[i] === '=' ? i + 1 : i);
+    const attrName = tokenName(text.slice(attrStart, i));
+
+    // After attribute name: without `=`, the attribute is boolean and
+    // whatever follows is read again as above.
+    i = runEnd(WHITESPACE_RUN_RE, text, i);
+    if (i >= length || text[i] !== '=') {
+      attrs.push({ name: attrName, value: null });
+      continue;
+    }
+
+    // Before attribute value.
+    i = runEnd(WHITESPACE_RUN_RE, text, i + 1);
+    if (i >= length) {
+      attrs.push({ name: attrName, value: '' });
+      return token(length, false);
+    }
+    const quote = text[i];
+    if (quote === '"' || quote === "'") {
+      const valueEnd = runEnd(quote === '"' ? DOUBLE_QUOTED_RUN_RE : SINGLE_QUOTED_RUN_RE, text, i + 1);
+      attrs.push({ name: attrName, value: text.slice(i + 1, valueEnd).replaceAll('\0', '\uFFFD') });
+      if (valueEnd >= length) return token(length, false);
+      i = valueEnd + 1;
+    } else {
+      // Unquoted; an immediate `>` leaves the value empty and ends the tag.
+      const valueEnd = runEnd(UNQUOTED_RUN_RE, text, i);
+      attrs.push({ name: attrName, value: text.slice(i, valueEnd).replaceAll('\0', '\uFFFD') });
+      i = valueEnd;
+    }
+  }
+}
+
+/**
+ * Reads the raw text after the start tag of `name`, up to its closer or, with
+ * none (and always for `plaintext`), to the end of the input.
+ * @param {string} text
+ * @param {string} name A key of `RAW_TEXT_CLOSERS`, or `plaintext`.
+ * @param {number} from Offset just after the start tag.
+ * @returns {HtmlToken}
+ */
+function readRawText(text, name, from) {
+  const closer = RAW_TEXT_CLOSERS.get(name);
+  let match = null;
+  if (closer !== undefined) {
+    closer.lastIndex = from;
+    match = closer.exec(text);
+  }
+  return match === null
+    ? { type: 'raw-text', name, start: from, end: text.length, terminated: false }
+    : { type: 'raw-text', name, start: from, end: match.index, terminated: true };
 }
 
 /**
@@ -293,8 +438,10 @@ function collectIds(tags) {
  * page emit: `&amp;`, `&quot;`, `&lt;`, `&gt;`, `&apos;`, `&nbsp;` and
  * decimal or hexadecimal numeric references. One pass, so `&amp;lt;` becomes
  * `&lt;`. A reference must end in `;`; other named references stay literal.
- * Never throws: a numeric reference to 0, a surrogate or a value above
- * U+10FFFF is left as written.
+ * For string input it never throws: a numeric reference to 0, a surrogate or
+ * a value above U+10FFFF is left as written. Any other input is coerced with
+ * `String()` (`null` and `undefined` become `""`), and that coercion throws
+ * for a value with no string conversion, such as `Object.create(null)`.
  *
  * @example
  * decodeEntities('&amp;lt; R&amp;D &#39;x&#x27; &copy; &family=');
@@ -320,11 +467,111 @@ export function decodeEntities(text) {
 }
 
 /**
- * Lists every start tag of an HTML document in document order. One
- * left-to-right scan reads comments and start tags whole: a tag inside a
- * comment is not returned, and `<!--` inside a quoted attribute value is
- * text, not the start of a comment. Offsets and `source` refer to the
- * original string.
+ * Splits HTML into the tokens a browser's tokenizer reads, in document
+ * order. Text is not emitted: it is the gaps between tokens, except that
+ * `</>`, which a browser drops, is consumed without a token.
+ *   - `<` plus an ASCII letter opens a start tag, `</` plus one an end tag;
+ *     both are read like a browser reads them (`readTag`), attributes and
+ *     quotes included.
+ *   - A comment (`<!--`) ends at `-->` or `--!>`, at once for `<!-->` and
+ *     `<!--->`, or at the end of the input.
+ *   - `<!` followed by anything else (`<!DOCTYPE`, `<![CDATA[`), `<?`, and
+ *     `</` followed by a character other than a letter or `>` are each a
+ *     bogus comment, ending at the first `>`.
+ *   - Any other `<`, and `</` at the end of the input, is text.
+ *   - A token the input ends inside has `terminated: false`.
+ * With `rawText`, the content after a `textarea`, `title`, `style`, `xmp`,
+ * `iframe`, `noembed`, `noframes`, `noscript` or `script` start tag (a
+ * self-closing `/>` included) is one `raw-text` token, ending at the first
+ * `</name` in any ASCII case followed by whitespace, `/` or `>`, or
+ * unterminated at the end of the input; that end tag is then read as usual.
+ * `plaintext` content always runs to the end, unterminated. A script whose
+ * content holds `<!--` can end later in a browser (its escaped states), and
+ * inside SVG or MathML these elements are not raw text at all.
+ *
+ * Linear in the input: no character is read twice, whatever is left open.
+ * A non-string is coerced with `String()` (`null` and `undefined` become
+ * `""`), which throws for a value with no string conversion.
+ *
+ * @example
+ * tokenizeHtml('<p class=x>a</p><!-- b --><textarea><b></textarea>', { rawText: true }).map((t) => t.type);
+ * // → ['start-tag', 'end-tag', 'comment', 'start-tag', 'raw-text', 'end-tag']
+ * @param {unknown} html
+ * @param {{ rawText?: boolean }} [options]
+ * @returns {HtmlToken[]}
+ */
+export function tokenizeHtml(html, { rawText = false } = {}) {
+  const text = typeof html === 'string' ? html : String(html ?? '');
+  const { length } = text;
+  /** @type {HtmlToken[]} */
+  const tokens = [];
+  /** A bogus comment from `start` to the first `>` at or after `from`. */
+  const bogus = (start, from) => {
+    const close = text.indexOf('>', from);
+    return close === -1
+      ? { type: 'bogus-comment', start, end: length, terminated: false }
+      : { type: 'bogus-comment', start, end: close + 1, terminated: true };
+  };
+  const isLetter = (offset) => /[A-Za-z]/.test(text[offset] ?? '');
+
+  let i = 0;
+  while (i < length) {
+    const open = text.indexOf('<', i);
+    if (open === -1) break;
+    const next = text[open + 1];
+    /** @type {HtmlToken | null} */
+    let token = null;
+    if (isLetter(open + 1)) {
+      token = readTag(text, 'start-tag', open, open + 1);
+    } else if (next === '!') {
+      if (text.startsWith('--', open + 2)) {
+        let end;
+        if (text[open + 4] === '>') end = open + 5;
+        else if (text.startsWith('->', open + 4)) end = open + 6;
+        else {
+          COMMENT_END_RE.lastIndex = open + 4;
+          const close = COMMENT_END_RE.exec(text);
+          end = close === null ? -1 : close.index + close[0].length;
+        }
+        token = end === -1
+          ? { type: 'comment', start: open, end: length, terminated: false }
+          : { type: 'comment', start: open, end, terminated: true };
+      } else {
+        token = bogus(open, open + 2);
+      }
+    } else if (next === '?') {
+      token = bogus(open, open + 2);
+    } else if (next === '/') {
+      if (isLetter(open + 2)) token = readTag(text, 'end-tag', open, open + 2);
+      else if (text[open + 2] === '>') {
+        i = open + 3;
+        continue;
+      } else if (open + 2 >= length) break;
+      else token = bogus(open, open + 2);
+    }
+    if (token === null) {
+      i = open + 1;
+      continue;
+    }
+    tokens.push(token);
+    i = token.end;
+    if (rawText && token.type === 'start-tag' && token.terminated) {
+      if (token.name === PLAINTEXT || RAW_TEXT_CLOSERS.has(token.name)) {
+        const content = readRawText(text, token.name, i);
+        tokens.push(content);
+        i = content.end;
+      }
+    }
+  }
+  return tokens;
+}
+
+/**
+ * Lists every start tag of an HTML document in document order, read by
+ * `tokenizeHtml` without raw text: a tag inside a comment, a bogus comment
+ * or an end tag's attribute value is not returned, `<!--` inside a quoted
+ * value is text, and a tag the input ends inside is dropped, as a browser
+ * drops it. Offsets and `source` refer to the original string.
  *
  * @example
  * const [nav] = parseStartTags('<nav class="mobile-menu" id="mobile-menu" aria-label="Primary" hidden>');
@@ -336,19 +583,14 @@ export function parseStartTags(html) {
   const original = typeof html === 'string' ? html : String(html ?? '');
   /** @type {StartTag[]} */
   const tags = [];
-  const re = new RegExp(MARKUP_RE.source, 'g');
-  let match;
-  while ((match = re.exec(original)) !== null) {
-    // A comment has no tag-name group; it is consumed and skipped.
-    if (match[1] === undefined) continue;
-    const start = match.index;
-    const end = start + match[0].length;
+  for (const token of tokenizeHtml(original)) {
+    if (token.type !== 'start-tag' || !token.terminated) continue;
     tags.push({
-      name: match[1].toLowerCase(),
-      attrs: parseAttributes(match[2]),
-      start,
-      end,
-      source: original.slice(start, end),
+      name: token.name,
+      attrs: attributeRecord(token.attrs),
+      start: token.start,
+      end: token.end,
+      source: original.slice(token.start, token.end),
     });
   }
   return tags;

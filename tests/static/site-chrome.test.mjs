@@ -1,54 +1,35 @@
-/* Cabrillo Coast LLC — home page integrity, blog chrome parity and blog asset rules (AC-10, F-018, F-019) */
+/* Cabrillo Coast LLC — home page integrity, blog chrome parity and blog asset rules (AC-05, AC-10, F-018, F-019) */
 /**
- * Source checks over the files the blog shares with, or adds beside, the
- * hand-written home page. The suite runs in the first
- * `node --test "tests/**\/*.test.mjs"` pass of `scripts/verify.mjs`, which
- * follows the real-site `bundle exec jekyll build`, but it reads no build
- * output itself, so it gives the same answer with or without `_site/`.
+ * Source checks that the blog leaves the hand-written home page intact,
+ * keeps its header and footer includes in step with the home page
+ * navigation, and holds its own assets to their budgets and rules. The
+ * blog templates must end every printed value in `escape`, except the
+ * trusted `{{ content }}`, site-path URLs and `url_encode` values. The
+ * suite runs in the first `node --test "tests/**\/*.test.mjs"` pass of
+ * `scripts/verify.mjs`, after the real-site build, but reads no build
+ * output, so it gives the same answer with or without `_site/`. Paths
+ * resolve from this file's location (`ROOT`), never from `process.cwd()`.
  *
- * What it proves:
- *   - Home page navigation. `index.html` lists the seven header and
- *     mobile-menu destinations and the five footer destinations in the order
- *     the plan fixes, with Blog at `./blog/`, and its mobile menu is a
- *     `nav.mobile-menu#mobile-menu[aria-label="Primary"][hidden]` landmark.
- *   - Home page pass-through. `index.html` starts with `<!DOCTYPE html>`, so
- *     it has no front matter and Jekyll copies it byte-for-byte, and it loads
- *     exactly one script, `./main.js`.
- *   - Home page integrity. With the three Blog lines removed and the mobile
- *     menu's `nav` turned back into its `div`, `index.html` is byte-identical
- *     to the pre-blog page, whose size and SHA-256 are frozen here: no other
- *     edit to the head, sections, contact form or script tag passes.
- *   - Header and footer fit. `styles.css`, read with comments ignored and the
- *     cascade applied, keeps the logo from shrinking, the navigation links
- *     on one line, the footer links wrapping 10px by 24px, and the switch to
- *     the hamburger in the 900px block, not the 720px one, at every width
- *     either side of both breakpoints.
- *   - Home page budgets. PT-4: five first-party requests including the
- *     document. PT-1: at most 237,954 first-party bytes. PT-2: `main.js` at
- *     most 3,609 bytes. Requests are discovered in every form a page can
- *     make them (`srcset`, inline and `<style>` CSS, SVG references, any
- *     fetching `<link>`), absolute URLs on the site's own host included
- *     (`CNAME`, or `_config.yml`'s `url` on the project path).
- *   - Chrome parity. The navigation the includes output on every page,
- *     outside any Liquid condition or loop, matches `index.html` label for
- *     label, with each home page href mapped to its site-root form; every
- *     href the includes write, quoted or not, is one `relative_url` output;
- *     and the includes keep every hook `main.js` drives, so the blog's
- *     mobile menu, scroll shadow and footer year work with `main.js`
- *     unchanged.
- *   - Blog assets. `blog/search.js` is at most 5,000 bytes; it is one
- *     invoked function expression opening with a `"use strict"` directive,
- *     uses no syntax added after ES5, and calls no HTML-writing or
- *     code-evaluating API in any spelling, all read from its token stream;
- *     `blog/blog.css` is at most 8,000 bytes.
+ * Standing choices behind the checks:
+ *   - Home page integrity rests on the pre-blog page's size and SHA-256,
+ *     frozen in this file (`PRE_BLOG_COMMIT`): with the blog's edits
+ *     reversed, any other edit to `index.html` fails.
+ *   - `styles.css` is read as a browser reads it, comments ignored and the
+ *     cascade applied, so a commented-out or overridden rule cannot pass for
+ *     a live one.
+ *   - The request budgets count a static enumeration of the first-party
+ *     URLs written in the HTML and CSS source, absolute URLs on the site's
+ *     own host included. Requests a script makes when it runs are not seen,
+ *     and linked stylesheets are read one level deep.
+ *   - The `search.js` sink check is lexical: it finds the listed sinks in
+ *     the static spellings `unsafeSinks` names (names with escapes resolved,
+ *     `.`, `?.` and string-literal bracket keys, sink names in literal text)
+ *     but resolves no alias or run-time value, such as
+ *     `var d = document; d.write(s)` or `el[a + b]`. It guards how
+ *     `search.js` is written and is no proof of XSS safety.
  *
- * Paths resolve from this file's own location (`ROOT`), never from
- * `process.cwd()`, so the suite gives the same answer from any directory.
- *
- * Runs with `node --test tests/static/site-chrome.test.mjs` or as part of
- * `node --test "tests/**\/*.test.mjs"`. It needs no network and writes
- * nothing; only when the integrity check fails does it ask `git`, if
- * available, for the first differing line.
+ * It needs no network and writes nothing; only when the integrity check
+ * fails does it ask `git`, if available, for the first differing line.
  */
 
 import { test } from 'node:test';
@@ -62,14 +43,10 @@ import vm from 'node:vm';
 
 import { decodeEntities, parseStartTags } from './lib/site-links.mjs';
 
-/* ------------------------------------------------------------------------ */
 /* Constants                                                                 */
-/* ------------------------------------------------------------------------ */
 
-/** Repository root: two levels above `tests/static/`. */
 const ROOT = fileURLToPath(new URL('../../', import.meta.url));
 
-/** Header and mobile-menu labels on the home page, in order. */
 const HOME_LABELS = Object.freeze([
   'Services',
   'Agentic AI',
@@ -80,7 +57,6 @@ const HOME_LABELS = Object.freeze([
   'Get in touch',
 ]);
 
-/** Header and mobile-menu hrefs on the home page, paired with `HOME_LABELS`. */
 const HOME_HREFS = Object.freeze([
   '#services',
   '#agentic',
@@ -91,10 +67,8 @@ const HOME_HREFS = Object.freeze([
   '#contact',
 ]);
 
-/** Footer labels on the home page, in order. */
 const FOOT_LABELS = Object.freeze(['Services', 'Approach', 'About', 'Blog', 'Contact']);
 
-/** Footer hrefs on the home page, paired with `FOOT_LABELS`. */
 const FOOT_HREFS = Object.freeze(['#services', '#approach', '#about', './blog/', '#contact']);
 
 /**
@@ -105,19 +79,14 @@ const FOOT_HREFS = Object.freeze(['#services', '#approach', '#about', './blog/',
  */
 const PRE_BLOG_COMMIT = '4611c37';
 
-/** Size in bytes of `index.html` at `PRE_BLOG_COMMIT`. */
 const PRE_BLOG_INDEX_BYTES = 23_676;
 
-/** SHA-256 of `index.html` at `PRE_BLOG_COMMIT`, lowercase hex. */
 const PRE_BLOG_INDEX_SHA256 = '985588747b08aac84b6a305aeb62a8ed674aa5a0a4c0a1f052fcebac3622fa1e';
 
-/** The Blog link the plan inserts into each of the three home page lists. */
 const BLOG_ANCHOR = '<a href="./blog/">Blog</a>';
 
-/** The mobile menu's opening tag as the plan writes it. */
 const MOBILE_MENU_NAV_OPEN = '<nav class="mobile-menu" id="mobile-menu" aria-label="Primary" hidden>';
 
-/** The mobile menu's opening tag before the blog. */
 const PRE_BLOG_MOBILE_MENU_OPEN = '<div class="mobile-menu" id="mobile-menu" hidden>';
 
 /**
@@ -139,10 +108,8 @@ const PT2_MAX_BYTES = 3_609;
 /** PT-4: first-party requests of the home page, document included. */
 const PT4_REQUESTS = 5;
 
-/** First-party resources `index.html` itself requests, sorted. */
 const HOME_HTML_RESOURCES = Object.freeze(['./favicon.svg', './main.js', './styles.css']);
 
-/** First-party resources the home page stylesheets request, sorted. */
 const HOME_CSS_RESOURCES = Object.freeze(['./assets/hero-lighthouse.jpg']);
 
 /**
@@ -181,7 +148,6 @@ const NAV_WIDE = Object.freeze([
   Object.freeze(['.mobile-menu[data-open="true"]', 'display', undefined]),
 ]);
 
-/** The navigation at or below `NAV_SWITCH_WIDTH`: the three switch rules. */
 const NAV_NARROW = Object.freeze([
   Object.freeze(['.nav-links', 'display', 'none']),
   Object.freeze(['.nav-toggle', 'display', 'flex']),
@@ -199,10 +165,8 @@ const CSS_ENVIRONMENTS = Object.freeze(
       ['no-preference', 'reduce'].map((motion) => Object.freeze({ width, scheme, motion })))),
 );
 
-/** Size limit of `blog/search.js` (AAP 0.5.5). */
 const SEARCH_JS_MAX_BYTES = 5_000;
 
-/** Size limit of `blog/blog.css` (AAP 0.5.4). */
 const BLOG_CSS_MAX_BYTES = 8_000;
 
 /**
@@ -235,7 +199,11 @@ const NON_FETCHING_LINK_RELS = new Set([
   'terms-of-service',
 ]);
 
-/** Attributes whose value is one URL the browser loads, on any element (`<video poster>`, `<object data>`). */
+/**
+ * Attributes whose value is read as one requested URL (`<video poster>`,
+ * `<object data>`). They count on every element, whatever its type, so one
+ * that loads nothing where it is written (`<div data>`) counts as well.
+ */
 const RESOURCE_URL_ATTRIBUTES = new Set(['src', 'poster', 'data', 'background']);
 
 /** Attributes holding a list of image candidates, each a URL and an optional descriptor. */
@@ -244,9 +212,7 @@ const SRCSET_ATTRIBUTES = new Set(['srcset', 'imagesrcset']);
 /** Elements whose `href` is navigation, a `<link>` (classified by `rel`) or a `<base>` (refused). */
 const NON_RESOURCE_HREF_ELEMENTS = new Set(['a', 'area', 'link', 'base']);
 
-/* ------------------------------------------------------------------------ */
 /* File helpers                                                              */
-/* ------------------------------------------------------------------------ */
 
 /**
  * Absolute path of a repository file given its POSIX path from the root.
@@ -275,9 +241,7 @@ function size(rel) {
   return statSync(abs(rel)).size;
 }
 
-/* ------------------------------------------------------------------------ */
 /* HTML helpers                                                              */
-/* ------------------------------------------------------------------------ */
 
 /**
  * Whether a parsed start tag's `class` attribute holds `token`.
@@ -389,7 +353,6 @@ function siteRootHref(href) {
 /** A Liquid tag `{% … %}` or output `{{ … }}`, with its whitespace-control dashes. */
 const LIQUID_MARKUP_RE = /\{%(-?)([\s\S]*?)(-?)%\}|\{\{(-?)([\s\S]*?)(-?)\}\}/g;
 
-/** The `{% endraw %}` that ends a raw block. */
 const LIQUID_ENDRAW_RE = /\{%-?\s*endraw\s*-?%\}/g;
 
 /**
@@ -560,9 +523,7 @@ function liquidToStatic(src) {
   return out;
 }
 
-/* ------------------------------------------------------------------------ */
 /* Home page integrity helpers                                               */
-/* ------------------------------------------------------------------------ */
 
 /**
  * How many times `needle` occurs in `haystack`, without overlaps.
@@ -662,9 +623,7 @@ function firstDifferenceFromPreBlog(restored) {
   return `first difference at line ${at + 1} (edits reversed): expected ${want}, found ${found}`;
 }
 
-/* ------------------------------------------------------------------------ */
 /* Request helpers                                                           */
-/* ------------------------------------------------------------------------ */
 
 /** `url(…)` in CSS, with the value double-quoted, single-quoted or bare. */
 const CSS_URL_RE = /url\(\s*(?:"([^"]*)"|'([^']*)'|([^)"'\s]*))\s*\)/gi;
@@ -819,8 +778,8 @@ function srcsetUrls(value) {
 }
 
 /**
- * Every first-party resource a page requests while it loads, so a request
- * added in any form changes the result:
+ * The first-party URLs a page's markup references for loading, read
+ * statically from the HTML source in these forms:
  *   - the `href` of every `<link>` whose `rel` can fetch: anything but the
  *     relations in `NON_FETCHING_LINK_RELS`, unknown ones included;
  *   - `src`, `poster`, `data` and `background` on any element, and each
@@ -831,8 +790,10 @@ function srcsetUrls(value) {
  *   - the CSS of every `style` attribute and `<style>` element, and any
  *     attribute value holding `url(…)` (SVG `fill`, `filter`, `mask`), read
  *     with `cssRequests`.
- * Anchors are navigation, never counted, so the home page's `./blog/` links
- * add nothing. A `<base>` element would change how every relative URL
+ * No other attribute is read, and a request a script makes when it runs
+ * (`fetch`, or an element or URL it creates) is not seen. Anchors are
+ * navigation, never counted, so the home page's `./blog/` links add
+ * nothing. A `<base>` element would change how every relative URL
  * resolves, so a page with one is refused.
  * @param {string} html
  * @param {string} host The site host (`siteHost`).
@@ -907,9 +868,14 @@ function cssRequests(css, host) {
 }
 
 /**
- * Everything the home page loads from the site itself: the URLs in
- * `index.html`, the URLs inside each first-party stylesheet it links, and
- * the distinct repository files they name, the document included.
+ * The home page's first-party requests as its source shows them: the URLs
+ * in `index.html` (`htmlRequests`), the URLs inside each first-party
+ * stylesheet it links with a `rel` holding `stylesheet` (`cssRequests`),
+ * and the distinct repository files they name, the document included.
+ * Stylesheets are read one level deep: an `@import` target, in a linked
+ * stylesheet or a `<style>` element, counts as a request, but its own
+ * contents are not read. Requests `main.js` or any other script makes when
+ * it runs are not counted.
  * @returns {{ htmlUrls: string[], cssUrls: string[], files: string[] }}
  */
 function homeRequests() {
@@ -928,9 +894,7 @@ function homeRequests() {
   return { htmlUrls, cssUrls: [...cssUrls].sort(), files: [...files].sort() };
 }
 
-/* ------------------------------------------------------------------------ */
 /* Stylesheet helpers                                                        */
-/* ------------------------------------------------------------------------ */
 
 /** Values every CSS property accepts. */
 const CSS_WIDE_KEYWORDS = new Set(['inherit', 'initial', 'unset', 'revert', 'revert-layer']);
@@ -963,8 +927,12 @@ const CSS_FIT_LONGHANDS = Object.freeze([
 
 /**
  * Exclusive end of the CSS string whose opening quote is at `start`: just
- * past the closing quote, or at the line break or end of text that ends an
- * unterminated one. A backslash escapes the next character.
+ * past the closing quote, or, for an unterminated string, at the first LF
+ * (`\n`) or the end of text. A backslash escapes the next character, an LF
+ * included. CR and form feed do not end a string here, unlike in CSS's
+ * tokenizer: the helper exists only so the stylesheet scanners
+ * (`stripCssComments`, `cssStop`, `cssBlockEnd`, `normalizeCssText`) can
+ * step over strings.
  * @param {string} text
  * @param {number} start
  * @returns {number}
@@ -1378,9 +1346,7 @@ function atRuleApplies(atRule, env) {
   });
 }
 
-/* ------------------------------------------------------------------------ */
 /* JavaScript source scanner                                                 */
-/* ------------------------------------------------------------------------ */
 
 /** Characters that end a `//` comment or an unterminated literal, and allow ASI. */
 const LINE_TERMINATOR_RE = /[\n\r\u2028\u2029]/;
@@ -1435,7 +1401,6 @@ const STATEMENT_LIST_BRACES = new Set(['block', 'function-decl', 'function-expr'
 /** `{` roles whose `}` ends a statement, so a `/` after it opens a regular expression. */
 const STATEMENT_END_BRACES = new Set(['block', 'function-decl']);
 
-/** The opening bracket each closing bracket pairs with. */
 const OPENER_OF = Object.freeze({ ')': '(', ']': '[', '}': '{' });
 
 /** Escapes in a string literal: `\u{…}`, `\uXXXX`, `\xXX`, octal, line continuations, single characters. */
@@ -2097,7 +2062,6 @@ function accessedName(tokens, index) {
   return '';
 }
 
-/** Sinks in the order failures list them. */
 const SINK_KINDS = Object.freeze([
   'innerHTML',
   'outerHTML',
@@ -2159,25 +2123,35 @@ const SINK_TEXT_PATTERNS = Object.freeze([
 ]);
 
 /**
- * Calls that write markup or evaluate strings as code, found on the token
- * stream so every equivalent spelling counts and comments never do. The
- * plan names `innerHTML`, `insertAdjacentHTML`, `document.write`, `eval`
- * and `new Function`; `outerHTML` is checked as well because it is the
- * same kind of sink, and search output must be text only.
- *   - Names are read with their escapes resolved (`inner\u0048TML`), as a
- *     variable, a property or a key: `innerHTML`, `outerHTML`,
- *     `insertAdjacentHTML`, `eval` (`eval(s)`, `window.eval`, `(0, eval)`)
- *     and `Function` (`Function(s)`, `new window.Function(s)`).
- *   - `write` and `writeln` count only as members of `document`, by dot or
- *     as a bracket key, however it is reached (`window.document.write`,
- *     `self['document'].write`, `document['wr' + 'ite']`); `stream.write`,
- *     `stream['write']` and the text `"write"` are not sinks.
- *   - String literals are read decoded, alone and joined by `+`
- *     (`'inner' + 'HTML'`), so a static bracket key (`el['innerHTML']`,
- *     `window['ev' + 'al']`, `self['Function']`) counts. A string, regular
- *     expression or template whose text mentions `innerHTML`, `outerHTML`,
- *     `insertAdjacentHTML`, `document.write`, `eval` or `new Function`
- *     counts too.
+ * Uses of the sinks that write markup or evaluate strings as code, found
+ * lexically on the token stream, so comments never count. The plan names
+ * `innerHTML`, `insertAdjacentHTML`, `document.write`, `eval` and
+ * `new Function`; `outerHTML` is checked as well because it is the same
+ * kind of sink, and search output must be text only. These static
+ * spellings count:
+ *   - A sink name, its escapes resolved (`inner\u0048TML`), anywhere: as a
+ *     variable, a property after `.` or `?.`, or an object key. The names
+ *     are `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `eval` (`eval(s)`,
+ *     `window.eval`, `(0, eval)`) and `Function` (`Function(s)`,
+ *     `new window.Function(s)`).
+ *   - A bracket key that is one string literal, or string literals joined
+ *     by `+`, read decoded: `el['innerHTML']`, `window['ev' + 'al']`,
+ *     `self['Function']`.
+ *   - `write` and `writeln` only as members of `document`, by `.`, `?.` or
+ *     such a bracket key, with `document` reached by name, a dot chain or
+ *     such a bracket key (`window.document.write`, `self['document'].write`,
+ *     `document['wr' + 'ite']`); `stream.write`, `stream['write']` and the
+ *     text `"write"` are not sinks.
+ *   - A sink name in the decoded text of a string literal, alone or joined
+ *     by `+`, or in the source text of a regular expression or template.
+ * Nothing is followed through a variable, a call, parentheses or any other
+ * value known only at run time, so aliases and computed keys pass:
+ * `var d = document; d.write(s)`, `el[a + b]` with variable parts,
+ * `window[['ev', 'al'].join('')](s)`, `(document).write(s)`. Other APIs
+ * that parse markup or run strings, such as a string passed to
+ * `setTimeout`, are not on the list. The check holds `search.js` to a way
+ * of writing; it is no proof of XSS safety, and its input-to-sink paths
+ * still need review by reading.
  * @param {JsToken[]} tokens
  * @returns {{ what: string, token: JsToken }[]} The first token of each sink, in `SINK_KINDS` order.
  */
@@ -2240,8 +2214,8 @@ function located(found, src) {
 }
 
 /**
- * Whether the token at `index` would continue an expression that ends just
- * before it on the previous line, so no semicolon is inserted between them:
+ * Whether `token` would continue an expression that ends just before it on
+ * the previous line, so no semicolon is inserted between them:
  * an operator, `(`, `[`, `.`, a template, or `in`/`instanceof`. `++`, `--`,
  * `!`, `~`, `{`, `}`, `;`, names and literals start a new statement.
  * @param {JsToken | undefined} token
@@ -2318,9 +2292,7 @@ function isStrictScript(tokens) {
   return after === tokens.length && hasStrictDirective(tokens, bodyAt + 1, body.match);
 }
 
-/* ------------------------------------------------------------------------ */
 /* Home page navigation (index.html)                                         */
-/* ------------------------------------------------------------------------ */
 
 test('[AC-10][F-018] index.html header navigation lists the seven destinations in order, Blog included', () => {
   const nav = element(
@@ -2402,9 +2374,7 @@ test('[AC-10][F-018] index.html is the pre-blog page plus only the Blog links an
   );
 });
 
-/* ------------------------------------------------------------------------ */
 /* Header and footer fit rules (styles.css)                                  */
-/* ------------------------------------------------------------------------ */
 
 test('[AC-10][F-018] styles.css keeps the header and footer fit rules, with the navigation switch at 900px', () => {
   const rules = parseCss(read('styles.css'));
@@ -2454,7 +2424,7 @@ test('[AC-10][F-018] styles.css keeps the header and footer fit rules, with the 
 
 test('[AC-10][F-018] the styles.css reader ignores comments, honours strings and applies the cascade', () => {
   const all = () => true;
-  /** The value a one-rule-set stylesheet gives `longhand` on `selector` at the top level. */
+  /** The stylesheet's cascaded value for `longhand` on `selector` at the top level. */
   const value = (css, selector, longhand) => cascadeCss(parseCss(css), selector, longhand, all);
 
   // Comments never count, inside a value or around a declaration.
@@ -2516,9 +2486,7 @@ test('[AC-10][F-018] the styles.css reader ignores comments, honours strings and
   assert.equal(atRuleApplies('@supports (display:grid)', env), true);
 });
 
-/* ------------------------------------------------------------------------ */
 /* Home page budgets                                                         */
-/* ------------------------------------------------------------------------ */
 
 test('[AC-10][F-018] home page makes exactly 5 first-party requests (PT-4)', (t) => {
   const { htmlUrls, cssUrls, files } = homeRequests();
@@ -2545,7 +2513,7 @@ test('[AC-10][F-018] home page first-party bytes stay within 237,954 (PT-1)', (t
 
 test('[AC-10][F-018] home request discovery sees srcset, inline CSS, style elements and same-origin absolute URLs', () => {
   const host = 'www.example.test';
-  /** First-party URLs a page requests, as the PT-1 and PT-4 checks read `index.html`. */
+  /** First-party URLs the markup references, as the PT-1 and PT-4 checks enumerate them in `index.html`. */
   const urls = (html) => htmlRequests(html, host).urls;
 
   // Responsive images: every candidate of `srcset` and `imagesrcset`.
@@ -2612,9 +2580,7 @@ test('[AC-10][F-018] main.js stays within 3,609 bytes (PT-2)', (t) => {
   assert.ok(bytes <= PT2_MAX_BYTES, `PT-2: main.js is ${bytes} bytes, limit ${PT2_MAX_BYTES}`);
 });
 
-/* ------------------------------------------------------------------------ */
 /* Include parity (_includes/site-header.html, _includes/site-footer.html)  */
-/* ------------------------------------------------------------------------ */
 
 /** A placeholder for the Liquid token at an index, holding no space, quote, `=` or `>`. */
 const LIQUID_PLACEHOLDER_RE = /\uE000(\d+)\uE001/g;
@@ -2645,8 +2611,9 @@ function writtenHrefAttributes(html) {
 
 /**
  * Markup with a space after every quoted attribute value that another
- * attribute follows directly, as in `href="…"{{ marker }}`. HTML reads that
- * as two attributes; `parseStartTags` needs the space to see them.
+ * attribute follows directly, as in `href="…"{{ marker }}`. HTML and
+ * `parseStartTags` both read that as two attributes, so the space changes
+ * neither reading.
  * @param {string} html
  * @returns {string}
  */
@@ -2858,9 +2825,160 @@ test('[AC-10][F-018] the include readers drop conditional markup, see every href
   assert.deepEqual(anchors('<!-- <a href="/j">J</a> --><abbr title="x">K</abbr>'), []);
 });
 
-/* ------------------------------------------------------------------------ */
+/* Output encoding (_layouts/blog.html, _layouts/post.html, blog/index.html) */
+
+/** The blog templates that print front-matter values. */
+const ESCAPED_TEMPLATES = Object.freeze(['_layouts/blog.html', '_layouts/post.html', 'blog/index.html']);
+
+/** Filters that may end an unescaped output when applied directly to a `URL_INPUT_RE` input. */
+const URL_FILTERS = new Set(['relative_url', 'absolute_url']);
+
+/** URL inputs written by the template or the permalink: a quoted string, `page.url` or `post.url`. */
+const URL_INPUT_RE = /^(?:'[^']*'|"[^"]*"|page\.url|post\.url)$/;
+
+/**
+ * Liquid's and Jekyll's date filters. Each can return its input unchanged
+ * (Liquid's `date` when it cannot read it, Jekyll's when it is empty), so
+ * formatting a date is no encoding.
+ */
+const DATE_FILTERS = new Set(['date', 'date_to_xmlschema', 'date_to_rfc822', 'date_to_string', 'date_to_long_string']);
+
+/**
+ * A Liquid output's markup split on `|` outside quoted strings, as Liquid
+ * reads its filter chain: the input expression, then each filter with its
+ * arguments, all trimmed. Liquid strings have no escape sequences, so a
+ * quote closes at the next quote of the same kind.
+ * @param {string} markup
+ * @returns {string[]}
+ */
+function liquidFilterChain(markup) {
+  const parts = [''];
+  let quote = '';
+  for (const char of markup) {
+    if (quote === '' && char === '|') {
+      parts.push('');
+      continue;
+    }
+    if (quote === '' && (char === '"' || char === "'")) quote = char;
+    else if (char === quote) quote = '';
+    parts[parts.length - 1] += char;
+  }
+  return parts.map((part) => part.trim());
+}
+
+/**
+ * Whether a Liquid output prints its value encoded for HTML: its last
+ * filter is `escape`, or it is one of the outputs that need none:
+ *   - `{{ content }}` alone, the rendered article body, which is trusted
+ *     author Markdown printed as HTML by design;
+ *   - one `relative_url` or `absolute_url` filter on a quoted string,
+ *     `page.url` or `post.url`;
+ *   - a last `url_encode` filter, whose output holds no character HTML
+ *     reads as markup.
+ * An output that uses a `DATE_FILTERS` filter must end in `escape`.
+ * @param {string} markup The output's markup, trimmed, without delimiters.
+ * @returns {boolean}
+ */
+function isEncodedOutput(markup) {
+  if (markup === 'content') return true;
+  const [input, ...filters] = liquidFilterChain(markup);
+  const names = filters.map((filter) => /^\w*/.exec(filter)[0]);
+  const last = names.at(-1);
+  if (last === 'escape') return true;
+  if (names.some((name) => DATE_FILTERS.has(name))) return false;
+  if (last === 'url_encode') return true;
+  return names.length === 1 && URL_FILTERS.has(last) && URL_INPUT_RE.test(input);
+}
+
+/**
+ * Every Liquid output in a template that `isEncodedOutput` refuses, as
+ * `line: {{ … }}` with its 1-based line. Outputs inside conditions and
+ * loops are read; a `{% comment %}` block prints nothing and a
+ * `{% raw %}` block prints its text as written, so outputs inside either
+ * are not.
+ * @param {string} src
+ * @returns {string[]}
+ */
+function unescapedOutputs(src) {
+  const found = [];
+  let line = 1;
+  for (const token of liquidTokens(src)) {
+    if (token.kind === 'output' && !isEncodedOutput(token.markup)) found.push(`${line}: ${token.source}`);
+    line += token.source.split('\n').length - 1;
+  }
+  return found;
+}
+
+test('[AC-05][F-018] _layouts/blog.html, _layouts/post.html and blog/index.html end every printed value in escape', () => {
+  const found = ESCAPED_TEMPLATES.flatMap((rel) => unescapedOutputs(read(rel)).map((at) => `${rel}:${at}`));
+  assert.deepEqual(
+    found,
+    [],
+    'every printed value must end in | escape, except {{ content }}, one relative_url or absolute_url ' +
+      'filter on a quoted path, page.url or post.url, and a url_encode value; a date always needs escape',
+  );
+});
+
+test('[AC-05][F-018] the escape reader reads every output and exempts only the trusted body, site URLs and url_encode', () => {
+  // Reported with its line: no escape, a date, escape before another filter, and output inside a condition.
+  assert.deepEqual(
+    unescapedOutputs(
+      '<h1>{{ page.title }}</h1>\n' +
+        "<time>{{ post.date | date: '%Y' }}</time>\n" +
+        '<p>{{ page.summary | escape | strip }}</p>\n' +
+        '{% if page.updated %}\n  <b>{{ page.updated }}</b>\n{% endif %}',
+    ),
+    [
+      '1: {{ page.title }}',
+      "2: {{ post.date | date: '%Y' }}",
+      '3: {{ page.summary | escape | strip }}',
+      '5: {{ page.updated }}',
+    ],
+  );
+  for (const src of [
+    '{{ page.title | relative_url }}',
+    '{{ site.url | absolute_url }}',
+    "{{ '/a/' | append: page.slug | relative_url }}",
+    '{{ page.url | relative_url | strip }}',
+    '{{ content | strip }}',
+    '{{ post.date | date_to_xmlschema | url_encode }}',
+    "{{ page.title | append: ' | escape' }}",
+    "{{ post.date | date: '%Y|%m' }}",
+    '{{ page.title | escape_once }}',
+    '{% for tag in page.tags %}{{ tag }}{% endfor %}',
+  ]) {
+    assert.equal(unescapedOutputs(src).length, 1, src);
+  }
+
+  // Not reported: comments and raw blocks print no output; tags print nothing.
+  assert.deepEqual(
+    unescapedOutputs('{% comment %}{{ page.title }}{% endcomment %}{% raw %}{{ page.title }}{% endraw %}'),
+    [],
+  );
+  assert.deepEqual(unescapedOutputs('{% assign t = page.title | strip %}{% include site-header.html %}'), []);
+  // Line numbers count the lines inside comment and raw blocks.
+  assert.deepEqual(unescapedOutputs('{% comment %}\n{{ a }}\n{% endcomment %}{% raw %}\n{% endraw %}\n{{ b }}'), [
+    '5: {{ b }}',
+  ]);
+  for (const src of [
+    '{{ content }}',
+    '{{- content -}}',
+    "{{ '/x' | relative_url }}",
+    '{{ "/x" | relative_url }}',
+    "{{ '/a|b' | relative_url }}",
+    '{{ page.url | absolute_url }}',
+    '{{ post.url | relative_url | escape }}',
+    '{{ tag | url_encode }}',
+    "{{ x | date: '%Y' | escape }}",
+    '{{ page.updated | date_to_xmlschema | escape }}',
+    '{{page.title|escape}}',
+    '{{ page.title | default: site.title | escape }}',
+  ]) {
+    assert.deepEqual(unescapedOutputs(src), [], src);
+  }
+});
+
 /* Blog asset budgets and search.js conformance                              */
-/* ------------------------------------------------------------------------ */
 
 test('[AC-10][F-019] blog/search.js stays within 5,000 bytes', (t) => {
   const bytes = size('blog/search.js');
@@ -2899,7 +3017,6 @@ test('[AC-10][F-019] blog/search.js uses no HTML-writing or code-evaluating sink
 });
 
 test('[AC-10][F-019] the ES5 scanner sees through comments, strings and regular-expression literals', () => {
-  /** Names of the ES5 rules a snippet breaks, as the search.js check reads it. */
   const es5 = (src) => es5Violations(scanJs(src)).map(({ what }) => what);
 
   // Comment markers inside strings do not hide the code after them.
@@ -2928,7 +3045,7 @@ test('[AC-10][F-019] the ES5 scanner sees through comments, strings and regular-
   assert.deepEqual(es5('while (n--) /let/.exec(s);\nfor (;;) /=>/.test(s);'), []);
   assert.deepEqual(es5('function f() {}\n/const/.test(s);\n{}\n/let/.test(s);'), []);
   assert.deepEqual(es5('var t = f(a) / 2; const u = 1; var w = u / 3;'), ['`const` declaration']);
-  // Each original rule fires on its own syntax.
+  // Each AAP-required ES5 restriction rejects its own construct.
   assert.deepEqual(es5('var t = `hi`;'), ['template literal']);
   assert.deepEqual(es5('var f = function (a) { return a; }; var g = (a) => a;'), ['arrow function']);
   assert.deepEqual(es5('for (var k of list) {}'), ['`for…of` loop']);
@@ -2944,7 +3061,6 @@ test('[AC-10][F-019] the ES5 scanner sees through comments, strings and regular-
 });
 
 test('[AC-10][F-019] the ES5 rules reject syntax added after ES5 and accept ES5 syntax', () => {
-  /** Names of the ES5 rules a snippet breaks, as the search.js check reads it. */
   const es5 = (src) => es5Violations(scanJs(src)).map(({ what }) => what);
 
   const rejected = [
@@ -3003,7 +3119,6 @@ test('[AC-10][F-019] the ES5 rules reject syntax added after ES5 and accept ES5 
 });
 
 test('[AC-10][F-019] the strict-mode check requires one invoked IIFE whose body opens with "use strict"', () => {
-  /** Whether a snippet passes the search.js strict-mode check. */
   const strict = (src) => isStrictScript(scanJs(src));
 
   const accepted = [
@@ -3038,7 +3153,6 @@ test('[AC-10][F-019] the strict-mode check requires one invoked IIFE whose body 
 });
 
 test('[AC-10][F-019] the sink check sees dot, bracket, qualified, escaped and concatenated forms', () => {
-  /** Names of the sinks a snippet uses, as the search.js check reads it. */
   const sinks = (src) => unsafeSinks(scanJs(src)).map(({ what }) => what);
 
   const forms = [

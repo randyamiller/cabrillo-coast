@@ -1,49 +1,39 @@
 /* Cabrillo Coast LLC — built blog pages (AC-02, AC-05, AC-06, AC-07, AC-17; F-017, F-018) */
 /**
- * Assertions over the HTML Jekyll built. The same file runs twice in
- * `scripts/verify.mjs`, and every assertion holds in both runs:
+ * Assertions over the HTML Jekyll built. `scripts/verify.mjs` runs this file
+ * twice and every assertion holds in both runs: on the real build in
+ * custom-domain mode (the defaults: `SITE_DIR=_site`, `SITE_BASEURL=""`,
+ * `SITE_URL=https://www.cabrillocoast.com`), and on the fixture project
+ * build (`SITE_DIR=<tmp>/project/cabrillo-coast`,
+ * `SITE_BASEURL=/cabrillo-coast`, `SITE_URL=https://randyamiller.github.io`,
+ * `FIXTURE_DIR=<tmp>`, the output of `tests/fixtures/build-fixture-site.mjs`).
+ * The fixture-only cases run only when `FIXTURE_DIR` is set; the real
+ * launch-state case runs only while `_posts/` holds no article.
  *
- *   1. Real build, custom-domain mode (the defaults):
- *        SITE_DIR=_site  SITE_BASEURL=""  SITE_URL=https://www.cabrillocoast.com
- *      FIXTURE_DIR is unset, so the fixture-only cases are skipped. At launch
- *      `_posts/` is empty and the launch-state case (AC-17) runs on `_site`.
- *   2. Fixture project build, project-path mode:
- *        SITE_DIR=<tmp>/project/cabrillo-coast  SITE_BASEURL=/cabrillo-coast
- *        SITE_URL=https://randyamiller.github.io  FIXTURE_DIR=<tmp>
- *      `<tmp>` is the output of `tests/fixtures/build-fixture-site.mjs`, which
- *      also holds `preview/` (drafts built), `empty/` (no articles) and `src/`
- *      (the staged source with the synthetic draft and future-dated post).
+ *   - AC-06 [F-018] page contract: CSP, scripts, metadata, landmarks, the
+ *     prose scan and the listing state the built articles call for.
+ *   - AC-07 [F-018] links, canonical URLs and the published outputs.
+ *   - AC-02 [F-017] drafts, draft images and future-dated posts stay out of
+ *     normal builds.
+ *   - AC-05 [F-018] the escaping fixture's title is escaped wherever it is
+ *     printed and its raw-block code `{{ .Values.image }}` survives as text;
+ *     Rouge classes and tables render.
+ *   - AC-17 [F-018] the launch state.
  *
- * Coverage:
- *   - AC-06 [F-018] page contract of the listing and every article: doctype
- *     and language, the Content-Security-Policy directly after the charset,
- *     the allowed scripts, title and Open Graph metadata, skip link, mobile
- *     menu landmark, `aria-current` on Blog, the unsafe-markup scan of the
- *     prose region (bounded by the layout's own markup) and the listing state
- *     the built article pages call for: every article in the list plus the
- *     search form attributes, or the launch state when none was built.
- *   - AC-07 [F-018] every local link resolves (`checkSiteLinks`), canonical
- *     and `og:url` follow the deployment URL, repository-internal files are
- *     absent from the output, `CNAME` follows the deployment mode and the
- *     home page passes through byte for byte.
- *   - AC-02 [F-017] drafts, draft images and future-dated posts never reach a
- *     normal build: no output path names either synthetic slug, and no page,
- *     `search.json` or other text file holds a slug, a marker or an
- *     `assets/drafts/` path. The preview build renders the draft and its
- *     image, and its paths and text hold no trace of the future-dated post.
- *   - AC-05 [F-018] the escaping fixture's title is escaped everywhere it is
- *     printed, `{% raw %}` survives, the Python and YAML blocks each hold
- *     Rouge token classes, and tables render.
- *   - AC-17 [F-018] the zero-article listing and an empty search index; the
- *     real case runs while `_posts/` holds no regular `.md` file.
- *   Self-tests on synthetic input prove that the prose scan, the listing
- *   check, the Rouge check and the post inventory reject what they must.
+ * The prose region is bounded by markup the layouts own, never by markup an
+ * article body can write, and it is scanned before the scripts are checked
+ * so a script written in a body is reported against the article. Both
+ * security checks fail closed: they read raw text and decode attribute
+ * values as a browser does, and every forbidden `<name` written anywhere,
+ * comments and attribute values included, counts, so markup the tokenizer
+ * could read differently from a browser fails rather than passes. Escaped
+ * values are asserted in their encoded form, and the privacy cases search
+ * every output path and text file only after proving the fixture builder
+ * wrote the synthetic draft and future-dated post.
  *
- * Paths resolve from this file's location (`ROOT`), never `process.cwd()`;
- * relative `SITE_DIR` and `FIXTURE_DIR` values resolve against `ROOT`. The
- * suite never builds or uses the network, and it reads the built output
- * without changing it. Its one write is the post-inventory self-test, which
- * creates a folder under `os.tmpdir()` and removes it.
+ * Paths resolve from this file's location, never `process.cwd()`. The suite
+ * never builds or uses the network and reads the output without changing
+ * it; its one write is a temporary folder for the post-inventory self-test.
  *
  * Run: bundle exec jekyll build && node --test tests/static/built-pages.test.mjs
  */
@@ -66,7 +56,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { checkSiteLinks, decodeEntities, listHtmlPages, parseStartTags } from './lib/site-links.mjs';
+import { checkSiteLinks, decodeEntities, listHtmlPages, parseStartTags, tokenizeHtml } from './lib/site-links.mjs';
 import {
   DRAFT_IMAGE,
   DRAFT_MARKER,
@@ -75,21 +65,18 @@ import {
   FUTURE_SLUG,
 } from '../fixtures/build-fixture-site.mjs';
 
-/* ------------------------------------------------------------------------ */
 /* Configuration                                                             */
-/* ------------------------------------------------------------------------ */
 
-/** Repository root: two levels above `tests/static/`. */
 const ROOT = fileURLToPath(new URL('../../', import.meta.url));
 
 /** Built site under test; a relative value resolves against `ROOT`. */
 const SITE_DIR = path.resolve(ROOT, process.env.SITE_DIR || '_site');
 
 /** Base path the site is served under: empty on the custom domain, `/cabrillo-coast` on the project path. */
-const BASE = (process.env.SITE_BASEURL || '').replace(/\/+$/, '');
+const BASE = trimTrailingSlashes(process.env.SITE_BASEURL || '');
 
 /** Deployment URL (scheme and host) that canonical and `og:url` start with. */
-const SITE_URL = (process.env.SITE_URL || 'https://www.cabrillocoast.com').replace(/\/+$/, '');
+const SITE_URL = trimTrailingSlashes(process.env.SITE_URL || 'https://www.cabrillocoast.com');
 
 /** Output folder of the fixture builder; empty when the fixture cases do not apply. */
 const FIXTURE_DIR = process.env.FIXTURE_DIR ? path.resolve(ROOT, process.env.FIXTURE_DIR) : '';
@@ -97,9 +84,7 @@ const FIXTURE_DIR = process.env.FIXTURE_DIR ? path.resolve(ROOT, process.env.FIX
 /** `skip` option of every fixture-only case. */
 const FIXTURE_ONLY = { skip: !FIXTURE_DIR && 'FIXTURE_DIR not set' };
 
-/* ------------------------------------------------------------------------ */
 /* Expected values                                                           */
-/* ------------------------------------------------------------------------ */
 
 /** The blog's Content-Security-Policy, character for character (AAP 0.5.6). */
 const CSP =
@@ -110,7 +95,6 @@ const CSP =
 /** Suffix of every blog page title (U+2014 em dash). */
 const TITLE_SUFFIX = ' — Cabrillo Coast';
 
-/** Exact title of the listing page. */
 const LISTING_TITLE = `Technical articles${TITLE_SUFFIX}`;
 
 /** `og:site_name` on every blog page, matching the home page. */
@@ -129,11 +113,54 @@ const POST_BACK_TAG = '<p class="post-back">';
  */
 const LAYOUT_TAIL_RE = /^<p class="post-back"><a href="[^"<>]*">← All articles<\/a><\/p>\s*<\/div>\s*<\/article>\s*<\/main\s*>/;
 
-/** Event-handler attribute names. */
 const EVENT_HANDLER_RE = /^on/i;
 
 /** A `javascript:` URL, tolerant of the whitespace browsers strip from URLs. */
 const JAVASCRIPT_URL_RE = /j\s*a\s*v\s*a\s*s\s*c\s*r\s*i\s*p\s*t\s*:/i;
+
+/**
+ * The named references `securityDecode` replaces; a browser requires the `;`
+ * for each. Of the 2,231 entries in the HTML named-reference table,
+ * `&Tab;`, `&NewLine;`, `&colon;` and `&fjlig;` ("fj") are the only ones
+ * whose replacement holds an ASCII letter of "javascript", a colon, a tab, a
+ * line feed or a carriage return, so no reference left undecoded can spell a
+ * `javascript:` scheme or hide one behind the tabs and newlines a URL parser
+ * drops. The rest are the references kramdown and Liquid write.
+ */
+const SECURITY_NAMED_REFERENCES = Object.freeze({
+  Tab: '\t',
+  NewLine: '\n',
+  colon: ':',
+  fjlig: 'fj',
+  amp: '&',
+  quot: '"',
+  lt: '<',
+  gt: '>',
+  apos: "'",
+  nbsp: '\u00a0',
+});
+
+/**
+ * The references `securityDecode` reads: hexadecimal and decimal numeric
+ * references with every digit and an optional `;`, as a browser reads them,
+ * and the names of `SECURITY_NAMED_REFERENCES` with their `;`.
+ */
+const SECURITY_REFERENCE_RE = /&(?:#[xX]([0-9a-fA-F]+);?|#([0-9]+);?|(Tab|NewLine|colon|fjlig|amp|quot|lt|gt|apos|nbsp);)/g;
+
+/** What a browser substitutes for a numeric reference to 0x80–0x9F (windows-1252). */
+const C1_REFERENCE_REPLACEMENTS = new Map([
+  [0x80, 0x20ac], [0x82, 0x201a], [0x83, 0x0192], [0x84, 0x201e], [0x85, 0x2026], [0x86, 0x2020],
+  [0x87, 0x2021], [0x88, 0x02c6], [0x89, 0x2030], [0x8a, 0x0160], [0x8b, 0x2039], [0x8c, 0x0152],
+  [0x8e, 0x017d], [0x91, 0x2018], [0x92, 0x2019], [0x93, 0x201c], [0x94, 0x201d], [0x95, 0x2022],
+  [0x96, 0x2013], [0x97, 0x2014], [0x98, 0x02dc], [0x99, 0x2122], [0x9a, 0x0161], [0x9b, 0x203a],
+  [0x9c, 0x0153], [0x9e, 0x017e], [0x9f, 0x0178],
+]);
+
+/** Markup inside raw text: SVG and MathML, where those elements hold no raw text, read it as tags. */
+const RAW_TEXT_MARKUP_RE = /<[A-Za-z!/?]/;
+
+/** A start-tag candidate's name: up to whitespace, `/`, `>` or `<`. */
+const CANDIDATE_NAME_RUN_RE = /[^\t\n\f\r /><]*/y;
 
 /**
  * Repository-internal paths that must never be published (AAP 0.5.7, AC-07).
@@ -194,7 +221,6 @@ const ROUGE_TOKEN_CLASSES = Object.freeze(
   ]),
 );
 
-/** Fixture article slugs and the escaped title the escaping fixture must render as. */
 const ESCAPING_SLUG = 'fixture-escaping-and-liquid';
 const CODE_SLUG = 'fixture-code-and-tables';
 const ESCAPED_TITLE = 'Escaping &quot;quotes&quot; &amp; &lt;angle&gt; brackets';
@@ -203,9 +229,7 @@ const ESCAPED_TITLE = 'Escaping &quot;quotes&quot; &amp; &lt;angle&gt; brackets'
 const ARTICLE_REL_RE = /^blog\/([^/]+)\/index\.html$/;
 const LISTING_REL = 'blog/index.html';
 
-/* ------------------------------------------------------------------------ */
 /* Helpers                                                                   */
-/* ------------------------------------------------------------------------ */
 
 /**
  * Every start tag of a page, in document order, with lowercase names and
@@ -214,6 +238,55 @@ const LISTING_REL = 'blog/index.html';
  */
 function tags(html) {
   return parseStartTags(html);
+}
+
+/**
+ * One-entry cache of the token views of the page read last: several checks
+ * walk the same page, and the suite reads one page at a time.
+ */
+let tokenCache = { html: '', views: new Map() };
+
+/**
+ * `compute()` for `html`, kept under `key` until another page is read.
+ * @template T
+ * @param {string} html
+ * @param {string} key
+ * @param {() => T} compute
+ * @returns {T}
+ */
+function cachedView(html, key, compute) {
+  if (tokenCache.html !== html) tokenCache = { html, views: new Map() };
+  if (!tokenCache.views.has(key)) tokenCache.views.set(key, compute());
+  return tokenCache.views.get(key);
+}
+
+/** The tokens of a page read without raw text, as `tags()` reads it. */
+function tokensOf(html) {
+  return cachedView(html, 'tokens', () => tokenizeHtml(html));
+}
+
+/** The tokens of a page read with raw text, as a browser reads it. */
+function rawTokensOf(html) {
+  return cachedView(html, 'raw', () => tokenizeHtml(html, { rawText: true }));
+}
+
+/**
+ * Offsets of the closed end tags named `name` in a page (`tokensOf`), ascending.
+ * @param {string} html
+ * @param {string} name
+ * @returns {number[]}
+ */
+function endTagOffsets(html, name) {
+  const byName = cachedView(html, 'end-tags', () => {
+    const index = new Map();
+    for (const token of tokensOf(html)) {
+      if (token.type !== 'end-tag' || !token.terminated) continue;
+      if (!index.has(token.name)) index.set(token.name, []);
+      index.get(token.name).push(token.start);
+    }
+    return index;
+  });
+  return byName.get(name) ?? [];
 }
 
 /**
@@ -229,9 +302,29 @@ function meta(html, key, value) {
   return tag === undefined ? undefined : tag.attrs.content;
 }
 
+/**
+ * `value` without trailing slashes, by an index scan: an unanchored
+ * /\/+$/ retries every suffix of a long slash run that a non-slash ends.
+ * @param {string} value
+ * @returns {string}
+ */
+function trimTrailingSlashes(value) {
+  let end = value.length;
+  while (end > 0 && value[end - 1] === '/') end -= 1;
+  return value.slice(0, end);
+}
+
 /** Removes comments and tags, leaving the text with its character references. */
 function stripTags(s) {
-  return String(s).replace(/<!--[\s\S]*?-->/g, '').replace(/<[^>]*>/g, '');
+  const html = String(s);
+  let text = '';
+  let at = 0;
+  // The gaps between tokens are the text, less any `</>`, which a browser drops without a token.
+  for (const token of tokenizeHtml(html)) {
+    text += html.slice(at, token.start).replaceAll('</>', '');
+    at = token.end;
+  }
+  return text + html.slice(at).replaceAll('</>', '');
 }
 
 /** Visible text of an HTML fragment: tags stripped, references decoded, whitespace collapsed. */
@@ -239,7 +332,6 @@ function textOf(fragment) {
   return decodeEntities(stripTags(fragment)).replace(/\s+/g, ' ').trim();
 }
 
-/** Whitespace-separated tokens of a tag's `class` attribute. */
 function classTokens(tag) {
   return (tag.attrs.class || '').split(/\s+/).filter(Boolean);
 }
@@ -263,7 +355,6 @@ function walk(dir) {
   return out.sort();
 }
 
-/** The text files under `dir` (see `TEXT_EXTENSIONS`), as relative POSIX paths. */
 function textFiles(dir) {
   return walk(dir).filter((rel) => {
     if (!TEXT_EXTENSIONS.has(path.extname(rel).toLowerCase())) return false;
@@ -271,22 +362,143 @@ function textFiles(dir) {
   });
 }
 
-/** Reads a site file given as a POSIX path relative to `dir`. */
 function readSiteFile(dir, rel) {
   return readFileSync(path.join(dir, ...rel.split('/')), 'utf8');
 }
 
 /**
- * Offset of the first closing tag `</name` at or after `from`, or -1.
+ * Offset of the first end tag `</name…>` at or after `from`, or -1. Only end
+ * tags the tokenizer reads count, so one inside a comment does not; the
+ * binary search keeps repeated lookups on malformed pages cheap.
  * @param {string} html
  * @param {string} name
  * @param {number} from
  */
 function closingTagIndex(html, name, from) {
-  const re = new RegExp(`</${name}\\s*>`, 'gi');
-  re.lastIndex = from;
-  const match = re.exec(html);
-  return match === null ? -1 : match.index;
+  const offsets = endTagOffsets(html, name);
+  let low = 0;
+  let high = offsets.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (offsets[middle] < from) low = middle + 1;
+    else high = middle;
+  }
+  return low < offsets.length ? offsets[low] : -1;
+}
+
+/**
+ * Every `<title>` of a page as a browser reads it: its offset, its raw text,
+ * and whether its `</title>` was found (an unclosed title runs to the end of
+ * the page).
+ * @param {string} html
+ * @returns {{ start: number, text: string, closed: boolean }[]}
+ */
+function pageTitles(html) {
+  const tokens = rawTokensOf(html);
+  const titles = [];
+  tokens.forEach((token, index) => {
+    if (token.type !== 'start-tag' || token.name !== 'title') return;
+    const content = tokens[index + 1];
+    titles.push(
+      content?.type === 'raw-text'
+        ? { start: token.start, text: html.slice(content.start, content.end), closed: content.terminated }
+        : { start: token.start, text: '', closed: false },
+    );
+  });
+  return titles;
+}
+
+/**
+ * The `<title>` elements of a page's head, the only ones that name the
+ * document. A `<title>` in the body, such as an inline SVG's accessible name
+ * in article prose, leaves `document.title` alone. The head runs from
+ * `<head>` to `</head>` or the first `<body>`, whichever comes first; an
+ * unclosed title keeps it open to the end of the page.
+ * @param {string} html
+ * @returns {{ start: number, text: string, closed: boolean }[] | null} `null` without a `<head>`
+ */
+function headTitles(html) {
+  const tokens = rawTokensOf(html);
+  const head = tokens.findIndex((token) => token.type === 'start-tag' && token.name === 'head');
+  if (head === -1) return null;
+  let end = html.length;
+  for (let index = head + 1; index < tokens.length; index += 1) {
+    const { type, name, start } = tokens[index];
+    if ((type === 'end-tag' && name === 'head') || (type === 'start-tag' && name === 'body')) {
+      end = start;
+      break;
+    }
+  }
+  const from = tokens[head].end;
+  return pageTitles(html).filter((title) => title.start >= from && title.start < end);
+}
+
+/**
+ * The title links of a listing: each `<h2>` holding one `<a>` and nothing
+ * else but whitespace, with the link's start tag and its inner HTML. A link
+ * that meets another `<a>` or `<h2>` tag before its `</a>` is not one, and
+ * the walk resumes at that tag, so every token is visited a bounded number
+ * of times however many openers are left unclosed.
+ * @param {string} html
+ * @returns {{ tag: import('./lib/site-links.mjs').StartTag, inner: string }[]}
+ */
+function titleLinks(html) {
+  const tokens = tokensOf(html);
+  const startTags = new Map(tags(html).map((tag) => [tag.start, tag]));
+  const is = (token, type, name) => token?.type === type && token.name === name && token.terminated;
+  const blankBetween = (before, after) => html.slice(before.end, after.start).trim() === '';
+  const boundary = (token) =>
+    (token.type === 'start-tag' || token.type === 'end-tag') && (token.name === 'a' || token.name === 'h2');
+  const links = [];
+  let i = 0;
+  while (i < tokens.length) {
+    const h2 = tokens[i];
+    const a = tokens[i + 1];
+    if (!is(h2, 'start-tag', 'h2') || !is(a, 'start-tag', 'a') || !blankBetween(h2, a)) {
+      i += 1;
+      continue;
+    }
+    let j = i + 2;
+    while (j < tokens.length && !boundary(tokens[j])) j += 1;
+    const close = tokens[j];
+    const h2End = tokens[j + 1];
+    if (is(close, 'end-tag', 'a') && is(h2End, 'end-tag', 'h2') && blankBetween(close, h2End)) {
+      links.push({ tag: startTags.get(a.start), inner: html.slice(a.end, close.start) });
+      i = j + 2;
+    } else {
+      i = j;
+    }
+  }
+  return links;
+}
+
+/**
+ * Whether a page holds a table with a header cell aligned the way kramdown
+ * writes it (`<th style="text-align: …">`) before that table's `</table>`.
+ * One pass over the tokens, counting open tables.
+ * @param {string} html
+ * @returns {boolean}
+ */
+function hasAlignedTable(html) {
+  let open = 0;
+  let aligned = false;
+  for (const token of tokensOf(html)) {
+    if (!token.terminated || (token.type !== 'start-tag' && token.type !== 'end-tag')) continue;
+    if (token.name === 'table') {
+      if (token.type === 'start-tag') {
+        open += 1;
+      } else if (open > 0) {
+        if (aligned) return true;
+        open -= 1;
+      }
+    } else if (open > 0 && token.type === 'start-tag' && token.name === 'th') {
+      const style = token.attrs.find((attr) => attr.name === 'style');
+      if (style !== undefined && style.value !== null && decodeEntities(style.value).startsWith('text-align:')) {
+        aligned = true;
+      }
+    }
+  }
+  return false;
 }
 
 /**
@@ -328,22 +540,104 @@ function proseRegion(html) {
 }
 
 /**
- * Lists the unsafe markup in an HTML fragment: forbidden elements, event
- * handler attributes and `javascript:` URLs, in the tag source or in a
- * decoded attribute value (which catches `&#106;avascript:`). Escaped code
- * samples (`&lt;script…`) contain no `<` and are text, not tags.
+ * Decodes the character references of a raw attribute value exactly as a
+ * browser does for every character that can make the value a `javascript:`
+ * URL. Numeric references take every digit, need no `;`, and map 0, values
+ * above U+10FFFF and surrogates to U+FFFD and 0x80–0x9F through
+ * windows-1252; `&#` without digits stays literal. Named references are
+ * those of `SECURITY_NAMED_REFERENCES`. One pass, so `&amp;#106;` stays
+ * `&#106;`.
+ * @param {string} raw
+ * @returns {string}
+ */
+function securityDecode(raw) {
+  return raw.replace(SECURITY_REFERENCE_RE, (reference, hex, decimal, name) => {
+    if (name !== undefined) return SECURITY_NAMED_REFERENCES[name];
+    // Past seven significant digits (six in hexadecimal) the value exceeds
+    // U+10FFFF, so a long run is never parsed.
+    const radix = hex === undefined ? 10 : 16;
+    const digits = (hex ?? decimal).replace(/^0+/, '');
+    const code = digits.length > (radix === 10 ? 7 : 6) ? Infinity : Number.parseInt(digits || '0', radix);
+    if (code === 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return '\ufffd';
+    return String.fromCodePoint(C1_REFERENCE_REPLACEMENTS.get(code) ?? code);
+  });
+}
+
+/**
+ * Every place a browser could start an element: the offset and
+ * ASCII-lowercased name of each `<` followed by an ASCII letter, wherever it
+ * sits (text, a comment, raw text or an attribute value). A browser's tag
+ * name runs on through `<`; stopping there keeps the pass linear and can
+ * only shorten a name, never hide one.
+ * @param {string} html
+ * @returns {{ start: number, name: string }[]}
+ */
+function startTagCandidates(html) {
+  const found = [];
+  let open = html.indexOf('<');
+  while (open !== -1) {
+    let next = open + 1;
+    if (/[A-Za-z]/.test(html[next] ?? '')) {
+      CANDIDATE_NAME_RUN_RE.lastIndex = next;
+      CANDIDATE_NAME_RUN_RE.test(html);
+      next = CANDIDATE_NAME_RUN_RE.lastIndex;
+      const name = html.slice(open + 1, next).replace(/[A-Z]+/g, (letters) => letters.toLowerCase());
+      found.push({ start: open, name });
+    }
+    open = html.indexOf('<', next);
+  }
+  return found;
+}
+
+/**
+ * Lists the unsafe markup in an HTML fragment. The scan fails closed: what a
+ * browser could read as an element, a handler or a script URL is reported
+ * even where the tokenizer reads it differently.
+ *   - A forbidden element anywhere `<name` is written (`startTagCandidates`),
+ *     comments, raw text and attribute values included.
+ *   - Any token left open at the end of the fragment, which would swallow
+ *     the layout markup after it.
+ *   - Raw text holding markup and a CDATA section that does not end at its
+ *     first `>`: SVG and MathML read both as tags, where the tokenizer does
+ *     not.
+ *   - Event-handler attributes, and `javascript:` URLs in a value decoded as
+ *     a browser decodes it (`securityDecode`) or in the tag source.
+ * Escaped code samples (`&lt;script…`) contain no `<` and are text.
  * @param {string} fragment
  * @returns {string[]}
  */
 function unsafeMarkup(fragment) {
   const problems = [];
-  for (const tag of tags(fragment)) {
-    if (FORBIDDEN_PROSE_TAGS.has(tag.name)) problems.push(`<${tag.name}> element: ${tag.source}`);
-    for (const [name, value] of Object.entries(tag.attrs)) {
-      if (EVENT_HANDLER_RE.test(name)) problems.push(`event handler attribute ${name}: ${tag.source}`);
-      if (JAVASCRIPT_URL_RE.test(value)) problems.push(`javascript: URL in ${name}: ${tag.source}`);
+  const tokens = tokenizeHtml(fragment, { rawText: true });
+  const excerpt = (start, end) => fragment.slice(start, Math.min(end, start + 160));
+  const startTags = new Map(tokens.filter((token) => token.type === 'start-tag').map((token) => [token.start, token]));
+  for (const { start, name } of startTagCandidates(fragment)) {
+    if (!FORBIDDEN_PROSE_TAGS.has(name)) continue;
+    const tag = startTags.get(start);
+    problems.push(`<${name}> element: ${excerpt(start, tag === undefined ? start + 80 : tag.end)}`);
+  }
+  for (const token of tokens) {
+    const source = excerpt(token.start, token.end);
+    const label = token.name === undefined ? token.type : `<${token.name}> ${token.type}`;
+    if (!token.terminated) problems.push(`${label} left open at the end of the prose: ${source}`);
+    if (token.type === 'raw-text' && RAW_TEXT_MARKUP_RE.test(fragment.slice(token.start, token.end))) {
+      problems.push(`markup inside ${label}, which SVG and MathML read as tags: ${source}`);
     }
-    if (JAVASCRIPT_URL_RE.test(tag.source)) problems.push(`javascript: URL: ${tag.source}`);
+    if (
+      token.type === 'bogus-comment' &&
+      fragment.startsWith('<![CDATA[', token.start) &&
+      !fragment.slice(token.start, token.end).endsWith(']]>')
+    ) {
+      problems.push(`CDATA section that SVG and MathML end after its first ">": ${source}`);
+    }
+    if (token.type !== 'start-tag') continue;
+    for (const { name, value } of token.attrs) {
+      if (EVENT_HANDLER_RE.test(name)) problems.push(`event handler attribute ${name}: ${source}`);
+      if (value !== null && JAVASCRIPT_URL_RE.test(securityDecode(value))) {
+        problems.push(`javascript: URL in ${name}: ${source}`);
+      }
+    }
+    if (JAVASCRIPT_URL_RE.test(fragment.slice(token.start, token.end))) problems.push(`javascript: URL: ${source}`);
   }
   return [...new Set(problems)];
 }
@@ -434,9 +728,7 @@ function assertEmpty(dir) {
   assert.deepEqual(index, [], `${indexFile} must be [] without articles`);
 }
 
-/* ------------------------------------------------------------------------ */
 /* AC-06 — page contract                                                     */
-/* ------------------------------------------------------------------------ */
 
 /**
  * The head of a page must open with the charset declaration and, directly
@@ -445,9 +737,9 @@ function assertEmpty(dir) {
  * @param {string} html
  */
 function assertHeadOrder(html) {
-  const head = /<head(?:\s[^>]*)?>/i.exec(html);
+  const head = tags(html).find((tag) => tag.name === 'head');
   assert.ok(head, 'page has no <head> start tag');
-  const afterHead = html.slice(head.index + head[0].length);
+  const afterHead = html.slice(head.end);
 
   const charset = /^\s*<meta\s+charset\s*=\s*(["']?)utf-8\1\s*\/?>/i.exec(afterHead);
   assert.ok(charset, `the first tag after <head> must be <meta charset="UTF-8">, found: ${afterHead.trim().slice(0, 80)}`);
@@ -471,23 +763,41 @@ function assertHeadOrder(html) {
 
 /**
  * Every script element loads a file and carries no inline code, and the
- * scripts are exactly the expected ones, in order.
+ * scripts are exactly the expected ones, in order. The page is read with raw
+ * text, as a browser reads it, so a script after a `<textarea>` that holds
+ * `<!--` is seen. The check fails closed: every `<script` written anywhere
+ * (`startTagCandidates`), in a comment, raw text or attribute value
+ * included, must be one of the script elements read.
  * @param {string} html
  * @param {string[]} expectedSrcs
  */
 function assertScripts(html, expectedSrcs) {
-  const scripts = tags(html).filter((t) => t.name === 'script');
-  for (const script of scripts) {
-    assert.ok(Object.hasOwn(script.attrs, 'src'), `inline script element without src: ${script.source}`);
-    const close = closingTagIndex(html, 'script', script.end);
-    assert.notEqual(close, -1, `script element is never closed: ${script.source}`);
-    assert.equal(html.slice(script.end, close).trim(), '', `script element has inline content: ${script.source}`);
-  }
-  assert.deepEqual(
-    scripts.map((script) => script.attrs.src),
-    expectedSrcs,
-    'blog pages load main.js everywhere and search.js on the listing only',
+  const tokens = rawTokensOf(html);
+  const srcs = [];
+  tokens.forEach((token, index) => {
+    if (token.type !== 'start-tag' || token.name !== 'script') return;
+    const source = html.slice(token.start, Math.min(token.end, token.start + 160));
+    assert.ok(token.terminated, `script start tag is never closed: ${source}`);
+    const src = token.attrs.find((attr) => attr.name === 'src');
+    assert.ok(src !== undefined, `inline script element without src: ${source}`);
+    const content = tokens[index + 1];
+    const close = tokens[index + 2];
+    assert.ok(content?.type === 'raw-text' && content.terminated, `script element is never closed: ${source}`);
+    assert.equal(html.slice(content.start, content.end).trim(), '', `script element has inline content: ${source}`);
+    assert.ok(
+      close?.type === 'end-tag' && close.name === 'script' && close.terminated,
+      `script element is never closed: ${source}`,
+    );
+    srcs.push(src.value === null ? '' : decodeEntities(src.value));
+  });
+  const written = startTagCandidates(html).filter((candidate) => candidate.name === 'script').length;
+  assert.equal(
+    written,
+    srcs.length,
+    `${written} "<script" start tag(s) are written but ${srcs.length} read as script elements: ` +
+      'one in a comment, raw text or an attribute value, or in markup read differently, could still run',
   );
+  assert.deepEqual(srcs, expectedSrcs, 'blog pages load main.js everywhere and search.js on the listing only');
 }
 
 /**
@@ -496,9 +806,11 @@ function assertScripts(html, expectedSrcs) {
  * @param {'listing' | 'article'} kind
  */
 function assertMetadata(html, kind) {
-  const titles = [...html.matchAll(/<title\b[^>]*>([\s\S]*?)<\/title\s*>/gi)];
-  assert.equal(titles.length, 1, 'page must have exactly one <title>');
-  const title = decodeEntities(titles[0][1]).trim();
+  const titles = headTitles(html);
+  assert.ok(titles !== null, 'page has no <head> start tag');
+  assert.equal(titles.length, 1, 'the <head> must hold exactly one <title>');
+  assert.ok(titles[0].closed, 'the <title> is never closed');
+  const title = decodeEntities(titles[0].text).trim();
   assert.ok(title.endsWith(TITLE_SUFFIX), `<title> "${title}" must end with "${TITLE_SUFFIX}"`);
   assert.ok(title.slice(0, -TITLE_SUFFIX.length).trim() !== '', `<title> "${title}" names no page`);
   if (kind === 'listing') assert.equal(title, LISTING_TITLE);
@@ -703,16 +1015,35 @@ function definePageContractTests() {
       '<a href="java\tscript:alert(1)">x</a>',
       '<a href="&#106;avascript:alert(1)">x</a>',
       '<svg><script>alert(1)</script></svg>',
+      // Recovery syntax and raw text a browser reads differently from plain tags.
+      '<script/src="/assets/blog/x/evil.js"></script>',
+      '<img src="x"onerror="alert(1)">',
+      '<textarea><!--</textarea><script src="/assets/blog/x/evil.js"></script>--><p>ok</p>',
+      '<svg><xmp><p><textarea><!--</textarea><img src="/x.png" alt="x" onerror="alert(1)"></xmp>--></svg>',
+      '<svg><![CDATA[ > <!-- ]]><img src=x onerror=alert(1)> -->',
+      '<textarea>',
+      '<plaintext>',
+      '<noscript><img src=x onerror=alert(1)></noscript>',
+      // References a browser decodes: no `;`, named tab and colon, the "fj" ligature.
+      '<a href="&#106avascript:alert(1)">x</a>',
+      '<a href="java&Tab;script&colon;alert(1)">x</a>',
+      '<a href="java&#x09script:alert(1)">x</a>',
+      '<a href="&fjlig;avascript:alert(1)">x</a>',
+      // A `<script` counts wherever it is written, as in the source scan.
+      '<!-- <script>commented out</script> -->',
     ];
     for (const inner of unsafe) assert.ok(flagged(inner), `not flagged: ${inner}`);
+    assert.ok(unsafeMarkup('<p>ok</p><a href="x').length > 0, 'not flagged: an attribute value left open');
 
     const safe = [
       '<pre class="highlight"><code><span class="nt">&lt;script </span><span class="na">src=</span>' +
         '<span class="s">"/assets/app.js"</span><span class="nt">&gt;&lt;/script&gt;</span></code></pre>',
       '<p>Use <code>onclick</code> handlers sparingly; never write <code>javascript&#58;</code> URLs.</p>',
       '<table><tr><th style="text-align: left">A</th></tr></table>',
-      '<!-- <script>commented out</script> -->',
       '<p><img src="/assets/blog/x/figure.png" alt="Figure"></p>',
+      '<svg><title>Diagram</title></svg>',
+      '<p>a &lt; b and &amp;#106;avascript: as text</p>',
+      '<textarea>plain</textarea>',
     ];
     for (const inner of safe) assert.ok(!flagged(inner), `flagged: ${inner}`);
 
@@ -741,11 +1072,92 @@ function definePageContractTests() {
         `</div>\n<iframe src="/"></iframe>\n${back}\n</div>`,
       ),
       'no closing back link after the prose': wrap('<p>ok</p>').replace(`${back}\n</div>\n</article>`, '</div>\n</article>'),
+      'an attribute value left open in the prose swallows the closing back link': wrap('<a href="x'),
     };
     for (const [why, html] of Object.entries(unbounded)) {
       assert.notEqual(html, wrap('<p>ok</p>'), `case not built: ${why}`);
       assert.throws(() => proseRegion(html), assert.AssertionError, `prose region accepted: ${why}`);
     }
+  });
+
+  test('[AC-06][F-018] the script check finds every script a browser could run', () => {
+    const main = '<script src="/main.js" defer></script>';
+    const page = (body, scripts = main) =>
+      '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="UTF-8">\n<title>T &amp; U</title>\n' +
+      `${scripts}\n</head>\n<body>\n${body}\n</body>\n</html>\n`;
+    const check = (html, expected = ['/main.js']) => () => assertScripts(html, expected);
+
+    assert.doesNotThrow(check(page('<p>ok</p>')), 'the expected script must pass');
+    assert.doesNotThrow(
+      check(page('<textarea>plain</textarea>', `${main}\n<script src="/blog/search.js" defer></script>`), [
+        '/main.js',
+        '/blog/search.js',
+      ]),
+      'the expected listing scripts must pass',
+    );
+    const rejected = {
+      'an extra <script/src>': page('<script/src="/assets/blog/x/evil.js"></script>'),
+      'a script hidden from plain tags by a textarea and a comment': page(
+        '<textarea><!--</textarea><script src="/assets/blog/x/evil.js"></script>-->',
+      ),
+      'a script written in a comment': page('<!-- <script src=x> -->'),
+      'inline content': page('<p>ok</p>', '<script src="/main.js" defer>alert(1)</script>'),
+      'an unclosed script': page('<p>ok</p>', '<script src="/main.js" defer>'),
+    };
+    for (const [why, html] of Object.entries(rejected)) {
+      assert.throws(check(html), assert.AssertionError, `passed: ${why}`);
+    }
+  });
+
+  test('[AC-06][F-018] the title check counts the head only, so an inline SVG title in the prose passes', () => {
+    const page = (head, body) =>
+      `<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="UTF-8">\n${head}\n</head>\n<body>\n${body}\n</body>\n</html>\n`;
+    const texts = (html) => headTitles(html).map((title) => title.text);
+
+    assert.deepEqual(texts(page('<title>A</title>', '<svg><title>Diagram</title></svg>')), ['A']);
+    assert.deepEqual(texts(page('<title>A</title><title>B</title>', '<p>x</p>')), ['A', 'B']);
+    assert.deepEqual(texts(page('', '<title>A</title>')), []);
+    // A `</head>` inside the title's raw text does not end the head.
+    assert.deepEqual(texts(page('<title>A</head>B</title><title>C</title>', '<p>x</p>')), ['A</head>B', 'C']);
+    // Without `</head>`, the first `<body>` ends it.
+    assert.deepEqual(texts('<html><head><title>A</title><body><svg><title>D</title></svg>'), ['A']);
+    assert.equal(headTitles('<html><body><title>A</title>'), null);
+  });
+
+  test('[AC-06][F-018] the page checks stay linear on a hundred thousand unclosed openers', () => {
+    const count = 100000;
+    // Each check here takes well under a second; a pass that rescans the rest
+    // of the input per opener takes about twenty seconds at this count.
+    const boundMs = 5000;
+    const timed = (why, run) => {
+      const started = performance.now();
+      const result = run();
+      const elapsed = performance.now() - started;
+      assert.ok(elapsed < boundMs, `${why} took ${elapsed.toFixed(0)} ms on ${count} unclosed openers`);
+      return result;
+    };
+    const tables = '<table>'.repeat(count);
+    const titles = '<title>'.repeat(count);
+    const links = '<h2><a>x'.repeat(count);
+    const angles = '< '.repeat(count);
+
+    assert.equal(timed('the table check', () => hasAlignedTable(tables)), false);
+    const aligned = '<table><tr><th style="text-align: left">A</th></tr></table>';
+    assert.equal(timed('the table check', () => hasAlignedTable(`${tables}${aligned}`)), true);
+    assert.deepEqual(
+      timed('the title read', () => pageTitles(`<title>T</title>${titles}`)).map((title) => title.closed),
+      [true, false],
+    );
+    const found = timed('the listing link read', () => titleLinks(`${links}<h2><a href="/blog/x/">X</a></h2>`));
+    assert.deepEqual(
+      found.map(({ tag, inner }) => ({ href: tag.attrs.href, inner })),
+      [{ href: '/blog/x/', inner: 'X' }],
+    );
+    assert.equal(timed('the text read', () => textOf(angles)), angles.trim());
+    assert.deepEqual(timed('the prose scan', () => unsafeMarkup(tables)), []);
+    assert.ok(timed('the prose scan', () => unsafeMarkup(titles)).length > 0, 'an unclosed <title> must be flagged');
+    assert.deepEqual(timed('the prose scan', () => unsafeMarkup(links)), []);
+    assert.deepEqual(timed('the prose scan', () => unsafeMarkup(angles)), []);
   });
 
   test('[AC-06][F-018] the listing check follows the built article inventory, not the listing markup', () => {
@@ -791,9 +1203,7 @@ function definePageContractTests() {
   });
 }
 
-/* ------------------------------------------------------------------------ */
 /* AC-07 — links, metadata and outputs                                       */
-/* ------------------------------------------------------------------------ */
 
 function defineLinkAndOutputTests() {
   test('[AC-07][F-018] every local href, src and data-index on every built page resolves', (t) => {
@@ -844,9 +1254,7 @@ function defineLinkAndOutputTests() {
   });
 }
 
-/* ------------------------------------------------------------------------ */
 /* AC-02 — drafts, draft images and future-dated posts                       */
-/* ------------------------------------------------------------------------ */
 
 /**
  * Confirms the fixture builder wrote the synthetic draft, its image and the
@@ -911,9 +1319,7 @@ function definePrivacyTests() {
   });
 }
 
-/* ------------------------------------------------------------------------ */
 /* AC-05 — rendering and escaping (fixture articles)                         */
-/* ------------------------------------------------------------------------ */
 
 /** Reads a built article of `SITE_DIR` by slug, failing when it was not built. */
 function readArticle(slug) {
@@ -978,13 +1384,16 @@ function assertRougeBlock(html, lang, { tokens, text }) {
 }
 
 function defineRenderingTests() {
-  test('[AC-05][F-018] the escaping fixture is escaped in <title>, <h1> and og:title and keeps {% raw %} text', FIXTURE_ONLY, () => {
+  test('[AC-05][F-018] the escaping fixture is escaped in <title>, <h1> and og:title and keeps its raw-block code as text', FIXTURE_ONLY, () => {
     const html = readArticle(ESCAPING_SLUG);
     assert.ok(html.includes(`<title>${ESCAPED_TITLE}${TITLE_SUFFIX}</title>`), '<title> must hold the escaped title');
 
-    const h1 = /<h1\b[^>]*>([\s\S]*?)<\/h1\s*>/i.exec(html);
+    const h1 = tags(html).find((t) => t.name === 'h1');
     assert.ok(h1, 'no <h1>');
-    assert.ok(h1[1].includes(ESCAPED_TITLE), `<h1> must hold the escaped title, found: ${h1[1]}`);
+    const h1End = closingTagIndex(html, 'h1', h1.end);
+    assert.notEqual(h1End, -1, 'the <h1> is never closed');
+    const h1Html = html.slice(h1.end, h1End);
+    assert.ok(h1Html.includes(ESCAPED_TITLE), `<h1> must hold the escaped title, found: ${h1Html}`);
 
     const ogTitle = tags(html).find((t) => t.name === 'meta' && t.attrs.property === 'og:title');
     assert.ok(ogTitle, 'no og:title');
@@ -1002,10 +1411,9 @@ function defineRenderingTests() {
 
   test('[AC-05][F-018] the listing prints the escaped fixture title in its <h2> link', FIXTURE_ONLY, () => {
     const html = readSiteFile(SITE_DIR, LISTING_REL);
-    const links = [...html.matchAll(/<h2\b[^>]*>\s*(<a\b[^>]*>)([\s\S]*?)<\/a\s*>\s*<\/h2\s*>/gi)];
-    const match = links.find((m) => m[2].includes(ESCAPED_TITLE));
+    const match = titleLinks(html).find((link) => link.inner.includes(ESCAPED_TITLE));
     assert.ok(match, 'no listing <h2> link holds the escaped title');
-    assert.equal(tags(match[1])[0].attrs.href, `${BASE}/blog/${ESCAPING_SLUG}/`, 'listing link target');
+    assert.equal(match.tag.attrs.href, `${BASE}/blog/${ESCAPING_SLUG}/`, 'listing link target');
   });
 
   test('[AC-05][F-018] the code fixture renders Rouge highlighting, inline code and an aligned table', FIXTURE_ONLY, () => {
@@ -1027,11 +1435,7 @@ function defineRenderingTests() {
       tokens: ['na', 'pi', 's2', 'm'],
       text: ['strategy: "exponential"', 'max_attempts: 5'],
     });
-    const tables = [...html.matchAll(/<table\b[^>]*>([\s\S]*?)<\/table\s*>/gi)].map((m) => m[1]);
-    assert.ok(
-      tables.some((table) => table.includes('<th') && table.includes('style="text-align:')),
-      'no rendered table with aligned header cells',
-    );
+    assert.ok(hasAlignedTable(html), 'no rendered table with aligned header cells');
     assert.equal(meta(html, 'property', 'article:modified_time'), undefined, 'the code fixture has no updated date');
   });
 
@@ -1075,9 +1479,7 @@ function defineRenderingTests() {
   });
 }
 
-/* ------------------------------------------------------------------------ */
 /* AC-17 — launch state                                                      */
-/* ------------------------------------------------------------------------ */
 
 function defineLaunchStateTests() {
   test('[AC-17][F-018] the empty fixture build shows the launch state', FIXTURE_ONLY, () => {
@@ -1124,9 +1526,7 @@ function defineLaunchStateTests() {
   });
 }
 
-/* ------------------------------------------------------------------------ */
 /* Registration                                                              */
-/* ------------------------------------------------------------------------ */
 
 if (!existsSync(SITE_DIR)) {
   // Without a build there is nothing to check: one failing case says what to do,

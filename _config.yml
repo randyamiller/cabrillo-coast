@@ -24,7 +24,10 @@ permalink: /blog/:title/
 
 # Privacy control, not a restated default: never build future-dated posts. github-pages 232
 # lists this as true in its own defaults, so the explicit value removes any dependence on
-# configuration merge order. Future-dated posts would otherwise sit readable on GitHub.
+# configuration merge order. This controls site output, not repository privacy.
+# It only keeps future-dated posts out of the built site. No Jekyll setting makes committed
+# content private: a committed future-dated post stays public on GitHub, so the local guard
+# (scripts/article.mjs guard, run by .githooks/) refuses it independently.
 future: false
 
 # Setting exclude replaces Jekyll's default list, so every repository-internal path is listed.

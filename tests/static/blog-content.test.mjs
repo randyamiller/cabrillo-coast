@@ -1,58 +1,33 @@
 /* Cabrillo Coast LLC — draft privacy, publishing configuration and article schema (AC-01, AC-04, F-017) */
 /**
- * Source checks over the repository. The suite runs in the first real-site
- * `node --test "tests/**\/*.test.mjs"` pass of `scripts/verify.mjs`, which
- * follows the real Jekyll build, but it reads no build output (no
- * `SITE_DIR`), so it gives the same answer with or without `_site/`.
+ * Source checks over the repository for AC-01 (draft privacy and publishing
+ * configuration) and AC-04 (article schema). Article content (the
+ * tracked-content rules, the front-matter schema, images and unsafe markup)
+ * is judged by `scripts/lib/articles.mjs`, the module `guard` uses, so commit
+ * time and test time judge it identically. The `.gitignore`, hook,
+ * configuration and gem checks encode their requirements in this suite.
  *
- * AC-01, draft privacy and publishing configuration:
- *   - nothing under `_drafts/` or `assets/drafts/` is tracked;
- *   - the working tree passes `checkTrackedContent`, the rules `guard`
- *     applies at commit and push time: no tracked drafts or draft images, no
- *     `published:` key, no future date, no orphan `assets/blog/<slug>/`, and
- *     every article valid and free of unsafe markup;
- *   - `.gitignore` lists every Jekyll, Bundler, npm, Playwright, draft and
- *     draft-image entry, and its own patterns ignore a path under each one;
- *   - `.githooks/pre-commit` and `.githooks/pre-push` are `#!/bin/sh`
- *     wrappers that end by exec-ing their `guard` command from the
- *     repository root, hand guard its arguments, standard input and exit
- *     status when run, and are executable, with index mode `100755` once
- *     tracked (and tracked at all under `CI=true`);
- *   - `_config.yml`, read with the types Jekyll's YAML loader gives it, sets
- *     `theme` to null and `future` to boolean false, never sets a base path,
- *     lists every `exclude` entry, and its `url` matches the deployment that
- *     `CNAME` selects;
- *   - `_config.preview.yml` restates that `exclude` list without
- *     `assets/drafts` and sets nothing else;
- *   - `Gemfile` pins the GitHub Pages gem versions on active lines, and the
- *     `GEM` specs of `Gemfile.lock` resolve them;
- *   - `.nojekyll` is absent.
- *
- * AC-04, article schema: every `_posts/**\/*.md` and fixture article has a
- * valid filename and slug and passes `parseArticle` and `validateArticle`,
- * with its images resolving to regular files on disk; slugs are unique
- * across posts, fixtures and the author's local drafts. Draft contents are
- * never read: drafts are private and may be incomplete.
- *
- * Every rule comes from `scripts/lib/articles.mjs`, the module `guard` uses,
- * so commit time and test time judge content identically.
- *
- * Each check is also run against synthetic inputs it must refuse (negative
- * controls) and boundary inputs it must accept, through the same function
- * the repository check uses, so a check that stopped refusing anything would
- * fail here: invalid trees for `checkTrackedContent`; malformed front matter,
- * schema breaks and image rules for `parseArticle` and `validateArticle`
- * (with a fixed "today", `FIXED_TODAY`); disabled hook wrappers, run with a
- * stand-in guard; quoted, retyped and unreadable YAML; negated `.gitignore`
- * entries; inactive gem pins and stale lock text; and untracked or
- * wrongly-moded hook index entries.
- *
- * Paths resolve from this file's own location (`ROOT`), never from
- * `process.cwd()`, and git runs in `ROOT`, so the suite gives the same answer
- * from any directory, locally and in CI. It needs no network. It never writes
- * inside the repository, changes its index or changes `process.env`: synthetic
- * roots and temporary git repositories, isolated from every git
- * configuration, live in one `os.tmpdir()` folder removed after the run.
+ * Standing constraints:
+ *   - `_config.yml` and `_config.preview.yml` are read with the types
+ *     Jekyll's YAML loader gives them, so a value that only looks right, such
+ *     as `future: "false"`, fails. The preview restates the `exclude` list
+ *     without `assets/drafts` and sets nothing else, so the overlay's only
+ *     effect is that draft images render in the preview.
+ *   - A hook must be executable, with index mode `100755` once tracked and
+ *     tracked at all under `CI=true`, because a clone receives the mode the
+ *     index records.
+ *   - Draft contents are never read: drafts are private and may be
+ *     incomplete, so only their filenames join the slug check.
+ *   - Every check also runs against inputs it must refuse and inputs it must
+ *     accept, through the same function the repository check uses.
+ *   - Paths resolve from this file's location (`ROOT`), never from
+ *     `process.cwd()`, and git runs in `ROOT`, so the answer is the same from
+ *     any directory. The suite reads no build output and needs no network. It
+ *     never writes inside the repository, changes its index or changes
+ *     `process.env`: synthetic roots and temporary git repositories, run with
+ *     no system, global or environment git configuration and an empty
+ *     template (`TEMP_GIT_ENV`), live in one `os.tmpdir()` folder removed
+ *     after the run.
  *
  * Run: node --test tests/static/blog-content.test.mjs (Node 22 or later).
  */
@@ -82,14 +57,12 @@ import {
   SLUG_RE,
   checkTrackedContent,
   parseArticle,
+  scanUnsafeMarkup,
   validateArticle,
 } from '../../scripts/lib/articles.mjs';
 
-/* ------------------------------------------------------------------------ */
 /* Constants                                                                 */
-/* ------------------------------------------------------------------------ */
 
-/** Repository root: two levels above `tests/static/`. */
 const ROOT = fileURLToPath(new URL('../../', import.meta.url));
 
 /** Today as `YYYY-MM-DD` in UTC, the date the article rules compare against. */
@@ -234,17 +207,23 @@ const TEMP_GIT_CONFIG = path.join(PARENT, 'gitconfig');
 writeFileSync(TEMP_GIT_CONFIG, '');
 const TEMP_HOME = path.join(PARENT, 'home');
 mkdirSync(TEMP_HOME);
+const TEMP_GIT_TEMPLATE = path.join(PARENT, 'git-template');
+mkdirSync(TEMP_GIT_TEMPLATE);
 
 /** Variables that inject git configuration (`git -c` exports `GIT_CONFIG_PARAMETERS`). */
 const GIT_CONFIG_VARS = Object.freeze(['GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_SYSTEM']);
 
 /**
  * Environment for git, and for hooks, in temporary repositories: the
- * redirecting and configuration variables are removed, the system and global
- * configuration are replaced by an empty file and `HOME` by an empty folder,
- * so no developer setting (`core.hooksPath`, excludes files, templates) can
- * influence a case, and discovery never climbs above `PARENT`. A copy, so
- * `process.env` itself is never changed.
+ * redirecting and configuration variables are removed; the system
+ * configuration is turned off and the global one is an empty file; `HOME`
+ * and `XDG_CONFIG_HOME` name an empty folder; `GIT_TEMPLATE_DIR`, which
+ * outranks `init.templateDir` (no call passes `--template`), names an empty
+ * folder, so `git init` copies no hooks, configuration or `info/exclude`
+ * into a new repository; and `GIT_CEILING_DIRECTORIES` stops discovery at
+ * `PARENT`. No developer setting (`core.hooksPath`, excludes files,
+ * templates) can therefore influence a case. A copy, so `process.env` itself
+ * is never changed.
  */
 const TEMP_GIT_ENV = { ...process.env };
 for (const name of Object.keys(TEMP_GIT_ENV)) {
@@ -257,13 +236,12 @@ Object.assign(TEMP_GIT_ENV, {
   GIT_CONFIG_GLOBAL: TEMP_GIT_CONFIG,
   HOME: TEMP_HOME,
   XDG_CONFIG_HOME: TEMP_HOME,
+  GIT_TEMPLATE_DIR: TEMP_GIT_TEMPLATE,
   GIT_TERMINAL_PROMPT: '0',
   GIT_CEILING_DIRECTORIES: PARENT,
 });
 
-/* ------------------------------------------------------------------------ */
 /* File and git helpers                                                      */
-/* ------------------------------------------------------------------------ */
 
 /** Absolute path of a repository-relative POSIX path. */
 function abs(rel) {
@@ -275,7 +253,6 @@ function read(rel) {
   return readFileSync(abs(rel), 'utf8');
 }
 
-/** Whether a repository path exists. */
 function exists(rel) {
   return existsSync(abs(rel));
 }
@@ -371,11 +348,8 @@ function bodyStartLine(text, body) {
   return text.slice(0, text.length - body.length).split('\n').length;
 }
 
-/* ------------------------------------------------------------------------ */
 /* Synthetic roots and temporary repositories (below PARENT only)            */
-/* ------------------------------------------------------------------------ */
 
-/** A new, empty folder below `PARENT`. */
 function tempFolder(name) {
   return mkdtempSync(path.join(PARENT, `${name}-`));
 }
@@ -412,7 +386,6 @@ function replaceOnce(text, search, replacement) {
   return text.slice(0, at) + replacement + text.slice(at + search.length);
 }
 
-/** Asserts that some entry of `problems` matches `pattern`. */
 function assertReports(problems, pattern, label) {
   assert.ok(
     problems.some((problem) => pattern.test(problem)),
@@ -437,12 +410,9 @@ function articleSource(frontMatter, body) {
   return `${['---', ...frontMatter, '---'].join('\n')}\n${body}`;
 }
 
-/** Front matter that passes the article schema. */
 const VALID_FRONT_MATTER = Object.freeze(['title: "A valid title"', 'summary: "A valid summary."', 'tags: [testing]']);
 
-/* ------------------------------------------------------------------------ */
 /* .gitignore probes                                                         */
-/* ------------------------------------------------------------------------ */
 
 /**
  * Problems with how the repository at `cwd` ignores each `IGNORE_PROBES`
@@ -487,9 +457,7 @@ function ignoreProbeProblems(cwd, env) {
   return problems;
 }
 
-/* ------------------------------------------------------------------------ */
 /* Hook wrappers                                                             */
-/* ------------------------------------------------------------------------ */
 
 /** Balanced single- and double-quoted shell strings. */
 const QUOTED_STRING_RE = /"(?:[^"\\]|\\.)*"|'[^']*'/g;
@@ -624,14 +592,17 @@ const GUARD_STAND_IN = [
 ].join('\n');
 
 /**
- * Problems seen when the hook `text` runs as git runs it, in isolation: it is
- * written to `hook.file` in a new temporary repository whose
- * `scripts/article.mjs` is `GUARD_STAND_IN`, and run with `sh` from a
- * subfolder, with `hook.stdin` on standard input and this Node first on
- * `PATH`, once with the stand-in exiting 1 and once exiting 0. Guard must be
+ * Problems seen when the hook `text` is run directly with `sh` rather than
+ * invoked by git, so git supplies neither the working folder nor the
+ * environment it gives a hook: the hook is written to `hook.file` in a new
+ * temporary repository whose `scripts/article.mjs` is the stand-in guard
+ * `GUARD_STAND_IN`, and run from the subfolder `sub/folder` with
+ * `TEMP_GIT_ENV`, this Node first on `PATH` and `hook.stdin` on standard
+ * input, once with the stand-in exiting 1 and once exiting 0. Guard must be
  * reached both times with `hook.args`, the repository's real top level as its
- * working folder and `hook.stdin` unchanged, and the hook must exit with the
- * stand-in's status. Nothing touches this repository.
+ * working folder (the hook must find the root itself) and `hook.stdin`
+ * unchanged, and the hook must exit with the stand-in's status. Nothing
+ * touches this repository.
  *
  * @returns {string[]} Problems; `[]` when the hook hands guard everything.
  */
@@ -763,9 +734,7 @@ const HOOK_CONTROLS = Object.freeze([
   },
 ]);
 
-/* ------------------------------------------------------------------------ */
 /* Typed, fail-closed YAML reader for the Jekyll configuration files         */
-/* ------------------------------------------------------------------------ */
 
 /**
  * Plain scalars that SafeYAML 1.0.5, which Jekyll 3.10 loads its
@@ -1029,7 +998,6 @@ function readTopLevelYaml(text) {
     pos += 1;
   };
 
-  /** The node that starts at `lines[pos]`, at that line's indentation: a list when it is a `- ` item, otherwise a mapping. */
   const readNode = () => (isYamlItem(lines[pos].body) ? readList(lines[pos].indent) : readMapping(lines[pos].indent));
 
   /**
@@ -1144,7 +1112,6 @@ function stringListOf(value) {
   return { items: value.items.map((item) => item.value) };
 }
 
-/** What reading a configuration file reports before any value is checked: refused constructs and repeated keys. */
 function readingProblems(config, label) {
   return [
     ...config.unsupported.map((entry) => `${label}: unsupported YAML at ${entry}`),
@@ -1237,9 +1204,7 @@ function cnameHost() {
   return exists('CNAME') ? read('CNAME').trim() : null;
 }
 
-/* ------------------------------------------------------------------------ */
 /* Gem pins                                                                  */
-/* ------------------------------------------------------------------------ */
 
 /** The active `source` line `Gemfile` must have. */
 const GEM_SOURCE_RE = /^source\s+(["'])https:\/\/rubygems\.org\1$/;
@@ -1443,9 +1408,7 @@ function dropLockSpec(lock, name) {
     .join('\n');
 }
 
-/* ------------------------------------------------------------------------ */
 /* AC-01: draft privacy and publishing configuration                         */
-/* ------------------------------------------------------------------------ */
 
 test('[AC-01][F-017] nothing under _drafts/ or assets/drafts/ is tracked', () => {
   assertRepositoryRoot();
@@ -1908,7 +1871,7 @@ const CONFIG_CONTROLS = Object.freeze([
     ['an item indented deeper than its siblings', (text) => replaceOnce(text, '  - Gemfile\n', '    - Gemfile\n')],
     ['an item indented less than its siblings', (text) => replaceOnce(text, '  - README.md\n', '    - README.md\n')],
     ['an anchor in nested content', (text) => replaceOnce(text, '      layout: post\n', '      layout: &layout post\n')],
-    // Malformed nesting that SafeYAML rejects (verified with the installed gem) must not pass below a key no check reads.
+    // Malformed nesting that SafeYAML 1.0.5 rejects must not pass below a key no check reads.
     ['a nested value continued on a deeper line', (text) => replaceOnce(text, '      author: "Randy Miller"\n', '      author: "Randy Miller"\n        stray\n')],
     ['a nested line without a key', (text) => replaceOnce(text, '    values:\n', '    values\n')],
     ['a nested key between two indentation levels', (text) => replaceOnce(text, '    values:\n', '   values:\n')],
@@ -1998,7 +1961,7 @@ function plainYaml(value) {
 
 test('[AC-01][F-017] the YAML reader reads the nested defaults: block to the structure SafeYAML loads', async (t) => {
   const base = read('_config.yml');
-  // The values the installed SafeYAML 1.0.5 loads for each variant (verified with the gem).
+  // The values SafeYAML 1.0.5 loads for each variant.
   const variants = [
     {
       name: 'as _config.yml writes it',
@@ -2146,9 +2109,7 @@ test('[AC-01][F-017] .nojekyll is absent, so GitHub Pages keeps running Jekyll f
   assert.equal(existsSync(path.join(ROOT, '.nojekyll')), false, '.nojekyll would switch Jekyll off and stop the blog from rendering');
 });
 
-/* ------------------------------------------------------------------------ */
 /* AC-04: article schema                                                     */
-/* ------------------------------------------------------------------------ */
 
 /** Real posts and fixture articles, each validated as a post. */
 function articleFiles() {
@@ -2202,7 +2163,6 @@ const SCHEMA_POST = '_posts/2026-03-01-schema-case.md';
 /** A change to front-matter lines that sets `key` to the raw YAML `value`, replacing any earlier line for it. */
 const setField = (key, value) => (lines) => [...lines.filter((line) => !line.startsWith(`${key}:`)), `${key}: ${value}`];
 
-/** A change to front-matter lines that removes `key`. */
 const dropField = (key) => (lines) => lines.filter((line) => !line.startsWith(`${key}:`));
 
 /**
@@ -2449,6 +2409,244 @@ const IMAGE_CASES = Object.freeze([
     expect: [/^_drafts\/img-case\.md:8: image .* must be under \/assets\/drafts\/img-case\/$/],
     calls: [],
   },
+  {
+    name: 'an escaped space is accepted',
+    image: '![A figure](/assets/blog/img-case/sub/fig%201.png)',
+    expect: [],
+    calls: ['/assets/blog/img-case/sub/fig 1.png'],
+  },
+  {
+    name: 'an encoded .. segment beside a non-UTF-8 escape is refused',
+    image: '![A figure](/assets/blog/img-case/%2e%2e/other-slug/fig%ff.png)',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: image path \/assets\/blog\/img-case\/%2e%2e\/other-slug\/fig%ff\.png has malformed percent-encoding; write % itself as %25$/],
+    calls: [],
+  },
+  {
+    name: 'an encoded .. segment beside a malformed escape is refused',
+    image: '![A figure](/assets/blog/img-case/%2e%2e/other-slug/fig%zz.png)',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: image path \/assets\/blog\/img-case\/%2e%2e\/other-slug\/fig%zz\.png has malformed percent-encoding; write % itself as %25$/],
+    calls: [],
+  },
+  {
+    name: 'a lone non-UTF-8 escape is refused',
+    image: '![A figure](/assets/blog/img-case/fig%ff.png)',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: image path \/assets\/blog\/img-case\/fig%ff\.png has malformed percent-encoding; write % itself as %25$/],
+    calls: [],
+  },
+  {
+    name: 'a .. segment written as character references is refused',
+    image: '![A figure](/assets/blog/img-case/&#46;&#46;/other-slug/fig.png)',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: image path \/assets\/blog\/img-case\/&#46;&#46;\/other-slug\/fig\.png must not contain character references \(&…;\); write the characters themselves$/],
+    calls: [],
+  },
+  {
+    name: 'an encoded .. segment written with named references is refused',
+    image: '![A figure](/assets/blog/img-case/&percnt;2e&percnt;2e/other-slug/fig.png)',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: image path \/assets\/blog\/img-case\/&percnt;2e&percnt;2e\/other-slug\/fig\.png must not contain character references/],
+    calls: [],
+  },
+  {
+    name: 'a tab between two dots, which the browser drops, is refused',
+    image: '![A figure](/assets/blog/img-case/.\t./other-slug/fig.png)',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: image path \/assets\/blog\/img-case\/\.\t\.\/other-slug\/fig\.png must not contain tabs, line breaks or other control characters$/],
+    calls: [],
+  },
+  {
+    name: 'an <img> tab written as a character reference is refused',
+    image: '<img src="/assets/blog/img-case/.&#9;./other-slug/fig.png" alt="A figure">',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: image path \/assets\/blog\/img-case\/\.\t\.\/other-slug\/fig\.png must not contain tabs, line breaks or other control characters$/],
+    calls: [],
+  },
+  // kramdown attribute lists set the attributes the page renders, so their values are held to the same rules.
+  {
+    name: 'an attribute list setting an external src is refused',
+    image: '![A figure](/assets/blog/img-case/fig.png){: src="https://example.com/pixel.png"}',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: attribute list on the image: external images are not allowed \(https:\/\/example\.com\/pixel\.png\)$/],
+    calls: ['/assets/blog/img-case/fig.png'],
+  },
+  {
+    name: "an attribute list setting a src in another article's folder is refused",
+    image: '![A figure](/assets/blog/img-case/fig.png){: src="/assets/blog/other-slug/fig.png"}',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: attribute list on the image: image \/assets\/blog\/other-slug\/fig\.png must be under \/assets\/blog\/img-case\/$/],
+    calls: ['/assets/blog/img-case/fig.png'],
+  },
+  {
+    name: 'an attribute list setting a missing src in the own folder is refused',
+    image: '![A figure](/assets/blog/img-case/fig.png){: src="/assets/blog/img-case/missing.png"}',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: attribute list on the image: image \/assets\/blog\/img-case\/missing\.png does not exist$/],
+    calls: ['/assets/blog/img-case/fig.png', '/assets/blog/img-case/missing.png'],
+  },
+  {
+    name: 'an attribute list setting an empty alt is refused',
+    image: '![A figure](/assets/blog/img-case/fig.png){: alt=""}',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: attribute list on the image: alt text is blank$/],
+  },
+  {
+    name: 'an attribute list setting an alt that a character reference leaves blank is refused',
+    image: '![A figure](/assets/blog/img-case/fig.png){: alt="&#32;"}',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: attribute list on the image: alt text is blank$/],
+  },
+  {
+    name: 'an attribute list setting srcset is refused',
+    image: '![A figure](/assets/blog/img-case/fig.png){: srcset="/assets/blog/img-case/fig.png 2x"}',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: attribute list on the image: srcset is not supported; use a single src$/],
+  },
+  {
+    name: 'an ALD that an attribute list names is checked',
+    image: '![A figure](/assets/blog/img-case/fig.png){: pix}\n\n{:pix: src="/assets/blog/other-slug/fig.png"}',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: attribute list on the image: image \/assets\/blog\/other-slug\/fig\.png must be under \/assets\/blog\/img-case\/$/],
+    calls: ['/assets/blog/img-case/fig.png'],
+  },
+  {
+    name: 'chained attribute lists are all checked',
+    image: '![A figure](/assets/blog/img-case/fig.png){: .wide}{: src="https://example.com/pixel.png"}',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: attribute list on the image: external images are not allowed \(https:\/\/example\.com\/pixel\.png\)$/],
+  },
+  {
+    name: 'an attribute list after an <img> tag is checked',
+    image: '<img src="/assets/blog/img-case/fig.png" alt="A figure">{: src="https://example.com/pixel.png"}',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: attribute list on the image: external images are not allowed \(https:\/\/example\.com\/pixel\.png\)$/],
+  },
+  {
+    name: 'an attribute list after a reference image is checked',
+    image: '![A figure][pic]{: src="https://example.com/pixel.png"}\n\n[pic]: /assets/blog/img-case/fig.png',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: attribute list on the image: external images are not allowed \(https:\/\/example\.com\/pixel\.png\)$/],
+  },
+  {
+    name: 'an attribute list on the link definition a reference image uses is checked',
+    image: '![A figure][pic]\n\n[pic]: /assets/blog/img-case/fig.png\n{: srcset="/assets/blog/other-slug/fig.png 2x"}',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: attribute list on the image: srcset is not supported; use a single src$/],
+  },
+  {
+    name: 'an attribute list on the line before the link definition a reference image uses is checked',
+    image: '![A figure][pic]\n\n{: SRC="/assets/blog/other-slug/fig.png"}\n[pic]: /assets/blog/img-case/fig.png',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: attribute list on the image: image \/assets\/blog\/other-slug\/fig\.png must be under \/assets\/blog\/img-case\/$/],
+  },
+  {
+    name: 'a srcset on the line before the link definition a reference image uses is refused',
+    image: '![A figure][pic]\n\n{: srcset="/assets/blog/other-slug/fig.png 2x"}\n[pic]: /assets/blog/img-case/fig.png',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: attribute list on the image: srcset is not supported; use a single src$/],
+  },
+  {
+    name: 'an ALD named on the line before the link definition a reference image uses is checked',
+    image: '![A figure][pic]\n\n{:ext: SRC="https://example.com/pixel.png"}\n\n{: ext}\n[pic]: /assets/blog/img-case/fig.png',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: attribute list on the image: external images are not allowed \(https:\/\/example\.com\/pixel\.png\)$/],
+  },
+  {
+    name: 'an attribute list over two lines before the link definition a reference image uses is checked',
+    image: '![A figure][pic]\n\n{: SRC="https://example.com/pixel.png"\n}\n[pic]: /assets/blog/img-case/fig.png',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: attribute list on the image: external images are not allowed \(https:\/\/example\.com\/pixel\.png\)$/],
+  },
+  {
+    name: 'a link definition inside a blockquote, with the attribute list before it, is checked',
+    image: '![A figure][pic]\n\n> {: SRC="https://example.com/pixel.png"}\n> [pic]: /assets/blog/img-case/fig.png',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: attribute list on the image: external images are not allowed \(https:\/\/example\.com\/pixel\.png\)$/],
+  },
+  {
+    name: 'a link definition inside a blockquote is checked',
+    image: '![A figure][pic]\n\n> [pic]: https://example.com/pixel.png',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: external images are not allowed \(https:\/\/example\.com\/pixel\.png\)$/],
+  },
+  {
+    name: 'a link definition opening a list item is checked',
+    image: '![A figure][pic]\n\n- [pic]: https://example.com/pixel.png',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: external images are not allowed \(https:\/\/example\.com\/pixel\.png\)$/],
+  },
+  {
+    name: 'a link definition opening a footnote is checked',
+    image: '![A figure][pic]\n\n[^1]: [pic]: https://example.com/pixel.png',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: external images are not allowed \(https:\/\/example\.com\/pixel\.png\)$/],
+  },
+  {
+    name: 'an earlier definition of a label is checked while a later one may be paragraph text kramdown does not read',
+    image: '![A figure][pic]\n\n[pic]: https://example.com/pixel.png\n\nSome text\n[pic]: /assets/blog/img-case/fig.png',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: another link definition of this image's label: external images are not allowed \(https:\/\/example\.com\/pixel\.png\)$/],
+  },
+  {
+    name: 'consecutive definitions of a label are decided by the last, which kramdown renders',
+    image: '![A figure][pic]\n\n[pic]: https://example.com/pixel.png\n[pic]: /assets/blog/img-case/fig.png',
+    expect: [],
+    calls: ['/assets/blog/img-case/fig.png'],
+  },
+  {
+    name: 'an earlier definition of a label is checked while the later one stands in a raw HTML block, blank lines around it',
+    image: '![A figure][pic]\n\n[pic]: https://example.com/pixel.png\n\n<div>\n\n[pic]: /assets/blog/img-case/fig.png\n\n</div>',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: another link definition of this image's label: external images are not allowed \(https:\/\/example\.com\/pixel\.png\)$/],
+  },
+  {
+    name: 'an earlier definition of a label is checked while the later one is a setext header',
+    image: '![A figure][pic]\n\n[pic]: https://example.com/pixel.png\n\n[pic]: /assets/blog/img-case/fig.png\n---',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: another link definition of this image's label: external images are not allowed \(https:\/\/example\.com\/pixel\.png\)$/],
+  },
+  {
+    name: 'an earlier definition of a label is checked while the later one is a table row',
+    image: '![A figure][pic]\n\n[pic]: https://example.com/pixel.png\n\n[pic]: /assets/blog/img-case/fig.png |',
+    expect: [
+      /^_posts\/2026-03-01-img-case\.md:8: image \/assets\/blog\/img-case\/fig\.png \| does not exist$/,
+      /^_posts\/2026-03-01-img-case\.md:8: another link definition of this image's label: external images are not allowed \(https:\/\/example\.com\/pixel\.png\)$/,
+    ],
+  },
+  {
+    name: 'an earlier definition of a label is checked while the later one puts its destination on the next line',
+    image: '![A figure][pic]\n\n[pic]: https://example.com/pixel.png\n\n[pic]:\n/assets/blog/img-case/fig.png',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: another link definition of this image's label: external images are not allowed \(https:\/\/example\.com\/pixel\.png\)$/],
+  },
+  {
+    name: 'an earlier definition of a label is checked while kramdown declines the later one for a space before a quote',
+    image: '![A figure][pic]\n\n[pic]: https://example.com/pixel.png\n\n[pic]: /assets/blog/img-case/fig.png "a" \'b\'',
+    expect: [
+      /^_posts\/2026-03-01-img-case\.md:8: image \/assets\/blog\/img-case\/fig\.png "a" does not exist$/,
+      /^_posts\/2026-03-01-img-case\.md:8: another link definition of this image's label: external images are not allowed \(https:\/\/example\.com\/pixel\.png\)$/,
+    ],
+  },
+  {
+    name: 'an attribute list a blank line separates from the link definition, which kramdown drops, is accepted',
+    image: '![A figure][pic]\n\n{: SRC="https://example.com/pixel.png"}\n\n[pic]: /assets/blog/img-case/fig.png',
+    expect: [],
+    calls: ['/assets/blog/img-case/fig.png'],
+  },
+  {
+    name: 'a class attribute list before the link definition is accepted',
+    image: '![A figure][pic]\n\n{: .wide}\n[pic]: /assets/blog/img-case/fig.png',
+    expect: [],
+    calls: ['/assets/blog/img-case/fig.png'],
+  },
+  {
+    name: 'an attribute list with backslash escapes, which move its end, is refused',
+    image: '![A figure](/assets/blog/img-case/fig.png){: src="/assets/blog/other-slug/fig.png" \\}',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: attribute list on the image cannot be checked; remove its backslash escapes$/],
+  },
+  {
+    name: 'an <img> repeating its src is refused',
+    image: '<img src="/assets/blog/img-case/fig.png" src="https://example.com/pixel.png" alt="A figure">',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: <img> repeats the src attribute; write it once$/],
+  },
+  {
+    name: 'an alt text that a character reference leaves blank is refused',
+    image: '![&#32;](/assets/blog/img-case/fig.png)',
+    expect: [/^_posts\/2026-03-01-img-case\.md:8: image has no alt text \(/],
+  },
+  {
+    name: 'an attribute list setting a src in the own folder is accepted',
+    image: '![A figure](/assets/blog/img-case/fig.png){: src="/assets/blog/img-case/sub/fig%201.png"}',
+    expect: [],
+    calls: ['/assets/blog/img-case/fig.png', '/assets/blog/img-case/sub/fig 1.png'],
+  },
+  { name: 'a class attribute list is accepted', image: '![A figure](/assets/blog/img-case/fig.png){: .wide}', expect: [], calls: ['/assets/blog/img-case/fig.png'] },
+  { name: 'an id attribute list is accepted', image: '![A figure](/assets/blog/img-case/fig.png){: #fig}', expect: [], calls: ['/assets/blog/img-case/fig.png'] },
+  { name: 'a loading attribute list is accepted', image: '![A figure](/assets/blog/img-case/fig.png){: loading="lazy"}', expect: [], calls: ['/assets/blog/img-case/fig.png'] },
+  {
+    name: 'an attribute list after a space, which kramdown leaves as text, is accepted',
+    image: '![A figure](/assets/blog/img-case/fig.png) {: src="https://example.com/pixel.png"}',
+    expect: [],
+    calls: ['/assets/blog/img-case/fig.png'],
+  },
+  {
+    name: 'an attribute list on the next line, which kramdown gives the paragraph, is accepted',
+    image: '![A figure](/assets/blog/img-case/fig.png)\n{: src="https://example.com/pixel.png"}',
+    expect: [],
+    calls: ['/assets/blog/img-case/fig.png'],
+  },
 ]);
 
 test('[AC-04][F-017] images need alt text and an existing regular file in the article\'s own folder, never external or data:', async (t) => {
@@ -2458,6 +2656,11 @@ test('[AC-04][F-017] images need alt text and an existing regular file in the ar
     'assets/blog/img-case/sub/fig 1.png': PNG,
     'assets/blog/other-slug/fig.png': PNG,
     'assets/drafts/img-case/fig.png': PNG,
+    // Files named as the raw text of encoded paths, so a check of that text instead of the request would pass.
+    'assets/blog/img-case/%2e%2e/other-slug/fig%ff.png': PNG,
+    'assets/blog/img-case/%2e%2e/other-slug/fig%zz.png': PNG,
+    'assets/blog/img-case/fig%ff.png': PNG,
+    'assets/blog/img-case/&#46;&#46;/other-slug/fig.png': PNG,
   });
   mkdirSync(path.join(root, 'assets', 'blog', 'img-case', 'folder'));
   const imageExists = makeImageExists(root);
@@ -2497,6 +2700,171 @@ test('[AC-04][F-017] images need alt text and an existing regular file in the ar
   });
 });
 
+/**
+ * `scanUnsafeMarkup` cases for what kramdown passes through and a browser
+ * runs although the raw source spells no `javascript:` and no tag name of
+ * letters, digits and hyphens: character references in inline, angle-bracket
+ * and reference-definition URLs, and handlers or `javascript:` values on tags
+ * named with `:`, `_`, `.` or non-ASCII letters. `expect` is the exact list
+ * of findings; the controls (autolinks, prose, code, ordinary links and
+ * elements) must produce none.
+ */
+const UNSAFE_SOURCE_CASES = Object.freeze([
+  {
+    name: 'an inline destination with &#106; for the j',
+    body: 'Intro.\n\n[open](&#106;avascript:alert(1)) end.\n',
+    expect: [{ line: 3, text: '[open](&#106;avascript:alert(1)) end.' }],
+  },
+  {
+    name: 'an inline destination with &#x6A; for the j',
+    body: 'Intro.\n\n![A figure](&#x6A;avascript:alert(1))\n',
+    expect: [{ line: 3, text: '![A figure](&#x6A;avascript:alert(1))' }],
+  },
+  {
+    name: 'an inline destination with &#58; for the colon',
+    body: 'Intro.\n\n[open](javascript&#58;alert(1))\n',
+    expect: [{ line: 3, text: '[open](javascript&#58;alert(1))' }],
+  },
+  {
+    name: 'an inline destination with &colon; for the colon',
+    body: 'Intro.\n\n[open](javascript&colon;alert(1))\n',
+    expect: [{ line: 3, text: '[open](javascript&colon;alert(1))' }],
+  },
+  {
+    name: 'an inline destination with a leading &#32;',
+    body: 'Intro.\n\n[open](&#32;javascript:alert(1))\n',
+    expect: [{ line: 3, text: '[open](&#32;javascript:alert(1))' }],
+  },
+  {
+    name: 'an angle-bracket destination with &#x09; between the letters',
+    body: 'Intro.\n\n[open](<java&#x09;script:alert(1)>)\n',
+    expect: [{ line: 3, text: '[open](<java&#x09;script:alert(1)>)' }],
+  },
+  {
+    name: 'an angle-bracket destination after a space, with &#106; for the j',
+    body: 'Intro.\n\n[open]( <&#106;avascript:alert(1)>)\n',
+    expect: [{ line: 3, text: '[open]( <&#106;avascript:alert(1)>)' }],
+  },
+  {
+    name: 'a reference definition with &#58; for the colon',
+    body: 'Intro [id] end.\n\n[id]: javascript&#58;alert(1)\n',
+    expect: [{ line: 3, text: '[id]: javascript&#58;alert(1)' }],
+  },
+  {
+    name: 'an angle-bracket reference definition with &colon; for the colon',
+    body: 'Intro [id] end.\n\n[id]: <javascript&colon;alert(1)>\n',
+    expect: [{ line: 3, text: '[id]: <javascript&colon;alert(1)>' }],
+  },
+  {
+    name: 'a reference definition with a leading &#9; and &#x6A; for the j',
+    body: 'Intro [id] end.\n\n[id]:&#9;&#x6A;avascript:alert(1)\n',
+    expect: [{ line: 3, text: '[id]:&#9;&#x6A;avascript:alert(1)' }],
+  },
+  {
+    name: 'a handler on a tag named with a colon',
+    body: 'Intro.\n\nHover <x:note onmouseover="alert(1)">here</x:note>.\n',
+    expect: [{ line: 3, text: 'Hover <x:note onmouseover="alert(1)">here</x:note>.' }],
+  },
+  {
+    name: 'a handler on a tag named with an underscore',
+    body: 'Intro.\n\nHover <x_note onmouseover="alert(1)">here</x_note>.\n',
+    expect: [{ line: 3, text: 'Hover <x_note onmouseover="alert(1)">here</x_note>.' }],
+  },
+  {
+    name: 'a handler on a tag whose name starts with an underscore',
+    body: 'Intro.\n\nClick <_note onclick="a()">here</_note>.\n',
+    expect: [{ line: 3, text: 'Click <_note onclick="a()">here</_note>.' }],
+  },
+  {
+    name: 'a handler on a tag named with a dot',
+    body: 'Intro.\n\nClick <x.note onclick="a()">here</x.note>.\n',
+    expect: [{ line: 3, text: 'Click <x.note onclick="a()">here</x.note>.' }],
+  },
+  {
+    name: 'a handler on a tag named with a non-ASCII letter',
+    body: 'Intro.\n\nClick <xé onclick="a()">here</xé>.\n',
+    expect: [{ line: 3, text: 'Click <xé onclick="a()">here</xé>.' }],
+  },
+  {
+    name: 'a handler on a tag whose name starts with a non-ASCII letter',
+    body: 'Intro.\n\nClick <é onclick="a()">here</é>.\n',
+    expect: [{ line: 3, text: 'Click <é onclick="a()">here</é>.' }],
+  },
+  {
+    name: 'a handler on its own line of a tag named with a colon',
+    body: 'Intro.\n\n<x:note\n  onclick="a()">here</x:note>\n',
+    expect: [{ line: 4, text: 'onclick="a()">here</x:note>' }],
+  },
+  {
+    name: 'a javascript: href on a tag named with a colon',
+    body: 'Intro.\n\nOpen <x:a href="javascript:alert(1)">here</x:a>.\n',
+    expect: [{ line: 3, text: 'Open <x:a href="javascript:alert(1)">here</x:a>.' }],
+  },
+  {
+    name: 'an encoded javascript: href on a tag named with a dot',
+    body: 'Intro.\n\nOpen <x.a href="&#106;avascript:alert(1)">here</x.a>.\n',
+    expect: [{ line: 3, text: 'Open <x.a href="&#106;avascript:alert(1)">here</x.a>.' }],
+  },
+  {
+    name: 'a URL-shaped tag name with a handler that opens an HTML block',
+    body: 'Intro.\n\n<http:x onclick="alert(1)"></http:x>\n',
+    expect: [{ line: 3, text: '<http:x onclick="alert(1)"></http:x>' }],
+  },
+  {
+    name: 'a URL-shaped tag name with a javascript: href inside a raw HTML block',
+    body: 'Intro.\n\n<div><mailto:x href="javascript:alert(1)"></mailto:x></div>\n',
+    expect: [{ line: 3, text: '<div><mailto:x href="javascript:alert(1)"></mailto:x></div>' }],
+  },
+  {
+    name: 'control: URL and address autolinks holding onclick= are links, not tags',
+    body: 'See <https://example.com/?onclick=1>, <https://example.com/a/onclick=1>, <mailto:a@b.example> and <a@b.example>.\n',
+    expect: [],
+  },
+  {
+    name: 'control: a URL-shaped tag in running text is an autolink, there and in a table cell or span',
+    body: 'Intro <http:x onclick="alert(1)"> end.\n\n| a | <https://e.example/x onclick=1> |\n|---|---|\n| b | c |\n\nSee <span><https://e.example/a onclick=1></span>.\n',
+    expect: [],
+  },
+  {
+    name: 'control: a heading about JavaScript',
+    body: '## JavaScript: closures explained\n\nA closure keeps its scope.\n',
+    expect: [],
+  },
+  {
+    name: 'control: escaped brackets and character references in prose',
+    body: 'Write &lt;javascript:x&gt; or &#93;(javascript:x) or &#x5d;: javascript:x as text.\n',
+    expect: [],
+  },
+  {
+    name: 'control: the payloads inside inline code',
+    body: 'Avoid `[open](&#106;avascript:alert(1))` and `<x:note onclick="a()">`.\n',
+    expect: [],
+  },
+  {
+    name: 'control: the payloads inside a fenced block',
+    body: 'Avoid these:\n\n```html\n<x:note onclick="a()">here</x:note>\n[open](&#106;avascript:alert(1))\n[id]: javascript&#58;alert(1)\n```\n',
+    expect: [],
+  },
+  {
+    name: 'control: ordinary links, images and reference definitions',
+    body: 'See [MDN](https://developer.mozilla.org/), [the blog](/blog/), [a ref][id] and ![A figure](/assets/blog/x/fig.png).\n\n[id]: https://example.com/&#63;q=1\n',
+    expect: [],
+  },
+  {
+    name: 'control: a custom element named with a colon and no handler',
+    body: 'A <x:note title="A &amp; B">note</x:note> and a <x.note class="wide">second</x.note>.\n',
+    expect: [],
+  },
+]);
+
+test('[AC-01][F-017] scanUnsafeMarkup refuses encoded javascript: destinations and handlers on every raw tag name, and leaves autolinks, prose and code alone', async (t) => {
+  for (const { name, body, expect } of UNSAFE_SOURCE_CASES) {
+    await t.test(`[AC-01][F-017] unsafe source: ${name}`, () => {
+      assert.deepEqual(scanUnsafeMarkup(body), expect, `${name}: findings for ${JSON.stringify(body)}`);
+    });
+  }
+});
+
 test('[AC-04][F-017] slugs are unique across _posts/, tests/fixtures/posts/ and local drafts', (t) => {
   const { posts, fixtures } = articleFiles();
   const owners = new Map();
@@ -2524,4 +2892,216 @@ test('[AC-04][F-017] slugs are unique across _posts/, tests/fixtures/posts/ and 
   t.diagnostic(`${posts.length} posts, ${fixtures.length} fixtures, ${drafts} local drafts`);
 
   assert.deepEqual(clashes, [], `every article needs its own slug, because the slug is its URL:\n${clashes.join('\n')}`);
+});
+
+/** Longest any one adversarial case may take; generous, as the host is shared and loaded. */
+const FAST_LIMIT_MS = 5000;
+/** Length of the long runs in the adversarial cases; a super-linear reading takes minutes at this size. */
+const FAST_N = 200000;
+/** Whitespace before a line terminator in a front-matter key line; a cubic reading takes hours at this size. */
+const FAST_KEY_N = 50000;
+
+/** The line numbers of scanner findings. */
+function findingLines(findings) {
+  return findings.map((finding) => finding.line);
+}
+
+/** The value of `key` and the errors `parseArticle` gives for the valid front matter with `line` as its `key` line. */
+function parsedField(line, key) {
+  const frontMatter = [...VALID_FRONT_MATTER.filter((entry) => !entry.startsWith(`${key}:`)), line];
+  const { data, errors } = parseArticle(articleSource(frontMatter, 'Body.\n'));
+  return { errors, value: data[key] };
+}
+
+/**
+ * What `validateArticle` makes of the reference image `![Alt][id]` (body
+ * line 1, file line 6) whose link definition is `definition`: the public
+ * paths it asks the existence callback about, and its errors.
+ */
+function definitionImageFindings(definition) {
+  const text = articleSource(VALID_FRONT_MATTER, `![Alt][id]\n\n${definition}\n`);
+  const { data, body } = parseArticle(text);
+  const asked = [];
+  const errors = validateArticle({
+    path: SCHEMA_POST, data, body, kind: 'post', todayUtc: FIXED_TODAY, bodyStartLine: bodyStartLine(text, body),
+    imageExists: (publicPath) => {
+      asked.push(publicPath);
+      return true;
+    },
+  });
+  return { asked, errors };
+}
+
+/**
+ * Inputs on which a backtracking reading of the article rules, or one that
+ * re-reads shared input for each item, costs time quadratic or worse in
+ * their length: long fence runs, open or closed, at the top level and in
+ * list items; closing-fence-shaped lines that never close each other; key
+ * lines whose whitespace ends in a line terminator; long whitespace runs in
+ * table rows, plain values, flow lists, raw tags, list items and autolinks;
+ * many images sharing a label with many definitions; and many autolinks on
+ * one line. Each case states the result the rules give at any size: markup
+ * after an unclosed fence is still found, code stays masked, and values
+ * parse as they do when short.
+ */
+const FAST_CASES = Object.freeze([
+  {
+    name: 'an unclosed fence of tildes leaves the markup after it scanned',
+    run: () => findingLines(scanUnsafeMarkup(`${'~'.repeat(FAST_N)}\nordinary text\n<script>alert(1)</script>\n`)),
+    expect: [3],
+  },
+  {
+    name: 'an unclosed fence of backticks leaves the markup after it scanned',
+    run: () => findingLines(scanUnsafeMarkup(`${'`'.repeat(FAST_N)}\nordinary text\n<script>alert(1)</script>\n`)),
+    expect: [3],
+  },
+  {
+    name: 'an unclosed fence mixing tildes and backticks leaves the markup after it scanned',
+    run: () => findingLines(scanUnsafeMarkup(`${'~`'.repeat(FAST_N / 2)}\nordinary text\n<script>alert(1)</script>\n`)),
+    expect: [3],
+  },
+  {
+    name: 'an unclosed fence in a list item leaves the markup after it scanned',
+    run: () => findingLines(scanUnsafeMarkup(`- ${'~'.repeat(FAST_N)}\n  ordinary text\n<script>alert(1)</script>\n`)),
+    expect: [3],
+  },
+  {
+    name: 'a fence opener whose info holds two words between long whitespace opens nothing',
+    run: () => findingLines(scanUnsafeMarkup(`\`\`\`${' '.repeat(FAST_N)}a b\n<script>alert(1)</script>\n`)),
+    expect: [2],
+  },
+  {
+    name: 'a long closed fence still masks its content and nothing after it',
+    run: () => findingLines(scanUnsafeMarkup(`${'~'.repeat(FAST_N)}\n<script>hidden()</script>\n${'~'.repeat(FAST_N)}\n<script>shown()</script>\n`)),
+    expect: [4],
+  },
+  {
+    name: 'closing-fence-shaped lines that never close each other leave the markup after them scanned',
+    run: () => {
+      const lines = Array.from({ length: 3000 }, (_, j) => `\`${'~'.repeat(j + 1)}\``);
+      return findingLines(scanUnsafeMarkup(`${lines.join('\n')}\n<script>alert(1)</script>\n`));
+    },
+    expect: [3001],
+  },
+  {
+    name: 'validateArticle reads an image after an unclosed fence',
+    run: () => {
+      const text = articleSource(VALID_FRONT_MATTER, `${'~'.repeat(FAST_N)}\n![](/assets/blog/schema-case/a.png)\n`);
+      const { data, body } = parseArticle(text);
+      const findings = validateArticle({ path: SCHEMA_POST, data, body, kind: 'post', todayUtc: FIXED_TODAY, imageExists: () => true, bodyStartLine: bodyStartLine(text, body) });
+      return findings.map((finding) => /:7: image has no alt text/.test(finding));
+    },
+    expect: [true],
+  },
+  {
+    name: 'a key line with whitespace before U+2028 is unsupported syntax',
+    run: () => parseArticle(`---\ntitle:${' '.repeat(FAST_KEY_N)}\u2028X\n---\nBody\n`).errors,
+    expect: ['front matter line 2: unsupported syntax'],
+  },
+  {
+    name: 'a key line with whitespace before a lone carriage return is unsupported syntax',
+    run: () => parseArticle(`---\ntitle:${' '.repeat(FAST_KEY_N)}\rX\n---\nBody\n`).errors,
+    expect: ['front matter line 2: unsupported syntax'],
+  },
+  {
+    name: 'a key line with tabs before U+2029 is unsupported syntax',
+    run: () => parseArticle(`---\ntitle:${'\t'.repeat(FAST_KEY_N)}\u2029X\n---\nBody\n`).errors,
+    expect: ['front matter line 2: unsupported syntax'],
+  },
+  {
+    name: 'a table row with a long whitespace run before text gives no finding',
+    run: () => findingLines(scanUnsafeMarkup(`\`a\` |${' '.repeat(FAST_N)}X\n`)),
+    expect: [],
+  },
+  {
+    name: 'a code span in a table row with a long whitespace run stays masked',
+    run: () => findingLines(scanUnsafeMarkup(`\`<script>\` |${' '.repeat(FAST_N)}X\n`)),
+    expect: [],
+  },
+  {
+    name: 'a table cell holding a long interior run of Ruby whitespace keeps its code span masked',
+    run: () => findingLines(scanUnsafeMarkup(`| \`<b>\` x${' \v'.repeat(FAST_N / 2)}X |\n`)),
+    expect: [],
+  },
+  {
+    name: 'a plain updated value keeps an interior whitespace run',
+    run: () => parsedField(`updated: x${' '.repeat(FAST_N)}X`, 'updated'),
+    expect: { errors: [], value: `x${' '.repeat(FAST_N)}X` },
+  },
+  {
+    name: 'a plain updated value loses a comment after a long whitespace run',
+    run: () => parsedField(`updated: 2026-01-01${' \t'.repeat(FAST_N / 2)}# note${' '.repeat(FAST_N)}`, 'updated'),
+    expect: { errors: [], value: '2026-01-01' },
+  },
+  {
+    name: 'a bare flow-list item keeps its interior whitespace and loses its trailing tabs',
+    run: () => parsedField(`tags: [a${' '.repeat(FAST_N)}b${'\t'.repeat(FAST_N)}, c]`, 'tags'),
+    expect: { errors: [], value: [`a${' '.repeat(FAST_N)}b`, 'c'] },
+  },
+  {
+    name: 'a raw tag with long whitespace between its attributes is still checked',
+    run: () => findingLines(scanUnsafeMarkup(`<a${' '.repeat(FAST_N)}href=x\n${' '.repeat(FAST_N)}onclick=alert(1)>\n`)),
+    expect: [2],
+  },
+  {
+    name: 'an unfinished block tag followed by long whitespace gives no finding',
+    run: () => findingLines(scanUnsafeMarkup(`<div${' '.repeat(FAST_N)}\n${' '.repeat(FAST_N)}X\n`)),
+    expect: [],
+  },
+  {
+    name: 'a list item whose first line is a long whitespace run gives no finding',
+    run: () => findingLines(scanUnsafeMarkup(`-${' '.repeat(FAST_N)}X\n`)),
+    expect: [],
+  },
+  {
+    name: 'a list item indented by alternating spaces and tabs is still scanned',
+    run: () => findingLines(scanUnsafeMarkup(`- ${' \t'.repeat(FAST_N / 2)}<script>alert(1)</script>\n`)),
+    expect: [1],
+  },
+  {
+    name: 'a near rule with long whitespace between its markers gives no finding',
+    run: () => findingLines(scanUnsafeMarkup(`*${' '.repeat(FAST_N)}*${' '.repeat(FAST_N)}X\n`)),
+    expect: [],
+  },
+  {
+    name: 'a link definition with long whitespace around an unclosed title gives its image the whole line as source',
+    run: () => {
+      const { asked, errors } = definitionImageFindings(`[id]: x${' '.repeat(FAST_N)}"t${' '.repeat(FAST_N)}`);
+      return { asked, errors: errors.map((error) => /:6: page-relative image path x {76}\.\.\. is not allowed/.test(error)) };
+    },
+    expect: { asked: [], errors: [true] },
+  },
+  {
+    name: 'a link definition with a long run of quoted words and no closing title gives its image the whole line as source',
+    run: () => definitionImageFindings(`[id]: /assets/blog/schema-case/a.png${' "y'.repeat(FAST_N / 3)} z`),
+    expect: { asked: [`/assets/blog/schema-case/a.png${' "y'.repeat(FAST_N / 3)} z`], errors: [] },
+  },
+  {
+    name: 'a line of unclosed autolinks keeps its code span masked and the markup after it scanned',
+    // Each unclosed autolink is read only to the end of its line, so this case repeats the opener, not a character, FAST_N times.
+    run: () => findingLines(scanUnsafeMarkup(`\`<script>\` ${'<http:'.repeat(FAST_N)}\n<b onclick=x>\n`)),
+    expect: [2],
+  },
+  {
+    name: 'many images of a label with many definitions, each of which kramdown may render, check its source once',
+    run: () => definitionImageFindings(`${'![Alt][id] '.repeat(FAST_N / 4)}\n\n${'Text\n[id]: /assets/blog/schema-case/a.png\n'.repeat(FAST_N / 20)}`),
+    expect: { asked: ['/assets/blog/schema-case/a.png'], errors: [] },
+  },
+  {
+    name: 'a line of many autolinks gives no finding and leaves the markup after it scanned',
+    run: () => findingLines(scanUnsafeMarkup(`See ${'<https://e.example/a> '.repeat(FAST_N / 5)}\n<b onclick=x>\n`)),
+    expect: [2],
+  },
+]);
+
+test('[AC-04][F-017] the article rules stay fast on adversarial fences, front-matter lines, table rows and whitespace runs', { timeout: 600000 }, async (t) => {
+  for (const { name, run, expect } of FAST_CASES) {
+    await t.test(`[AC-04][F-017] fast: ${name}`, { timeout: 60000 }, () => {
+      const started = performance.now();
+      const result = run();
+      const elapsed = performance.now() - started;
+      assert.deepEqual(result, expect, `${name}: unexpected result`);
+      assert.ok(elapsed < FAST_LIMIT_MS, `${name}: took ${Math.round(elapsed)} ms, over the ${FAST_LIMIT_MS} ms bound`);
+    });
+  }
 });

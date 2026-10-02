@@ -10,9 +10,13 @@
  *     arguments, working directory, inherited output and deadline, and each
  *     command is printed before it runs;
  *   - the fixture folder is a fresh `cabrillo-verify-*` folder that exists
- *     for steps 3 to 5, is removed after a pass and kept after a failure;
+ *     for steps 3 to 5 and is removed after a pass, a failure and an
+ *     exception alike, unless `--keep-fixtures` keeps it after a failure;
+ *     a folder that cannot be removed fails a pass and leaves a failing
+ *     step's status unchanged;
  *   - JEKYLL_ENV and the caller's SITE_DIR, SITE_BASEURL, SITE_URL and
- *     FIXTURE_DIR reach no step; step 2 gets SITE_URL from `_config.yml`,
+ *     FIXTURE_DIR reach no child (git queries, the browser preflight and
+ *     every step); step 2 gets SITE_URL from `_config.yml`,
  *     step 4 gets all four fixture variables, and VISUAL_CHANGE_INTENDED and
  *     every other variable reach every step;
  *   - `--base` reaches step 5 unchanged, the default is the upstream or
@@ -22,7 +26,8 @@
  *   - a refusing browser preflight stops the run before step 1;
  *   - the first failing step decides the exit status and no later step runs.
  *
- * `preflightPlaywright` is run with fake Playwright modules. It must judge
+ * `preflightPlaywright` (tests/visual/lib/preflight.mjs, which verify.mjs
+ * imports) is run with fake Playwright modules. It must judge
  * both partial installs by launching the browser, never by the path of full
  * Chromium: a headless shell alone passes and full Chromium alone fails with
  * the install command. The last case holds tests/visual/playwright.config.mjs
@@ -47,7 +52,8 @@ import process from 'node:process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { DEADLINES } from '../../scripts/lib/subprocess.mjs';
-import { main, preflightPlaywright } from '../../scripts/verify.mjs';
+import { configuredSiteUrl, main, yamlScalar } from '../../scripts/verify.mjs';
+import { CHROMIUM_NOT_CLOSED, PLAYWRIGHT_MISSING, preflightPlaywright } from '../visual/lib/preflight.mjs';
 
 /* ------------------------------------------------------------------------ */
 /* Constants                                                                 */
@@ -92,9 +98,11 @@ const HOSTILE_ENV = Object.freeze({
 
 const SUITE_VARIABLES = Object.freeze(['SITE_DIR', 'SITE_BASEURL', 'SITE_URL', 'FIXTURE_DIR']);
 
-const USAGE = 'Usage: node scripts/verify.mjs [--base <ref>]';
+const USAGE = 'Usage: node scripts/verify.mjs [--base <ref>] [--keep-fixtures]';
+
+/** What a failed run without --keep-fixtures prints once it has removed the fixture folder. */
+const FIXTURES_REMOVED = 'verify: fixture builds removed; run again with --keep-fixtures to keep them for inspection';
 const INSTALL_COMMAND = 'npx playwright install chromium';
-const PLAYWRIGHT_MISSING = 'Playwright is not installed. Run: npm ci && npx playwright install chromium';
 
 /** Playwright 1.63.0's launch error when only full Chromium is installed. */
 const SHELL_PATH =
@@ -183,7 +191,8 @@ function workspace(t, config = CUSTOM_DOMAIN_CONFIG) {
  * `gitFacts(ref)` when given. Any other git command is recorded as
  * unexpected. Every other call is a step, answered with `stepFacts(number)`;
  * its call records a copy of its options, the entries of the fixture parent
- * at that moment and the last line printed before it.
+ * at that moment and the last line printed before it. `remove`, when given,
+ * replaces the fixture folder's removal.
  * @param {ReturnType<typeof workspace>} ws
  * @param {string[]} argv
  * @param {object} [options]
@@ -196,11 +205,13 @@ async function runVerify(ws, argv, options = {}) {
     stepFacts = () => ({}),
     preflightResult = null,
     tmpdir = ws.tmpdir,
+    remove,
   } = options;
   const events = [];
   const gitCalls = [];
   const steps = [];
   const unexpected = [];
+  const preflightOptions = [];
   let preflightCalls = 0;
 
   const run = (command, args, callOptions) => {
@@ -232,15 +243,24 @@ async function runVerify(ws, argv, options = {}) {
     return processResult(callOptions, stepFacts(number));
   };
 
-  const preflight = async () => {
+  const preflight = async (preflightOptionsGiven) => {
     preflightCalls += 1;
+    preflightOptions.push(preflightOptionsGiven);
     events.push('preflight');
     return preflightResult;
   };
 
-  const code = await main(argv, { env, root: ws.root, run, preflight, tmpdir, execPath: EXEC_PATH });
+  const code = await main(argv, { env, root: ws.root, run, preflight, tmpdir, execPath: EXEC_PATH, remove });
   assert.deepEqual(unexpected, [], 'only rev-parse queries reach git');
-  return { code, events, gitCalls, steps, preflightCalls, fixtureDir: steps[2] ? steps[2].args[1] : undefined };
+  return {
+    code,
+    events,
+    gitCalls,
+    steps,
+    preflightCalls,
+    preflightOptions,
+    fixtureDir: steps[2] ? steps[2].args[1] : undefined,
+  };
 }
 
 /** The built-output suite variables in `env`, with their values. */
@@ -276,14 +296,35 @@ function fakePlaywright({ launch, executable = path.join(os.tmpdir(), 'no-such-c
   return { record, module: { chromium } };
 }
 
-/** A browser whose close resolves, or rejects with `closeError`. */
-function fakeBrowser(record, closeError) {
-  return {
-    async close() {
+/**
+ * A browser whose closes resolve unless `behaviour.closes` says otherwise.
+ * @param {object} record The fake module's record; every close is counted.
+ * @param {object} [behaviour]
+ * @param {Array<Error | 'hang' | undefined>} [behaviour.closes] Outcome of each close in turn: an
+ *   error rejects with it, 'hang' never settles, anything else (or a close beyond the list) resolves.
+ * @param {boolean} [behaviour.connected] What `isConnected()` returns; without it there is no `isConnected`.
+ */
+function fakeBrowser(record, behaviour = {}) {
+  const { closes = [], connected } = behaviour;
+  const browser = {
+    close() {
+      const outcome = closes[record.closes];
       record.closes += 1;
-      if (closeError) throw closeError;
+      if (outcome === 'hang') return new Promise(() => {});
+      return outcome instanceof Error ? Promise.reject(outcome) : Promise.resolve();
     },
   };
+  if (connected !== undefined) browser.isConnected = () => connected;
+  return browser;
+}
+
+/** A notice printer that records what it is given. */
+function recordingReport() {
+  const messages = [];
+  const report = (message) => {
+    messages.push(message);
+  };
+  return { messages, report };
 }
 
 /** Asserts a launch configuration starts what `chromium.launch({ headless: true })` starts. */
@@ -403,13 +444,21 @@ test("[AC-16][F-018] strips JEKYLL_ENV and the caller's suite variables; steps 2
   }
   assert.ok(ws.stdout.includes('verify: VISUAL_CHANGE_INTENDED=1 is passed to step 5'));
 
-  // git queries see the caller's environment with optional locks off, in the root, under their deadline.
+  // git queries see the sanitized environment with optional locks off, in the root, under their deadline.
   assert.equal(r.gitCalls.length, 1);
   for (const call of r.gitCalls) {
-    assert.deepEqual(call.options.env, { ...env, GIT_OPTIONAL_LOCKS: '0' });
+    assert.deepEqual(call.options.env, { ...kept, GIT_OPTIONAL_LOCKS: '0' });
     assert.equal(call.options.cwd, ws.root);
     assert.equal(call.options.timeoutMs, DEADLINES.gitQuery);
   }
+
+  // The browser preflight gets the same sanitized environment and a notice printer.
+  assert.equal(r.preflightOptions.length, 1);
+  const [preflightOptions] = r.preflightOptions;
+  assert.deepEqual(preflightOptions.env, kept);
+  assert.equal(Object.hasOwn(preflightOptions.env, 'JEKYLL_ENV'), false);
+  assert.deepEqual(suiteVariables(preflightOptions.env), {});
+  assert.equal(typeof preflightOptions.report, 'function');
 });
 
 /* ------------------------------------------------------------------------ */
@@ -453,6 +502,33 @@ test('[AC-16][F-018] a _config.yml without a usable url, or none, fails before t
       );
     });
   }
+});
+
+test('[AC-16][F-018] a plain url value loses its trailing comment exactly as /\\s+#.*$/ and trim remove it', () => {
+  // Every string of up to six of these characters, line terminators included.
+  const alphabet = [' ', '\t', '#', '\r', '\n', '\u2028', '\u2029', 'a'];
+  let strings = [''];
+  let checked = 0;
+  for (let length = 0; length <= 6; length += 1) {
+    if (length > 0) strings = strings.flatMap((value) => alphabet.map((ch) => value + ch));
+    for (const value of strings) {
+      const expected = value.trim().replace(/\s+#.*$/, '').trim();
+      assert.equal(yamlScalar(value), expected, JSON.stringify(value));
+      checked += 1;
+    }
+  }
+  assert.equal(checked, 299_593);
+  assert.deepEqual(configuredSiteUrl('url: https://example.test/ # the host'), { url: 'https://example.test/' });
+  assert.deepEqual(configuredSiteUrl('url: https://example.test/#top'), { url: 'https://example.test/#top' });
+});
+
+test('[AC-16][F-018] a url value with a long whitespace run and no comment is read in linear time', () => {
+  const url = `https://example.test/${' '.repeat(200_000)}x`;
+  const started = Date.now();
+  const result = configuredSiteUrl(`url: ${url}`);
+  const took = Date.now() - started;
+  assert.deepEqual(result, { url });
+  assert.ok(took < 2000, `took ${took} ms`);
 });
 
 /* ------------------------------------------------------------------------ */
@@ -533,7 +609,15 @@ test('[AC-16][F-018] a git query that gives no answer fails the run instead of f
 });
 
 test('[AC-16][F-018] a usage error exits 2 and --help exits 0, both without git, preflight or any step', async (t) => {
-  const usageErrors = [['--frobnicate'], ['--base'], ['--base', '--help'], ['--base='], ['--base', 'a', '--base', 'b']];
+  const usageErrors = [
+    ['--frobnicate'],
+    ['--base'],
+    ['--base', '--help'],
+    ['--base='],
+    ['--base', 'a', '--base', 'b'],
+    ['--keep-fixtures=1'],
+    ['--base', '--keep-fixtures'],
+  ];
   for (const argv of usageErrors) {
     await t.test(`[AC-16][F-018] usage error: ${argv.join(' ')}`, async (st) => {
       const ws = workspace(st);
@@ -550,6 +634,7 @@ test('[AC-16][F-018] a usage error exits 2 and --help exits 0, both without git,
       assert.equal(r.code, 0);
       assert.deepEqual(r.events, []);
       assert.ok(ws.stdout[0].startsWith(`${USAGE}\n`));
+      assert.ok(ws.stdout[0].includes('\n  --keep-fixtures  After a failure, keep the fixture builds'));
       assert.deepEqual(ws.stderr, []);
     });
   }
@@ -587,15 +672,105 @@ for (const failing of [1, 2, 3, 4, 5]) {
     assert.equal(r.steps.length, failing);
     assert.ok(ws.stderr.some((line) => line.startsWith(`verify: step ${failing} failed (`)), ws.stderr.join('\n'));
     assert.equal(ws.stdout.includes('verify: all checks passed'), false);
+    assert.deepEqual(fs.readdirSync(ws.tmpdir), [], 'no fixture folder is left behind');
+    assert.equal(ws.stderr.some((line) => line.includes('fixture builds kept')), false);
     if (failing < 3) {
-      assert.deepEqual(fs.readdirSync(ws.tmpdir), [], 'no fixture folder before step 3');
-      assert.equal(ws.stderr.some((line) => line.includes('fixture builds kept')), false);
+      assert.equal(ws.stderr.some((line) => line.includes('fixture builds')), false, 'no folder to report');
     } else {
-      assert.equal(fs.statSync(r.fixtureDir).isDirectory(), true, 'the fixture folder is kept');
-      assert.ok(ws.stderr.includes(`verify: fixture builds kept for inspection in ${r.fixtureDir}`));
+      assert.equal(fs.existsSync(r.fixtureDir), false, 'the fixture folder is removed');
+      assert.equal(ws.stderr.at(-1), FIXTURES_REMOVED);
     }
   });
 }
+
+for (const failing of [3, 4, 5]) {
+  test(`[AC-16][F-018] --keep-fixtures keeps the fixture folder after a failure of step ${failing}`, async (t) => {
+    const ws = workspace(t);
+    const r = await runVerify(ws, ['--base', 'origin/main', '--keep-fixtures'], {
+      stepFacts: (number) => (number === failing ? { status: 10 + failing } : {}),
+    });
+
+    assert.equal(r.code, 10 + failing);
+    assert.equal(r.steps.length, failing);
+    assert.equal(fs.statSync(r.fixtureDir).isDirectory(), true, 'the fixture folder is kept');
+    assert.deepEqual(fs.readdirSync(ws.tmpdir), [path.basename(r.fixtureDir)]);
+    assert.equal(ws.stderr.at(-1), `verify: fixture builds kept for inspection in ${r.fixtureDir}`);
+    assert.equal(ws.stderr.includes(FIXTURES_REMOVED), false);
+  });
+}
+
+test('[AC-16][F-018] a pass removes the fixture folder even with --keep-fixtures', async (t) => {
+  const ws = workspace(t);
+  const r = await runVerify(ws, ['--keep-fixtures', '--base', 'origin/main']);
+
+  assert.equal(r.code, 0);
+  assert.equal(r.steps.length, 5);
+  assert.equal(fs.existsSync(r.fixtureDir), false);
+  assert.deepEqual(fs.readdirSync(ws.tmpdir), []);
+  assert.deepEqual(ws.stderr, []);
+  assert.equal(ws.stdout.at(-1), 'verify: all checks passed');
+});
+
+test('[AC-16][F-018] an exception during a step disposes of the fixture folder and still propagates', async (t) => {
+  for (const keep of [false, true]) {
+    await t.test(`[AC-16][F-018] ${keep ? 'with' : 'without'} --keep-fixtures`, async (st) => {
+      const ws = workspace(st);
+      const argv = keep ? ['--base', 'origin/main', '--keep-fixtures'] : ['--base', 'origin/main'];
+      let during;
+      await assert.rejects(
+        runVerify(ws, argv, {
+          stepFacts: (number) => {
+            if (number !== 4) return {};
+            during = fs.readdirSync(ws.tmpdir);
+            throw new Error('runner exploded');
+          },
+        }),
+        /runner exploded/,
+      );
+      assert.equal(during.length, 1, 'the fixture folder existed when step 4 started');
+      assert.match(during[0], /^cabrillo-verify-.+$/);
+      const dir = path.join(ws.tmpdir, during[0]);
+      if (keep) {
+        assert.deepEqual(fs.readdirSync(ws.tmpdir), during, 'kept on request');
+        assert.equal(ws.stderr.at(-1), `verify: fixture builds kept for inspection in ${dir}`);
+      } else {
+        assert.deepEqual(fs.readdirSync(ws.tmpdir), [], 'removed');
+        assert.equal(ws.stderr.at(-1), FIXTURES_REMOVED);
+      }
+    });
+  }
+});
+
+test('[AC-16][F-018] a fixture folder that cannot be removed fails a pass and leaves a failure its status', async (t) => {
+  const refuse = () => {
+    throw new Error('EBUSY: resource busy or locked');
+  };
+  await t.test('[AC-16][F-018] after a pass', async (st) => {
+    const ws = workspace(st);
+    const r = await runVerify(ws, ['--base', 'origin/main'], { remove: refuse });
+    assert.equal(r.code, 1);
+    assert.equal(r.steps.length, 5);
+    assert.equal(ws.stdout.includes('verify: all checks passed'), false);
+    assert.deepEqual(ws.stderr, [
+      `verify: every step passed, but the fixture folder ${r.fixtureDir} could not be removed: ` +
+        'EBUSY: resource busy or locked; remove it by hand',
+    ]);
+  });
+  await t.test('[AC-16][F-018] after a failure of step 4', async (st) => {
+    const ws = workspace(st);
+    const r = await runVerify(ws, ['--base', 'origin/main'], {
+      remove: refuse,
+      stepFacts: (number) => (number === 4 ? { status: 14 } : {}),
+    });
+    assert.equal(r.code, 14);
+    assert.equal(r.steps.length, 4);
+    assert.equal(
+      ws.stderr.at(-1),
+      `verify: the fixture folder ${r.fixtureDir} could not be removed: EBUSY: resource busy or locked; remove it by hand`,
+    );
+    assert.equal(ws.stderr.includes(FIXTURES_REMOVED), false);
+  });
+});
 
 test('[AC-16][F-018] a step killed, timed out or unable to start fails with 1 and stops the run', async (t) => {
   const cases = [
@@ -660,17 +835,35 @@ test('[AC-16][F-018] a fixture folder that cannot be created fails the run befor
 
 test('[AC-16][F-018] the preflight accepts a headless-shell-only install by launching it', async () => {
   const fake = fakePlaywright({ launch: (options, record) => fakeBrowser(record) });
-  const message = await preflightPlaywright({ load: async () => fake.module });
+  const env = { ...CALLER_ENV };
+  const message = await preflightPlaywright({ load: async () => fake.module, env });
 
   assert.equal(message, null);
   assert.equal(fake.record.launches.length, 1);
   const [options] = fake.record.launches;
+  assert.deepEqual(options.env, CALLER_ENV, 'the browser is launched with the environment passed in');
   assert.equal(options.headless, true);
   assert.ok(Number.isFinite(options.timeout) && options.timeout > 0, 'the launch has a finite timeout');
   assert.equal(Object.hasOwn(options, 'channel'), false);
   assert.equal(Object.hasOwn(options, 'executablePath'), false);
   assert.equal(fake.record.closes, 1);
   assert.equal(fake.record.executablePathCalls, 0, 'the path of full Chromium decides nothing');
+});
+
+test('[AC-16][F-018] without an env option the preflight launches the browser without JEKYLL_ENV', async (t) => {
+  const saved = process.env.JEKYLL_ENV;
+  t.after(() => {
+    if (saved === undefined) delete process.env.JEKYLL_ENV;
+    else process.env.JEKYLL_ENV = saved;
+  });
+  process.env.JEKYLL_ENV = 'production';
+  const fake = fakePlaywright({ launch: (options, record) => fakeBrowser(record) });
+
+  assert.equal(await preflightPlaywright({ load: async () => fake.module }), null);
+  const [options] = fake.record.launches;
+  assert.equal(Object.hasOwn(options.env, 'JEKYLL_ENV'), false);
+  assert.equal(options.env.PATH, process.env.PATH, 'the rest of the environment is kept');
+  assert.equal(process.env.JEKYLL_ENV, 'production', "this process's environment is not modified");
 });
 
 test('[AC-16][F-018] the preflight refuses a full-Chromium-only install with the install command', async () => {
@@ -704,6 +897,7 @@ test('[AC-16][F-018] a launch failure with a blank reason is reported as the ins
 });
 
 test('[AC-16][F-018] the preflight refuses a missing or incomplete Playwright install', async () => {
+  assert.equal(PLAYWRIGHT_MISSING, 'Playwright is not installed. Run: npm ci && npx playwright install chromium');
   const notFound = Object.assign(new Error("Cannot find package '@playwright/test'"), { code: 'ERR_MODULE_NOT_FOUND' });
   assert.equal(
     await preflightPlaywright({
@@ -724,11 +918,63 @@ test('[AC-16][F-018] the preflight refuses a missing or incomplete Playwright in
   }
 });
 
-test('[AC-16][F-018] the preflight reads Chromium from a default export and ignores a failed close', async () => {
-  const closing = fakePlaywright({ launch: (options, record) => fakeBrowser(record, new Error('Target closed')) });
-  assert.equal(await preflightPlaywright({ load: async () => ({ default: closing.module }) }), null);
-  assert.equal(closing.record.launches.length, 1);
-  assert.equal(closing.record.closes, 1);
+test('[AC-16][F-018] the preflight reads Chromium from a default export', async () => {
+  const fake = fakePlaywright({ launch: (options, record) => fakeBrowser(record) });
+  const { messages, report } = recordingReport();
+  assert.equal(await preflightPlaywright({ load: async () => ({ default: fake.module }), report }), null);
+  assert.equal(fake.record.launches.length, 1);
+  assert.equal(fake.record.closes, 1);
+  assert.deepEqual(messages, [], 'a clean close reports nothing');
+});
+
+test('[AC-16][F-018] a failed close passes only once the browser is released, and says so', async (t) => {
+  await t.test('[AC-16][F-018] close rejects, then the browser reports itself disconnected', async () => {
+    const fake = fakePlaywright({
+      launch: (options, record) => fakeBrowser(record, { closes: [new Error('Target closed')], connected: false }),
+    });
+    const { messages, report } = recordingReport();
+    assert.equal(await preflightPlaywright({ load: async () => fake.module, report }), null);
+    assert.equal(fake.record.closes, 1, 'a disconnected browser is not closed again');
+    assert.equal(messages.length, 1);
+    assert.ok(messages[0].includes('Target closed'), messages[0]);
+    assert.ok(messages[0].includes('disconnected'), messages[0]);
+  });
+
+  await t.test('[AC-16][F-018] close rejects while still connected, and the second close succeeds', async () => {
+    const fake = fakePlaywright({
+      launch: (options, record) => fakeBrowser(record, { closes: [new Error('Protocol error')], connected: true }),
+    });
+    const { messages, report } = recordingReport();
+    assert.equal(await preflightPlaywright({ load: async () => fake.module, report }), null);
+    assert.equal(fake.record.closes, 2);
+    assert.equal(messages.length, 1);
+    assert.ok(messages[0].includes('Protocol error'), messages[0]);
+  });
+
+  await t.test('[AC-16][F-018] both closes reject while still connected', async () => {
+    const fake = fakePlaywright({
+      launch: (options, record) =>
+        fakeBrowser(record, { closes: [new Error('first refusal'), new Error('second refusal')], connected: true }),
+    });
+    const { messages, report } = recordingReport();
+    const message = await preflightPlaywright({ load: async () => fake.module, report });
+    assert.equal(message, `${CHROMIUM_NOT_CLOSED}\n(first refusal; second refusal)`);
+    assert.equal(fake.record.closes, 2);
+    assert.deepEqual(messages, []);
+  });
+
+  await t.test('[AC-16][F-018] a close that never settles is bounded and fails the preflight', async () => {
+    const fake = fakePlaywright({ launch: (options, record) => fakeBrowser(record, { closes: ['hang', 'hang'] }) });
+    const { messages, report } = recordingReport();
+    const started = Date.now();
+    const message = await preflightPlaywright({ load: async () => fake.module, report, closeTimeoutMs: 10 });
+    assert.ok(Date.now() - started < 2000, 'each close is bounded by closeTimeoutMs');
+    assert.equal(typeof message, 'string');
+    assert.ok(message.startsWith(`${CHROMIUM_NOT_CLOSED}\n(`), message);
+    assert.equal((message.match(/did not finish within 10 ms/g) ?? []).length, 2, message);
+    assert.equal(fake.record.closes, 2);
+    assert.deepEqual(messages, []);
+  });
 });
 
 /* ------------------------------------------------------------------------ */

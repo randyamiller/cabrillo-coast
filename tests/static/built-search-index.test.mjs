@@ -1,66 +1,36 @@
 /* Cabrillo Coast LLC — built search index: validity, completeness, fidelity, order and size (AC-08, AC-02; F-019, F-017) */
 /**
  * Checks the `blog/search.json` that Jekyll writes from the Liquid template
- * of the same name (AAP 0.5.5). `blog/search.js` fetches this file, parses it
- * with `JSON.parse` and joins each entry to its listing item on `url`, so the
- * index must be valid JSON, complete, faithful to each article, newest first,
- * aligned with the listing and free of private content.
+ * of the same name (AAP 0.5.5). `blog/search.js` parses it with `JSON.parse`
+ * and joins each entry to its listing item on `url`.
  *
  * `scripts/verify.mjs` runs this suite twice:
- *   1. Real build: `SITE_DIR=_site`, empty base path, custom-domain mode.
- *      At launch there are no articles and the index is `[]`.
+ *   1. Real build: `SITE_DIR=_site`, empty base path. At launch there are no
+ *      articles and the index is `[]`.
  *   2. Fixture project build: `SITE_DIR=<tmp>/project/cabrillo-coast`,
  *      `SITE_BASEURL=/cabrillo-coast`, `SITE_URL=https://randyamiller.github.io`
- *      and `FIXTURE_DIR=<tmp>`. The fixture articles are present, and the
- *      synthetic draft and future-dated post were staged but must not be built.
+ *      and `FIXTURE_DIR=<tmp>`. The synthetic draft and future-dated post were
+ *      staged but must not be built.
  *
- * Common cases run, and must pass, in both runs; on the empty real build
- * their per-entry checks hold vacuously. They cover the JSON array; entry
- * keys, types and non-empty values; title, summary and tags against the
- * listing and the article page; one entry per built article; URL resolution;
- * newest-first order; listing order; AC-02 privacy; single-space distinct
- * body tokens; and the size budget.
- * Fixture-only cases need the fixture articles and run only when
- * `FIXTURE_DIR` is set; in the real-build run node:test reports them as
- * skipped with the reason `FIXTURE_DIR not set`. They cover body-only words
- * and fenced code samples; bodies against the decoded built prose; leftover
- * character references; and front-matter values against the fixture sources.
+ * Coverage (AC-08, and AC-02 for the index). Common cases run in both builds,
+ * vacuously per entry on the empty one: entry shape, title, summary and tags
+ * against the listing and the article page, one entry per built article, URL
+ * resolution, newest-first and listing order, absence of private content,
+ * distinct body tokens and the size budget. Fixture-only cases are skipped with
+ * `FIXTURE_DIR not set` on the real build: body-only words and fenced code,
+ * bodies against the built prose, leftover character references, and title,
+ * summary and tags as raw text against the fixture sources, with dates from
+ * the fixture filenames read in UTC.
  *
- * What it proves:
- *   - AC-08, F-019, every build: the index is a JSON array of `{ url, title,
- *     summary, tags, date, body }` entries with a non-empty title and summary
- *     and 1 to 5 non-empty tags; each entry's title, summary and tags equal
- *     its listing item (`h2 > a`, `p.post-summary`, `a.tag-link`) and its
- *     article page (the single `h1`, the meta description, the
- *     `header.post-header` tag links), decoded from Liquid `escape`; there is
- *     exactly one entry per built article page and no duplicate; every URL
- *     resolves under the base path; entries are newest first and in the same
- *     order as the listing's `li[data-url]` items; every body is distinct
- *     tokens joined by single spaces; and the file stays inside its size
- *     budget, with raw and gzip sizes printed on every run.
- *   - AC-08, F-019, fixture build: each fixture body equals an oracle derived
- *     from its article page alone (the prose region with its markup removed
- *     as `strip_html` removes it, `&lt;`, `&gt;`, `&quot;`, `&#39;` and
- *     `&amp;` decoded, ASCII whitespace collapsed, lowercased, then reduced
- *     to its distinct tokens in first-occurrence order). With explicit checks
- *     for leftover live tags, case, separators, repeats and order, this
- *     covers every step of the body chain but `normalize_whitespace` on its
- *     own, whose removal changes no byte of the index because `split: " "`
- *     already splits on runs of whitespace. Body-only words (`r&d`, `café`)
- *     and text that occurs only inside fenced code
- *     (`def retry_delay(attempt,`, `base_seconds:`, `{{ .values.image }}`)
- *     are indexed, each probe re-checked against the fixture source; no body
- *     keeps a character reference; and title, summary and tags equal the
- *     fixture front matter as raw text (`jsonify`, not `escape`), with
- *     dates read in UTC.
- *   - AC-02, F-017 (index part): no entry belongs to the synthetic draft or
- *     the future-dated post, and no slug, no marker string and no
- *     `assets/drafts/` path appears anywhere in the file: not in its raw
- *     text and not in any string value of the parsed index (every field of
- *     every entry, nested ones included), which also catches text hidden
- *     behind JSON escapes such as `assets\/drafts\/`. Both comparisons are
- *     case-insensitive. On the real build these checks are vacuous but still
- *     run.
+ * The body oracle is derived from the article page alone, independent of the
+ * template. With the explicit checks for live tags, case, separators, repeats
+ * and order, it covers every step of the body chain but `normalize_whitespace`
+ * on its own, whose removal changes no byte because `split: " "` already
+ * splits on runs of whitespace.
+ *
+ * Privacy checks search the raw text and every string value of the parsed
+ * index, which catches text hidden behind JSON escapes such as
+ * `assets\/drafts\/`, case-insensitively because Liquid downcases bodies.
  *
  * Environment (same handling as `built-pages.test.mjs`):
  *   SITE_DIR      Built site, resolved against the repository root (`_site`).
@@ -68,8 +38,8 @@
  *   FIXTURE_DIR   Fixture output folder; fixture-only cases are skipped unless set.
  * `SITE_URL` plays no part here: the index holds base-path URLs, not absolute ones.
  *
- * Paths resolve from this file's own location (`ROOT`), never from
- * `process.cwd()`. The suite needs no network and writes nothing.
+ * Paths resolve from `ROOT`, never from `process.cwd()`. The suite needs no
+ * network and writes nothing.
  *
  * Run: bundle exec jekyll build && node --test tests/static/built-search-index.test.mjs
  */
@@ -91,11 +61,8 @@ import {
 } from '../fixtures/build-fixture-site.mjs';
 import { decodeEntities, parseStartTags } from './lib/site-links.mjs';
 
-/* ------------------------------------------------------------------------ */
-/* Environment                                                               */
-/* ------------------------------------------------------------------------ */
+/* Environment */
 
-/** Repository root: two levels above `tests/static/`. */
 const ROOT = fileURLToPath(new URL('../../', import.meta.url));
 
 /** Built site under test; a relative value resolves against `ROOT`. */
@@ -110,16 +77,12 @@ const FIXTURE_DIR = process.env.FIXTURE_DIR ? path.resolve(ROOT, process.env.FIX
 /** Options for cases that need the fixture articles in `SITE_DIR`. */
 const FIXTURE_ONLY = Object.freeze({ skip: !FIXTURE_DIR && 'FIXTURE_DIR not set' });
 
-/* ------------------------------------------------------------------------ */
-/* Constants                                                                 */
-/* ------------------------------------------------------------------------ */
+/* Constants */
 
-/** The built index and the listing that must agree with it. */
 const SEARCH_JSON = path.join(SITE_DIR, 'blog', 'search.json');
 const BLOG_DIR = path.join(SITE_DIR, 'blog');
 const LISTING_HTML = path.join(BLOG_DIR, 'index.html');
 
-/** URL prefix every article and index entry lives under. */
 const BLOG_PREFIX = `${BASE}/blog/`;
 
 /** The keys `blog/search.json` writes for every entry (AAP 0.5.5). */
@@ -135,7 +98,6 @@ const NON_EMPTY_KEYS = Object.freeze(['title', 'summary']);
 const TAGS_MIN = 1;
 const TAGS_MAX = 5;
 
-/** Source folder of the fixture articles named in `FIXTURE_POSTS`. */
 const FIXTURE_POSTS_DIR = path.join(ROOT, 'tests', 'fixtures', 'posts');
 
 /**
@@ -149,11 +111,9 @@ const FIXTURE_POSTS_DIR = path.join(ROOT, 'tests', 'fixtures', 'posts');
 const WARN_BYTES = 300000;
 const FAIL_BYTES = 400000;
 
-/** Slugs of the fixture articles (`tests/fixtures/posts/`). */
 const CODE_FIXTURE_SLUG = 'fixture-code-and-tables';
 const ESCAPING_FIXTURE_SLUG = 'fixture-escaping-and-liquid';
 
-/** URL fragment shared by every fixture article. */
 const FIXTURE_URL_PART = '/blog/fixture-';
 
 /**
@@ -182,7 +142,7 @@ const CODE_ONLY_PROBES = Object.freeze({
  */
 const ESCAPING_FIXTURE_TITLE = 'Escaping "quotes" & <angle> brackets';
 
-/** Front-matter dates of the fixtures, read in UTC (`timezone: Etc/UTC`). */
+/** Publication dates from fixture filenames, read in UTC (`timezone: Etc/UTC`). */
 const FIXTURE_DATES = Object.freeze({
   [CODE_FIXTURE_SLUG]: '2026-01-15',
   [ESCAPING_FIXTURE_SLUG]: '2026-02-01',
@@ -246,9 +206,7 @@ const DRAFT_IMAGE_PREFIX = 'assets/drafts/';
  */
 const PRIVATE_TEXTS = Object.freeze([DRAFT_SLUG, FUTURE_SLUG, DRAFT_IMAGE_PREFIX, DRAFT_MARKER, FUTURE_MARKER]);
 
-/* ------------------------------------------------------------------------ */
-/* Helpers                                                                   */
-/* ------------------------------------------------------------------------ */
+/* Helpers */
 
 /**
  * Reads and parses the index once. Failures are recorded rather than thrown,
@@ -515,11 +473,8 @@ function firstTokenDifference(actual, expected) {
   return 'the token lists are equal';
 }
 
-/* ------------------------------------------------------------------------ */
-/* Suite                                                                     */
-/* ------------------------------------------------------------------------ */
+/* Suite */
 
-/** Registers every case; called only when `SITE_DIR` exists. */
 function defineSuite() {
   const index = loadIndex();
 
@@ -529,9 +484,7 @@ function defineSuite() {
     return /** @type {Array<Record<string, unknown>>} */ (index.entries);
   };
 
-  /* ---------------------------------------------------------------------- */
-  /* Phase 1: load, entry shape and metadata fidelity                       */
-  /* ---------------------------------------------------------------------- */
+  /* Phase 1: load, entry shape and metadata fidelity */
 
   test('[AC-08][F-019] search.json is a valid JSON array', (t) => {
     assert.equal(index.error, null, index.error ?? '');
@@ -611,9 +564,7 @@ function defineSuite() {
     }
   });
 
-  /* ---------------------------------------------------------------------- */
-  /* Phase 2: completeness and order                                        */
-  /* ---------------------------------------------------------------------- */
+  /* Phase 2: completeness and order */
 
   test('[AC-08][F-019] the index holds exactly one entry per built article', (t) => {
     const entries = requireEntries();
@@ -668,9 +619,7 @@ function defineSuite() {
     );
   });
 
-  /* ---------------------------------------------------------------------- */
-  /* Phase 3: AC-02, private content never reaches the index                */
-  /* ---------------------------------------------------------------------- */
+  /* Phase 3: AC-02, private content never reaches the index */
 
   test('[AC-02][F-017] no draft or future-dated post reaches the index', () => {
     const entries = requireEntries();
@@ -702,9 +651,7 @@ function defineSuite() {
     }
   });
 
-  /* ---------------------------------------------------------------------- */
-  /* Phase 4: body tokens and decoding, raw front-matter values             */
-  /* ---------------------------------------------------------------------- */
+  /* Phase 4: body tokens and decoding, raw front-matter values */
 
   test('[AC-08][F-019] every body is single-space-separated distinct tokens', () => {
     const entries = requireEntries();
@@ -864,9 +811,7 @@ function defineSuite() {
     }
   });
 
-  /* ---------------------------------------------------------------------- */
-  /* Phase 5: size budget                                                   */
-  /* ---------------------------------------------------------------------- */
+  /* Phase 5: size budget */
 
   test('[AC-08][F-019] search.json stays within its size budget', (t) => {
     if (index.bytes === null) throw new Error(index.error);

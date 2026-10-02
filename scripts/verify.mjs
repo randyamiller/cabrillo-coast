@@ -1,91 +1,35 @@
 #!/usr/bin/env node
-/* Cabrillo Coast LLC — verification entry point (Node built-ins only) */
+/* Cabrillo Coast LLC — verification entry point (Node built-ins and relative modules only) */
 /**
  * Runs every automated blog check in one fixed order and stops at the first
- * failure (AAP 0.5.7). Authors run it before pushing, and the blog-checks
- * workflow runs the same script, so a local pass means what a CI pass means.
+ * failure. Authors run it before pushing, and the blog-checks workflow runs
+ * the same script, so a local pass means what a CI pass means.
  *
- *   node scripts/verify.mjs [--base <ref>]
+ *   node scripts/verify.mjs [--base <ref>] [--keep-fixtures]
  *
- * Steps, each run from the repository root with inherited output:
- *   1. bundle exec jekyll build
- *        The real site into `_site/`, empty base path, in the deployment mode
- *        that `_config.yml` and `CNAME` describe.
- *   2. SITE_URL=<_config.yml url> node --test "tests/**\/*.test.mjs"
- *        Static and unit suites, plus the built-output suites against `_site/`
- *        on the host `_config.yml`'s `url` names: the custom domain
- *        (https://www.cabrillocoast.com) while `CNAME` exists, and
- *        https://randyamiller.github.io after the move to the project path.
- *   3. node tests/fixtures/build-fixture-site.mjs <tmp>
- *        Project, preview and empty fixture builds into a fresh temporary
- *        folder (`cabrillo-verify-*` under `os.tmpdir()`).
- *   4. SITE_DIR=<tmp>/project/cabrillo-coast SITE_BASEURL=/cabrillo-coast
- *      SITE_URL=https://randyamiller.github.io FIXTURE_DIR=<tmp>
- *      node --test "tests/static/built-*.test.mjs"
- *        The built-output suites again, in project-path mode with the
- *        fixture-only cases enabled.
- *   5. node tests/visual/run-visual.mjs --base <ref>
- *        The visual comparison against the base revision (AC-16). Skipping it
- *        for a base without `_layouts/post.html` is run-visual's decision.
+ * After a Playwright Chromium preflight, which fails rather than skips, the
+ * steps run from the repository root with inherited output:
+ *   1. bundle exec jekyll build: the real site into `_site/`.
+ *   2. node --test "tests/**\/*.test.mjs": every suite, SITE_URL from `_config.yml`'s url.
+ *   3. node tests/fixtures/build-fixture-site.mjs <tmp>: the fixture builds.
+ *   4. node --test "tests/static/built-*.test.mjs": the built-output suites on the project fixture.
+ *   5. node tests/visual/run-visual.mjs --base <ref>: the visual comparison, against
+ *      `--base`, else `@{upstream}`, else `HEAD`.
  *
- * Base revision: `--base <ref>` is passed to step 5 unchanged. Without it the
- * branch's upstream (`@{upstream}`, what is already pushed) is used, or `HEAD`
- * when there is none, so everything not yet pushed is compared. The default
- * is pinned to its commit id when the run starts, so the base printed here is
- * the base step 5 compares against. Every base is checked before step 1, so a
- * mistyped revision fails in seconds rather than after the builds.
+ * Environment: JEKYLL_ENV and the caller's SITE_DIR, SITE_BASEURL, SITE_URL
+ * and FIXTURE_DIR reach no child (git queries, the browser preflight and all
+ * five steps); everything else, VISUAL_CHANGE_INTENDED included, is kept.
+ * JEKYLL_ENV is removed because a local production build without a Pages API
+ * token derives the wrong base path (/pages/randyamiller/cabrillo-coast).
  *
- * Environment: the steps inherit the caller's environment except
- *   - JEKYLL_ENV, always removed: a local production build without a Pages API
- *     token derives the wrong base path (/pages/randyamiller/cabrillo-coast);
- *   - SITE_DIR, SITE_BASEURL, SITE_URL and FIXTURE_DIR, removed so steps 1 and
- *     2 test the real `_site/` as `_config.yml` configures it: step 2 sets
- *     SITE_URL from that file's `url`, and step 4 sets its own values.
- * VISUAL_CHANGE_INTENDED is kept, so `VISUAL_CHANGE_INTENDED=1` reaches step 5.
- *
- * Preflight: a missing Playwright install, or a Chromium that cannot start,
- * is a failure before step 1, never a skip, so no check is silently left out
- * locally that CI would run. It runs first so authors are not kept waiting
- * for the builds. It launches and closes Chromium with the visual project's
- * own selection (headless, no channel), which starts Playwright's
- * `chromium-headless-shell` build, so it passes exactly when step 5 can start
- * its browser, whichever of Playwright's two Chromium builds is installed.
- *
- * Deadlines: every git query and every step runs under a finite deadline
- * from `DEADLINES` in scripts/lib/subprocess.mjs, and is killed with SIGKILL
- * when it expires, so the run always ends. The preflight launch is bounded
- * by Playwright's launch timeout, set to `PREFLIGHT_LAUNCH_MS` (1 min).
- * Each step's deadline exceeds the deadlines of the tools it runs inside
- * (the fixture builder's git, tar and Jekyll runs, the visual runner's
- * builds and Playwright runs), so a stuck tool is stopped and reported by
- * its own step first. Only a git that exited by itself gives an answer: a
- * killed or timed-out `@{upstream}` probe is a failure, never "no
- * upstream", and a killed `--base` probe is a failure, never an
- * unresolvable revision.
- *
- * Exit status:
- *   0  every step passed (the fixture folder has been removed);
- *   N  the exit status of the first step that failed; 1 when that step was
- *      killed by a signal, exceeded its deadline or could not be started (the
- *      fixture folder, when it exists, is kept and its path printed for
- *      inspection);
- *   1  `_config.yml` cannot be read or names no http or https `url`,
- *      Playwright is missing or its Chromium cannot start, git cannot be
- *      run or a git query was killed or exceeded its deadline, the fixture
- *      folder cannot be created, or every step passed but the fixture folder
- *      cannot be removed (its path is printed);
- *   2  usage error, or the base revision does not resolve to a commit.
- * An interrupt (Ctrl-C) reaches the foreground step and this script alike;
- * no handler is installed (Playwright's, which closes the preflight browser,
- * is removed with that browser), so the run ends at once with the shell's
- * usual 130.
- *
- * Consumers: `.github/workflows/blog-checks.yml` runs
- * `node scripts/verify.mjs --base <base>`; `scripts/article.mjs` prints
- * `node scripts/verify.mjs` as the step after `publish`.
- * tests/unit/verify.test.mjs imports `main` and `preflightPlaywright` and
- * runs them with injected processes, environment, folders and browser
- * module, so the step sequence and every refusal are tested without a build.
+ * Exit status: 0 when every step passed; otherwise the first failing step's
+ * status (1 when it was killed, exceeded its deadline or could not start);
+ * 1 when `_config.yml` names no usable url, the browser preflight fails, a
+ * git query gives no answer, the fixture folder cannot be created, or every
+ * step passed but that folder cannot be removed; 2 for a usage error or a
+ * base that does not resolve. The fixture folder (`cabrillo-verify-*` under
+ * `os.tmpdir()`) is removed whatever the outcome, unless `--keep-fixtures`
+ * keeps it after a failure.
  */
 
 import fs from "node:fs";
@@ -94,6 +38,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import { preflightPlaywright } from "../tests/visual/lib/preflight.mjs";
 import { DEADLINES, describeResult, formatDuration, runSync } from "./lib/subprocess.mjs";
 
 /* ------------------------------------------------------------------------ */
@@ -103,10 +48,10 @@ import { DEADLINES, describeResult, formatDuration, runSync } from "./lib/subpro
 /** Repository root, from this file's location, so the script works from any directory. */
 const ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 
-const USAGE = "Usage: node scripts/verify.mjs [--base <ref>]";
+const USAGE = "Usage: node scripts/verify.mjs [--base <ref>] [--keep-fixtures]";
 const LOG_PREFIX = "verify:";
 
-/** Removed from every step's environment; the reason is printed when one was set. */
+/** Removed from every child's environment; the reason is printed when one was set. */
 const JEKYLL_ENV = "JEKYLL_ENV";
 
 /**
@@ -119,9 +64,9 @@ const SUITE_VARIABLES = Object.freeze(["SITE_DIR", "SITE_BASEURL", "SITE_URL", "
  * Project-path deployment reproduced by the fixture builder's `project`
  * variant. These equal `PROJECT_BASEURL` and `PROJECT_URL` in
  * tests/fixtures/build-fixture-site.mjs; they are restated rather than
- * imported because this entry point loads only Node built-ins and the
- * built-in-only scripts/lib/subprocess.mjs, never the code its steps test.
- * A mismatch fails step 4, whose canonical-link checks compare against them.
+ * imported because this entry point never imports the fixture builder it
+ * runs as step 3. A mismatch fails step 4, whose canonical-link checks
+ * compare against them.
  */
 const PROJECT_BASEURL = "/cabrillo-coast";
 const PROJECT_URL = "https://randyamiller.github.io";
@@ -141,17 +86,6 @@ const COMMIT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 /** Characters that never need shell quoting in a printed command. */
 const SHELL_SAFE = /^[A-Za-z0-9_@%+=:,./-]+$/;
 
-/**
- * How long the preflight's Chromium launch may take, passed to Playwright as
- * the launch `timeout`. A cold start takes a few seconds; a launch still
- * pending after a minute cannot serve the visual comparison either.
- */
-const PREFLIGHT_LAUNCH_MS = 60_000;
-
-const PLAYWRIGHT_MISSING = "Playwright is not installed. Run: npm ci && npx playwright install chromium";
-const CHROMIUM_MISSING =
-  "Playwright Chromium is missing or cannot start. Run: npx playwright install chromium " +
-  "(in CI: npx playwright install --with-deps chromium)";
 const BUNDLE_MISSING = "bundle not found — install Ruby 3.3.4 and run bundle install";
 
 /**
@@ -174,7 +108,7 @@ const BUNDLE_MISSING = "bundle not found — install Ruby 3.3.4 and run bundle i
  * What the run reads and starts processes through: the real process for the
  * command line, fakes in tests/unit/verify.test.mjs.
  * @typedef {object} Io
- * @property {NodeJS.ProcessEnv} env  The caller's environment.
+ * @property {NodeJS.ProcessEnv} env  The sanitized child environment (`buildBaseEnv`), never the caller's.
  * @property {string} root  Repository root: where git and every step run.
  * @property {typeof runSync} run  Runs one child process to its end and returns its `ProcessResult`.
  * @property {string} execPath  The Node executable that `node` steps run as.
@@ -224,12 +158,10 @@ const STEPS = Object.freeze([
 /* Output helpers                                                            */
 /* ------------------------------------------------------------------------ */
 
-/** Prints one progress line on stdout. */
 function log(message) {
   console.log(`${LOG_PREFIX} ${message}`);
 }
 
-/** Prints one diagnostic line on stderr. */
 function warn(message) {
   console.error(`${LOG_PREFIX} ${message}`);
 }
@@ -256,7 +188,6 @@ function describeStep(step, ctx, quote = shellQuote) {
   return [...added, step.program, ...step.args(ctx).map(quote)].join(" ");
 }
 
-/** Seconds since `started`, for the pass line of a step. */
 function elapsed(started) {
   return `${((Date.now() - started) / 1000).toFixed(1)}s`;
 }
@@ -272,22 +203,24 @@ function helpText() {
     ...lines,
     "",
     "Options:",
-    "  --base <ref>  Base revision for the visual comparison (step 5), passed on unchanged.",
-    "                Default: @{upstream} (what is already pushed), or HEAD without one.",
-    "  -h, --help    Show this help.",
+    "  --base <ref>     Base revision for the visual comparison (step 5), passed on unchanged.",
+    "                   Default: @{upstream} (what is already pushed), or HEAD without one.",
+    "  --keep-fixtures  After a failure, keep the fixture builds (step 3) for inspection.",
+    "  -h, --help       Show this help.",
     "",
     "Environment:",
     "  VISUAL_CHANGE_INTENDED=1  Passed to step 5: declared visual differences are reported, not failed.",
-    `  ${JEKYLL_ENV}, ${SUITE_VARIABLES.join(", ")} are removed before any step runs.`,
+    `  ${JEKYLL_ENV}, ${SUITE_VARIABLES.join(", ")} are removed from git, the browser preflight and every step.`,
     "",
     `Deadlines: steps 1-${STEPS.length} may run ${STEPS.map((step) => formatDuration(step.deadlineMs)).join(", ")};`,
     `each git query ${formatDuration(DEADLINES.gitQuery)}. A step past its deadline is killed and fails.`,
     "",
     "Exit status: 0 when every check passed and the fixture folder was removed; otherwise the",
     "failing step's status (1 when it was killed, exceeded its deadline or could not start); 1 when",
-    "_config.yml names no http or https url, Playwright Chromium is missing or cannot start, a git",
-    "query was killed or timed out, or the fixture folder cannot be removed; 2 for a usage error or a",
-    "base revision that does not resolve.",
+    "_config.yml names no http or https url, Playwright Chromium is missing, cannot start or could",
+    "not be closed, a git query was killed or timed out, or every step passed but the fixture folder",
+    "cannot be removed; 2 for a usage error or a base revision that does not resolve. The fixture",
+    "folder is removed whatever the outcome, unless --keep-fixtures keeps it after a failure.",
   ].join("\n");
 }
 
@@ -299,15 +232,20 @@ function helpText() {
  * Parses the arguments after the script path. `--base=<ref>` is accepted as
  * well, matching tests/visual/run-visual.mjs. A value starting with `-` is a
  * missing value, never a revision, so an option can never be read as a base.
+ * `--keep-fixtures` takes no value.
  * @param {string[]} argv
- * @returns {{ help: boolean, base?: string, error?: string }}
+ * @returns {{ help: boolean, keepFixtures: boolean, base?: string, error?: string }}
  */
 export function parseCliArgs(argv) {
-  const parsed = { help: false };
+  const parsed = { help: false, keepFixtures: false };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--help" || arg === "-h") {
       parsed.help = true;
+      continue;
+    }
+    if (arg === "--keep-fixtures") {
+      parsed.keepFixtures = true;
       continue;
     }
     let value;
@@ -408,8 +346,9 @@ function chooseBase(io, explicit) {
 /* ------------------------------------------------------------------------ */
 
 /**
- * The environment every step starts from: the caller's, minus `JEKYLL_ENV`
- * and the built-output suites' variables. Everything else, including
+ * The environment every child starts from (git queries, the browser preflight
+ * and every step): a copy of the caller's, minus `JEKYLL_ENV` and the
+ * built-output suites' variables. Everything else, including
  * `VISUAL_CHANGE_INTENDED`, is kept.
  * @param {NodeJS.ProcessEnv} source
  * @returns {{ env: NodeJS.ProcessEnv, removed: Array<[string, string]> }}
@@ -456,7 +395,7 @@ function reportRemoved(removed) {
  * @param {string} raw
  * @returns {string}
  */
-function yamlScalar(raw) {
+export function yamlScalar(raw) {
   const text = raw.trim();
   if (text.startsWith('"')) {
     const m = /^"((?:[^"\\]|\\.)*)"/.exec(text);
@@ -466,7 +405,16 @@ function yamlScalar(raw) {
     const m = /^'((?:[^']|'')*)'/.exec(text);
     if (m) return m[1].replace(/''/g, "'");
   }
-  return text.replace(/\s+#.*$/, "").trim();
+  // The comment starts at the first `#` that follows whitespace and has no line
+  // break after it. One forward pass finds it, so a long whitespace run costs
+  // linear time however the value ends.
+  let cut = -1;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (ch === "\n" || ch === "\r" || ch === "\u2028" || ch === "\u2029") cut = -1;
+    else if (cut === -1 && i > 0 && ch === "#" && /\s/.test(text[i - 1])) cut = i;
+  }
+  return (cut === -1 ? text : text.slice(0, cut)).trim();
 }
 
 /**
@@ -501,68 +449,6 @@ export function configuredSiteUrl(text) {
 }
 
 /* ------------------------------------------------------------------------ */
-/* Playwright preflight                                                      */
-/* ------------------------------------------------------------------------ */
-
-/** First non-blank line of a message, trimmed; Playwright follows it with a boxed install hint. */
-function firstLine(text) {
-  return (
-    String(text)
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .find((line) => line !== "") ?? ""
-  );
-}
-
-/**
- * Confirms the visual comparison can run before any slow step starts, by
- * launching and closing the browser it uses. A missing install or browser
- * fails verification rather than skipping step 5, so a local pass means the
- * same as a CI pass.
- *
- * The probe launches exactly what tests/visual/playwright.config.mjs
- * launches: browserName chromium, no channel, no executable path, and
- * Playwright Test's default `headless: true`. Playwright starts its
- * `chromium-headless-shell` build for that, not the full Chromium that
- * `chromium.executablePath()` names, so only a launch tells whether step 5
- * can start its browser: with just the shell installed the comparison runs,
- * and with just full Chromium it cannot. The launch also checks the host
- * libraries Chromium needs. tests/unit/verify.test.mjs holds the visual
- * project to this launch configuration.
- * @param {object} [options]
- * @param {() => Promise<object>} [options.load]  Loads `@playwright/test`; tests pass a fake module.
- * @param {number} [options.timeoutMs]  Launch timeout; `PREFLIGHT_LAUNCH_MS` by default.
- * @returns {Promise<string | null>} the failure message, or null when ready.
- */
-export async function preflightPlaywright(options = {}) {
-  // Resolved from this file's location, so the repository's node_modules is used from any directory.
-  const { load = () => import("@playwright/test"), timeoutMs = PREFLIGHT_LAUNCH_MS } = options;
-  let playwright;
-  try {
-    playwright = await load();
-  } catch (err) {
-    const notFound = err && (err.code === "ERR_MODULE_NOT_FOUND" || err.code === "MODULE_NOT_FOUND");
-    return notFound ? PLAYWRIGHT_MISSING : `${PLAYWRIGHT_MISSING}\n(${errorMessage(err)})`;
-  }
-  const chromium = playwright && (playwright.chromium ?? (playwright.default && playwright.default.chromium));
-  if (!chromium || typeof chromium.launch !== "function") return PLAYWRIGHT_MISSING;
-  let browser;
-  try {
-    // The visual project's selection (no channel, headless), so this starts chromium-headless-shell as step 5 does.
-    browser = await chromium.launch({ headless: true, timeout: timeoutMs });
-  } catch (err) {
-    const reason = firstLine(errorMessage(err));
-    return reason === "" ? CHROMIUM_MISSING : `${CHROMIUM_MISSING}\n(${reason})`;
-  }
-  try {
-    await browser.close();
-  } catch {
-    // The browser started, which is all the probe asks; a failed close does not make it missing.
-  }
-  return null;
-}
-
-/* ------------------------------------------------------------------------ */
 /* Steps                                                                     */
 /* ------------------------------------------------------------------------ */
 
@@ -581,15 +467,14 @@ export async function preflightPlaywright(options = {}) {
  * @param {Step} step
  * @param {number} number 1-based step number.
  * @param {StepContext} ctx
- * @param {NodeJS.ProcessEnv} baseEnv
  * @returns {number} 0 when the step passed.
  */
-function runStep(io, step, number, ctx, baseEnv) {
+function runStep(io, step, number, ctx) {
   const command = describeStep(step, ctx);
   console.log(`\n==> [${number}/${STEPS.length}] ${command}`);
 
   const executable = step.program === "node" ? io.execPath : step.program;
-  const env = { ...baseEnv, ...(step.env ? step.env(ctx) : {}) };
+  const env = { ...io.env, ...(step.env ? step.env(ctx) : {}) };
   const started = Date.now();
   const result = io.run(executable, step.args(ctx), {
     cwd: io.root,
@@ -621,8 +506,33 @@ function runStep(io, step, number, ctx, baseEnv) {
     return 0;
   }
   warn(`step ${number} failed (${command})`);
-  if (ctx.fixtureDir !== "") warn(`fixture builds kept for inspection in ${ctx.fixtureDir}`);
   return code;
+}
+
+/**
+ * Disposes of the fixture folder once the steps are over, whatever their
+ * outcome: it is removed, unless `--keep-fixtures` keeps it after a failure.
+ * @param {string} dir
+ * @param {{ failed: boolean, keep: boolean, remove: (dir: string) => void }} options
+ *   `failed` covers a failing step and a thrown exception alike.
+ * @returns {boolean} false only when every step passed but the folder could not be removed.
+ */
+function disposeFixtures(dir, { failed, keep, remove }) {
+  if (failed && keep) {
+    warn(`fixture builds kept for inspection in ${dir}`);
+    return true;
+  }
+  try {
+    remove(dir);
+  } catch (err) {
+    // Exit 0 promises that nothing is left behind, so after a pass a folder
+    // that cannot be removed fails the run; after a failure the step's status stands.
+    const subject = failed ? "the fixture folder" : "every step passed, but the fixture folder";
+    warn(`${subject} ${dir} could not be removed: ${errorMessage(err)}; remove it by hand`);
+    return failed;
+  }
+  if (failed) warn("fixture builds removed; run again with --keep-fixtures to keep them for inspection");
+  return true;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -639,10 +549,15 @@ function runStep(io, step, number, ctx, baseEnv) {
  * @param {NodeJS.ProcessEnv} [collaborators.env]  Caller's environment; `process.env` by default.
  * @param {string} [collaborators.root]  Repository root; this checkout by default.
  * @param {typeof runSync} [collaborators.run]  Runs git and every step; `runSync` by default.
- * @param {() => Promise<string | null>} [collaborators.preflight]  Browser check; `preflightPlaywright` by default.
+ * @param {(options: { env: NodeJS.ProcessEnv, report: (message: string) => void }) => Promise<string | null>}
+ *   [collaborators.preflight]  Browser check, given the sanitized environment and a notice printer;
+ *   `preflightPlaywright` by default.
  * @param {string} [collaborators.tmpdir]  Parent of the fixture folder; `os.tmpdir()` by default.
  * @param {string} [collaborators.execPath]  Node executable of `node` steps; `process.execPath` by default.
+ * @param {(dir: string) => void} [collaborators.remove]  Removes the fixture folder; a recursive,
+ *   forced `fs.rmSync` by default.
  * @returns {Promise<number>} The exit code.
+ * @throws {*} whatever a collaborator throws, once the fixture folder has been disposed of.
  */
 export async function main(argv, collaborators = {}) {
   const {
@@ -652,9 +567,8 @@ export async function main(argv, collaborators = {}) {
     preflight = preflightPlaywright,
     tmpdir = os.tmpdir(),
     execPath = process.execPath,
+    remove = (dir) => fs.rmSync(dir, { recursive: true, force: true }),
   } = collaborators;
-  /** @type {Io} */
-  const io = { env, root, run, execPath };
 
   const args = parseCliArgs(argv);
   if (args.error !== undefined) {
@@ -666,6 +580,11 @@ export async function main(argv, collaborators = {}) {
     console.log(helpText());
     return 0;
   }
+
+  // Sanitized before any child starts, so git, the browser preflight and every step get the same environment.
+  const { env: baseEnv, removed } = buildBaseEnv(env);
+  /** @type {Io} */
+  const io = { env: baseEnv, root, run, execPath };
 
   // Base revision, checked now so a bad value fails before the slow steps.
   let base;
@@ -683,8 +602,6 @@ export async function main(argv, collaborators = {}) {
   log(`repository: ${root}`);
   log(`base: ${base.label}`);
 
-  // Environment hygiene.
-  const { env: baseEnv, removed } = buildBaseEnv(env);
   reportRemoved(removed);
   if (baseEnv.VISUAL_CHANGE_INTENDED !== undefined) {
     log(`VISUAL_CHANGE_INTENDED=${baseEnv.VISUAL_CHANGE_INTENDED} is passed to step 5`);
@@ -707,7 +624,7 @@ export async function main(argv, collaborators = {}) {
   log(`deployment host: ${site.url} (${CONFIG_FILE} url, step 2 SITE_URL)`);
 
   // Playwright Chromium preflight: a failure, never a skip.
-  const missing = await preflight();
+  const missing = await preflight({ env: io.env, report: warn });
   if (missing !== null) {
     warn(missing);
     return 1;
@@ -715,33 +632,32 @@ export async function main(argv, collaborators = {}) {
 
   /** @type {StepContext} */
   const ctx = { base: base.ref, fixtureDir: "", siteUrl: site.url };
-  for (let i = 0; i < STEPS.length; i += 1) {
-    const step = STEPS[i];
-    if (step.createsFixture) {
-      try {
-        ctx.fixtureDir = fs.mkdtempSync(path.join(tmpdir, FIXTURE_PREFIX));
-      } catch (err) {
-        warn(`cannot create the fixture folder under ${tmpdir}: ${errorMessage(err)}`);
-        return 1;
+  let code = 0;
+  let finished = false;
+  try {
+    for (let i = 0; i < STEPS.length; i += 1) {
+      const step = STEPS[i];
+      if (step.createsFixture) {
+        try {
+          ctx.fixtureDir = fs.mkdtempSync(path.join(tmpdir, FIXTURE_PREFIX));
+        } catch (err) {
+          warn(`cannot create the fixture folder under ${tmpdir}: ${errorMessage(err)}`);
+          code = 1;
+          break;
+        }
       }
+      code = runStep(io, step, i + 1, ctx);
+      if (code !== 0) break;
     }
-    const code = runStep(io, step, i + 1, ctx, baseEnv);
-    if (code !== 0) return code;
-  }
-
-  if (ctx.fixtureDir !== "") {
-    try {
-      fs.rmSync(ctx.fixtureDir, { recursive: true, force: true });
-    } catch (err) {
-      // Exit 0 promises that nothing is left behind, so a folder that cannot be
-      // removed fails the run even though every step passed.
-      warn(
-        `every step passed, but the fixture folder ${ctx.fixtureDir} could not be removed: ` +
-          `${errorMessage(err)}; remove it by hand`,
-      );
-      return 1;
+    finished = true;
+  } finally {
+    // Runs on a pass, a failed step and a thrown exception alike; an exception still propagates.
+    if (ctx.fixtureDir !== "") {
+      const failed = !finished || code !== 0;
+      if (!disposeFixtures(ctx.fixtureDir, { failed, keep: args.keepFixtures, remove })) code = 1;
     }
   }
+  if (code !== 0) return code;
   log("all checks passed");
   return 0;
 }

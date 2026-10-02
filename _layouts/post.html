@@ -2,23 +2,15 @@
 layout: blog
 ---
 {%- comment -%}
-  Article layout for /blog/<slug>/, applied to every post (and to drafts in the local
-  preview) through the _config.yml defaults; articles never set a layout key themselves.
-  It renders only the article inside main: _layouts/blog.html supplies the document, head,
-  Content-Security-Policy, Open Graph and article metadata, chrome and scripts. No search
-  key is set here, so search.js loads on the listing only.
+  Article layout, applied to every post (and to drafts in the local preview) through the
+  _config.yml defaults. It renders only the article inside main; _layouts/blog.html supplies
+  the document. It sets no search key, so search.js loads on the listing only.
 
-  Contracts checked by the built-page tests:
-    - Every printed front-matter value (title, author, tags) passes through escape. The
-      rendered article body is trusted author Markdown and is printed unescaped.
-    - Every link goes through relative_url, so it resolves at an empty base path and under a
-      project path alike.
-    - The prose region runs from the opening div.prose to the closing back link that directly
-      follows it; nothing else sits between them, and that region is scanned for unsafe markup.
-    - No script, style, form or event-handler attribute, and nothing that changes from build
-      to build, so the live main element can be compared byte for byte with a local build.
-    - The tag list markup and date format match the listing in blog/index.html, so
-      blog/blog.css styles both with the same rules.
+  The article body is trusted author Markdown and is printed unescaped by design.
+
+  The prose region runs from the opening div.prose to the closing back link that directly
+  follows it. Nothing else sits between them, and the built-page tests scan that region for
+  unsafe markup.
 {%- endcomment -%}
 {%- assign post_author = page.author | strip -%}
 <article class="section post">
@@ -29,8 +21,8 @@ layout: blog
       <h1>{{ page.title | escape }}</h1>
       <p class="post-meta">
         {%- if post_author != '' %}By {{ post_author | escape }} · {% endif -%}
-        <time datetime="{{ page.date | date: '%Y-%m-%d' }}">{{ page.date | date: '%B %-d, %Y' }}</time>
-        {%- if page.updated %} · Updated <time datetime="{{ page.updated | date: '%Y-%m-%d' }}">{{ page.updated | date: '%B %-d, %Y' }}</time>{% endif -%}
+        <time datetime="{{ page.date | date: '%Y-%m-%d' | escape }}">{{ page.date | date: '%B %-d, %Y' | escape }}</time>
+        {%- if page.updated %} · Updated <time datetime="{{ page.updated | date: '%Y-%m-%d' | escape }}">{{ page.updated | date: '%B %-d, %Y' | escape }}</time>{% endif -%}
       </p>
       {%- if page.tags.size > 0 %}
       <ul class="tag-list" aria-label="Tags">

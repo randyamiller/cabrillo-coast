@@ -2,37 +2,23 @@
 /* Cabrillo Coast LLC — fixture site builder for the blog checks (Node built-ins only) */
 /**
  * Builds the blog from a staged copy of the site source plus the fixture
- * articles and synthetic private content, in the three variants that the
- * built-output suites, the visual comparison and the browser acceptance pass
- * read.
+ * articles and synthetic private content, in three variants.
  *
  *   node tests/fixtures/build-fixture-site.mjs <outDir> [--ref <rev>] [--fixtures-only]
  *
- *   <outDir>         Output folder. It must not exist yet or be empty, and it
- *                    must lie outside the repository (see `assertOutsideRepo`).
+ *   <outDir>         Output folder: absent or empty, and outside the repository.
  *   --ref <rev>      Take the site source from that commit (`git archive`)
  *                    instead of the working tree. The fixture articles always
- *                    come from the working tree, so both sides of the visual
- *                    comparison hold the same articles.
+ *                    come from the working tree.
  *   --fixtures-only  Leave the repository's real `_posts/` out, so only the
- *                    fixture articles are built (the visual comparison uses
- *                    this, so publishing an article cannot change a screenshot).
- *
- * Consumers:
- *   - `scripts/verify.mjs` builds `<tmp>` and re-runs the `built-*` suites with
- *     `SITE_DIR=<tmp>/project/cabrillo-coast`, `SITE_BASEURL=/cabrillo-coast`,
- *     `SITE_URL=https://randyamiller.github.io` and `FIXTURE_DIR=<tmp>`;
- *   - `tests/static/built-pages.test.mjs` and `built-search-index.test.mjs`
- *     import the constants below and read `preview/`, `empty/` and `src/`;
- *   - `tests/visual/run-visual.mjs` calls `buildFixtureSite` for the base
- *     revision and the working tree and serves `<outDir>/project/`.
+ *                    fixture articles are built.
  *
  * Output layout under <outDir>:
  *   src/                     Staged source: the allow-listed site files, the
  *                            fixture posts, a synthetic draft and its image, a
  *                            post dated one year ahead and `_config.project.yml`.
- *                            Complete and servable for the browser acceptance
- *                            pass (`jekyll serve --source <outDir>/src --drafts …`).
+ *                            No real draft image: `assets/drafts/` is filtered
+ *                            from the working tree and excluded from the archive.
  *   project-src/             `src/` without `CNAME` (project-path deployment).
  *   project/cabrillo-coast/  Build of `project-src/` at base path /cabrillo-coast
  *                            with `url` set to the github.io host.
@@ -41,35 +27,18 @@
  *   empty-src/               `src/` without `_posts/`.
  *   empty/                   Zero-article build (launch state).
  *
- * Exit codes: 0 when all three variants are built; 1 for a copy or build
- * failure, including a git, tar or Jekyll run that was killed, exceeded its
- * deadline or could not be started; 2 for a usage error, including a
- * `--ref` that git answers does not name a commit. On failure `<outDir>` is
- * left in place for inspection; its owner removes it.
- *
- * Deadlines: every child runs under a deadline from `DEADLINES` in
- * scripts/lib/subprocess.mjs (`gitQuery` for each git query, `gitArchive`,
- * `tarExtract`, and `jekyllBuild` for each build) and is killed when it
- * expires, so the builder stays synchronous yet never blocks its caller for
- * longer than one deadline at a time. Only a git that exited by itself gives
- * an answer: a killed or timed-out `rev-parse` is a failure, never an
- * unresolvable `--ref`, and a failed path probe is a failure, never a path
- * that is absent.
+ * Exit codes: 0 when all three variants are built; 1 for a copy, staging or
+ * build failure, including a git, tar or Jekyll run that failed, was killed,
+ * exceeded its deadline or could not be started; 2 for a usage error,
+ * including a `--ref` that names no commit. On failure `<outDir>` is left in
+ * place for inspection; its owner removes it.
  *
  * Nothing here is published: `_config.yml` excludes `tests/`, and the
  * synthetic draft, its image and the future-dated post are written only into
- * `<outDir>`, never into the repository. Every Jekyll build runs with
- * `JEKYLL_ENV` removed: a local production build derives the wrong base path
- * (`/pages/randyamiller/cabrillo-coast`), so the project base path is passed
- * with `--baseurl` in place of the Pages API.
- *
- * Containment: everything the builder writes or removes lies below
- * `<outDir>`. Staging copies symbolic links as links without following them,
- * so before each write into the staged source and before the `assets/drafts/`
- * removal, every existing folder on the way must be a real folder
- * (`assertRealFolders`). A symlinked `_posts/` or `assets/` in the working tree
- * or the revision stops the build with exit 1 instead of redirecting fixture
- * files, synthetic content or that removal to wherever the link points.
+ * `<outDir>`, never into the repository. Every child (git, tar and Jekyll)
+ * runs with `JEKYLL_ENV` removed: a local production build derives the wrong
+ * base path, so the project base path is passed with `--baseurl` in place of
+ * the Pages API.
  */
 
 import fs from "node:fs";
@@ -100,8 +69,10 @@ export const FUTURE_SLUG = "fixture-future-post";
 export const FUTURE_MARKER = "FIXTURE-FUTURE-POST-MARKER-2b8d4e6f";
 
 /**
- * The fixture articles every build must contain. `file` is the basename
- * inside `tests/fixtures/posts/`; `slug` is the URL segment under `/blog/`.
+ * The fixture articles the staged source and the project and preview builds
+ * contain; the empty variant deliberately contains none. `file` is the
+ * basename inside `tests/fixtures/posts/`; `slug` is the URL segment under
+ * `/blog/`.
  */
 export const FIXTURE_POSTS = Object.freeze([
   Object.freeze({ file: "2026-01-15-fixture-code-and-tables.md", slug: "fixture-code-and-tables" }),
@@ -184,7 +155,6 @@ function fail(message, exitCode) {
   return error;
 }
 
-/** Prints one progress line. */
 function log(message) {
   console.log(`${LOG_PREFIX} ${message}`);
 }
@@ -245,11 +215,23 @@ function capture(cmd, args, options, timeoutMs) {
 }
 
 /**
- * Environment of every git command: the caller's, with `GIT_OPTIONAL_LOCKS=0`
+ * Base environment of every child (git, tar and Jekyll): a copy of the
+ * caller's without `JEKYLL_ENV`. A local production build derives the wrong
+ * base path (`/pages/randyamiller/cabrillo-coast`) and no other child has a
+ * use for the variable, so none receives it. `process.env` is never changed.
+ */
+function childEnv() {
+  const env = { ...process.env };
+  delete env.JEKYLL_ENV;
+  return env;
+}
+
+/**
+ * Environment of every git command: `childEnv()` with `GIT_OPTIONAL_LOCKS=0`
  * so a read-only command never writes even an opportunistic index refresh.
  */
 function gitEnv() {
-  return { ...process.env, GIT_OPTIONAL_LOCKS: "0" };
+  return { ...childEnv(), GIT_OPTIONAL_LOCKS: "0" };
 }
 
 /** Read-only git plumbing in the repository, with the `DEADLINES.gitQuery` deadline. */
@@ -393,11 +375,10 @@ function stagedPaths(fixturesOnly) {
 }
 
 /**
- * Refuses an output folder inside the repository. Beyond the plan's
- * contract, deliberately: a nested output would be copied into the real
- * `_site` by `bundle exec jekyll build` (its name is not in `exclude`) and
- * offered to `git add -A`, carrying the synthetic draft and Gemfile copies
- * with it. Every consumer passes a folder under `os.tmpdir()`.
+ * Refuses an output folder inside the repository: a nested output would be
+ * copied into the real `_site` by `bundle exec jekyll build` (its name is not
+ * in `exclude`) and offered to `git add -A`, carrying the synthetic draft and
+ * Gemfile copies with it. Every consumer passes a folder under `os.tmpdir()`.
  */
 function assertOutsideRepo(outDir) {
   if (isWithin(canonicalPath(outDir), canonicalPath(REPO_ROOT))) {
@@ -493,26 +474,55 @@ function stageWorkingTree(srcDir, paths) {
 
 /**
  * Extracts the allow-listed paths that exist at commit `sha` with
- * `git archive`, then removes any `assets/drafts/` the revision carries.
+ * `git archive`. The archive's pathspecs exclude `assets/drafts/`, so a draft
+ * image the revision tracks never reaches `ref.tar` or the staged source,
+ * not even when the extraction fails or is interrupted.
  */
 function stageRevision(outDir, srcDir, sha, paths) {
   const tarPath = path.join(outDir, "ref.tar");
+  // `--no-literal-pathspecs` keeps the exclude magic in force when the caller exports
+  // GIT_LITERAL_PATHSPECS; `literal` matches the excluded folder name character for character.
+  const excludeDraftImages = `:(exclude,literal)${DRAFT_IMAGES_DIR}`;
   try {
     run(
       "git",
-      ["archive", "--format=tar", "-o", tarPath, sha, "--", ...paths],
+      ["--no-literal-pathspecs", "archive", "--format=tar", "-o", tarPath, sha, "--", ...paths, excludeDraftImages],
       { cwd: REPO_ROOT, env: gitEnv() },
       DEADLINES.gitArchive,
     );
-    run("tar", ["-xf", tarPath, "-C", srcDir], {}, DEADLINES.tarExtract);
+    run("tar", ["-xf", tarPath, "-C", srcDir], { env: childEnv() }, DEADLINES.tarExtract);
   } finally {
     fs.rmSync(tarPath, { force: true });
   }
+}
+
+/**
+ * Fails closed when the freshly staged source holds `assets/drafts`, before
+ * any fixture or synthetic file is added. Both staging modes leave it out
+ * (the working-tree copy filters it, the revision archive excludes it), so
+ * finding it means that control failed. It is removed before the failure is
+ * reported, so no draft image stays in `<outDir>`.
+ * @throws {Error} exit code 1 when `assets/drafts` was staged, or when
+ *   `assets/` is not a real folder or cannot be inspected.
+ */
+function assertNoDraftImages(srcDir) {
   const draftImages = path.join(srcDir, ...DRAFT_IMAGES_DIR.split("/"));
-  // A symlinked `assets/` would aim this removal at the real `drafts/` inside the folder it points
-  // to; a symlinked `assets/drafts` itself is only unlinked by `rmSync`, never followed.
+  // A symlinked `assets/` would aim the probe and the removal at the real `drafts/` inside the folder it
+  // points to; a symlinked `assets/drafts` itself is only unlinked by `rmSync`, never followed.
   assertRealFolders(srcDir, path.dirname(draftImages));
-  fs.rmSync(draftImages, { recursive: true, force: true });
+  if (lstatOrNull(draftImages) === null) return;
+  try {
+    fs.rmSync(draftImages, { recursive: true, force: true });
+  } catch (err) {
+    throw fail(
+      `the staged source holds ${DRAFT_IMAGES_DIR}/, which staging must leave out, and removing it failed: ${err.message}; delete ${draftImages}`,
+      1,
+    );
+  }
+  throw fail(
+    `the staged source held ${DRAFT_IMAGES_DIR}/, which staging must leave out; it was removed from ${srcDir} and nothing was built`,
+    1,
+  );
 }
 
 /**
@@ -633,15 +643,12 @@ function writeSyntheticContent(srcDir) {
 /* ------------------------------------------------------------------------ */
 
 /**
- * Environment for every Jekyll build: the caller's, minus `JEKYLL_ENV`, plus
- * `BUNDLE_GEMFILE` naming the repository Gemfile so the installed bundle
- * (including CI's `vendor/bundle` configured beside it) is reused.
+ * Environment for every Jekyll build: `childEnv()` plus `BUNDLE_GEMFILE`
+ * naming the repository Gemfile so the installed bundle (including CI's
+ * `vendor/bundle` configured beside it) is reused.
  */
 function jekyllEnv() {
-  const env = { ...process.env };
-  delete env.JEKYLL_ENV;
-  env.BUNDLE_GEMFILE = GEMFILE;
-  return env;
+  return { ...childEnv(), BUNDLE_GEMFILE: GEMFILE };
 }
 
 /**
@@ -711,7 +718,7 @@ function stageAndBuild({ outDir, ref, fixturesOnly = false } = {}) {
 
   fs.mkdirSync(src, { recursive: true });
 
-  // 1. Stage the allow-listed site source.
+  // 1. Stage the allow-listed site source, which must hold no draft image before anything is added.
   if (sha !== null) {
     log(`staging the site source of ${sha.slice(0, 12)} into ${src}${fixturesOnly ? " (fixtures only)" : ""}`);
     stageRevision(out, src, sha, revisionPaths);
@@ -719,6 +726,7 @@ function stageAndBuild({ outDir, ref, fixturesOnly = false } = {}) {
     log(`staging the working-tree site source into ${src}${fixturesOnly ? " (fixtures only)" : ""}`);
     stageWorkingTree(src, paths);
   }
+  assertNoDraftImages(src);
 
   // 2. Fixture articles and synthetic private content, in the staging copy only.
   const fixtureCount = stageFixtures(src);

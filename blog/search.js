@@ -46,7 +46,7 @@
       }
       if (j === terms.length) hits.push({ e: prepared[i], s: s });
     }
-    hits.sort(function (a, b) { return b.s - a.s || a.e.order - b.e.order; }); // ES5 sort is unstable
+    hits.sort(function (a, b) { return b.s - a.s || a.e.order - b.e.order; }); // ES5 may be unstable
     for (i = 0; i < hits.length; i++) hits[i] = hits[i].e;
     return hits;
   }

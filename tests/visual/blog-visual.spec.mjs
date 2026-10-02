@@ -1,58 +1,26 @@
 /* Cabrillo Coast LLC — blog visual comparison (AC-16, F-018 public viewing) */
 /**
  * Twelve full-page screenshots: the blog listing and the code-and-tables
- * fixture article, each at 375px, 800px and 1280px wide, in light and dark
- * colour schemes.
+ * fixture article at 375px, 800px and 1280px, in light and dark schemes.
  *
- * Run only through `node tests/visual/run-visual.mjs`, which builds the
- * project fixture site twice (base revision and working tree), serves each on
- * 127.0.0.1 with the site mounted at `/cabrillo-coast/`, and runs this spec
- * through `tests/visual/playwright.config.mjs` twice:
- *   1. with `--update-snapshots=all` against the base build, writing the
- *      baseline into `VISUAL_BASELINE_DIR` (one flat file per screenshot, for
- *      example `listing-375-light.png`);
- *   2. with `--update-snapshots=none` against the working-tree build,
- *      comparing every screenshot with its baseline.
+ * Run only through `node tests/visual/run-visual.mjs`. It builds the base
+ * revision and the working tree, serves each, and runs this spec twice: in
+ * update mode against the base, writing the baseline into
+ * `VISUAL_BASELINE_DIR`, then in comparison mode against the working tree.
  *
- * The comparison is literal pixel equality, checked in two layers:
- *   1. `toHaveScreenshot` with `threshold: 0` and `maxDiffPixels: 0`, which
- *      waits for a stable render and writes Playwright's own expected,
- *      actual and diff images when it fails. Its pixelmatch comparator does
- *      not count changed pixels it classifies as anti-aliased, and blends
- *      every pixel with white by its alpha first, so on its own it can pass
- *      a changed glyph edge or a change hidden behind zero alpha.
- *   2. Once the matcher has passed, outside the baseline run, a new capture
- *      with the same options is compared with the baseline file sample by
- *      sample at zero tolerance (`compareScreenshots` in `lib/pixels.mjs`),
- *      so those differences fail too. A difference writes
- *      `<name>-expected.png`, `<name>-actual.png` and `<name>-diff.png` into
- *      the case's output folder, attaches them to the report, and fails the
- *      case with `strictMismatchMessage`, which run-visual.mjs classifies as
- *      a screenshot difference. A baseline or capture that cannot be decoded
- *      fails with its own message, never as a difference.
- * Two separate builds of identical source render identically in the same
- * browser build on the same machine, so any tolerance would only hide a real
- * regression. Intended visual changes are declared to run-visual.mjs (a
- * `Visual-Change: intended` commit trailer or `VISUAL_CHANGE_INTENDED=1`),
- * never by loosening this file.
+ * Equality is literal and checked twice. `toHaveScreenshot` with
+ * `threshold: 0` and `maxDiffPixels: 0` waits for a stable render and writes
+ * Playwright's evidence when it fails, but its pixelmatch comparator skips
+ * pixels it classifies as anti-aliased and blends alpha with white. So,
+ * outside the baseline run, a new capture is also compared with the baseline
+ * sample by sample at zero tolerance (`compareScreenshots` in
+ * `lib/pixels.mjs`). Both builds render in the same browser on the same
+ * machine, so any tolerance would only hide a regression; intended changes
+ * are declared to run-visual.mjs, never by loosening this file.
  *
- * Inputs (environment):
- *   VISUAL_BASE_URL      Served site root including the base path, for example
- *                        `http://127.0.0.1:41234/cabrillo-coast`.
- *   VISUAL_BASELINE_DIR  Read by the config, which places baselines there.
- *
- * Determinism:
- *   - Google Fonts requests are aborted, so both renders use the same local
- *     fallback fonts whatever the network does.
- *   - Reduced motion is emulated (styles.css then disables every transition
- *     and animation) and screenshots disable CSS animations as well.
- *   - The footer `span#year` is masked: main.js rewrites it to the current
- *     year, which must never change pixels between the base and the change.
- *   - Nothing is focused, hovered, clicked or scrolled. main.js adds the
- *     header's `.scrolled` shadow only once `scrollY > 8`, and a full-page
- *     capture does not scroll the window.
- *   - The listing loads without `?q=`, so search.js only unhides the search
- *     form: it fetches no index and leaves the status line empty.
+ * Google Fonts requests are aborted so both renders use the same local
+ * fallback fonts, and `#year` is masked because main.js rewrites it to the
+ * current year. Motion is reduced, and nothing is focused or scrolled.
  */
 
 import fs from "node:fs";
@@ -62,9 +30,12 @@ import { test, expect } from "@playwright/test";
 import { compareScreenshots, strictMismatchMessage } from "./lib/pixels.mjs";
 
 /*
- * Fail at load time, before any test runs, rather than screenshot an
- * unrelated origin or a relative path. One trailing slash is tolerated so
- * that page paths below always join with exactly one `/`.
+ * Fail at load time, before any test runs, when the runner supplied no
+ * `VISUAL_BASE_URL` (unset, not a string, or blank). The value is otherwise
+ * used as given; run-visual.mjs passes
+ * `http://127.0.0.1:<port>/cabrillo-coast`. Surrounding whitespace and one
+ * trailing slash are removed so the page paths below join with exactly one
+ * `/`.
  */
 const RAW_BASE = process.env.VISUAL_BASE_URL;
 if (typeof RAW_BASE !== "string" || RAW_BASE.trim() === "") {
@@ -72,12 +43,6 @@ if (typeof RAW_BASE !== "string" || RAW_BASE.trim() === "") {
 }
 const BASE = RAW_BASE.trim().replace(/\/$/, "");
 
-/*
- * The listing and one article. The article is the fixture
- * tests/fixtures/posts/2026-01-15-fixture-code-and-tables.md (Python and YAML
- * fences with Rouge tokens, inline code, an aligned table and a blockquote),
- * rendered by _layouts/post.html at `permalink: /blog/:title/`.
- */
 const PAGES = [
   { name: "listing", path: "/blog/" },
   { name: "article", path: "/blog/fixture-code-and-tables/" },

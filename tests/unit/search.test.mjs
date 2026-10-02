@@ -1,59 +1,28 @@
 /* Cabrillo Coast LLC — unit tests for the blog search logic (AC-09, F-019) */
 /**
- * `blog/search.js` filters and ranks the server-rendered article listing in
- * the browser. Its four pure functions are exported as
- * `window.CabrilloBlogSearch` before the script touches the DOM, so this
- * suite runs the real, unmodified file in a `node:vm` context and tests the
- * search contract directly:
- *   - normalize(text): lowercases and strips diacritics (NFD decomposition
- *     minus combining marks) where `String.prototype.normalize` exists, and
- *     only lowercases where it does not;
- *   - tokenize(query): splits a query into terms on any whitespace and drops
- *     empty terms;
- *   - prepare(entries): returns copies carrying normalized fields (`norm`)
- *     and their input position (`order`), leaving the inputs untouched;
- *   - rank(prepared, query): `null` for an empty query; otherwise the
- *     prepared entries in which every term occurs, as a literal substring, in
- *     at least one field. Each entry scores the sum, over the terms, of the
- *     weights of the fields holding the term (title 4, tags 3, summary 2,
- *     body 1), each field counting once however often it holds the term;
- *     results sort by score, ties keeping newest-first input order.
+ * Runs the real, unmodified `blog/search.js` in a `node:vm` context and tests
+ * the API it exports as `window.CabrilloBlogSearch` (AC-09).
  *
- * Each sandbox, built by `makeSandbox`, is a stand-in `window` whose every
- * DOM lookup returns `null` and which has no `fetch`, so the script's guarded
- * DOM wiring returns before it does anything and only the exported API is
- * exercised. The wiring itself (form, status line, `?q=` and the index fetch)
- * is checked in headless Chrome (AC-13). The sandbox must never be given a
- * lookup that succeeds, and `blog/search.js` is never changed to suit this
- * suite.
+ * Each sandbox (`makeSandbox`) is a stand-in `window` whose every DOM lookup
+ * returns `null` and which has no `fetch`, so the script's guarded DOM wiring
+ * returns before it does anything; that wiring is checked in headless Chrome
+ * (AC-13). The sandbox must never be given a lookup that succeeds, and
+ * `blog/search.js` is never changed to suit this suite. Its stub `document`
+ * records what was exported at each call, which proves the API exists before
+ * the first DOM access rather than merely after the script has run.
  *
- * The stub `document` is also a recorder: each of its methods notes, at the
- * moment it is called, the method, its argument, which of the four functions
- * `window.CabrilloBlogSearch` already holds, and the object it holds. The
- * export-order and fallback cases assert on those records after loading,
- * which proves the API exists before the first DOM access rather than merely
- * after the script has run. Stubs record and never throw: a throw would abort
- * the load.
+ * The fallback case builds a separate realm and deletes its
+ * `String.prototype.normalize`; each vm context has its own built-ins, so the
+ * deletion reaches no other realm. Values created inside a vm context carry
+ * its prototypes, which `assert.deepStrictEqual` treats as different from
+ * local literals, so results are copied into this realm (`Array.from`,
+ * `urls`) before any deep comparison.
  *
- * Cases share one realm built this way. The fallback case builds a second,
- * isolated realm and deletes its `String.prototype.normalize` before loading
- * the script, so the lowercase-only branch of `normalize` runs. Each vm
- * context has its own built-ins, so the deletion reaches neither this realm
- * nor the shared one.
+ * Entries mirror the built `blog/search.json`, whose `body` is already the
+ * lowercased distinct tokens of the article text.
  *
- * Entries mirror the built `blog/search.json`: `{ url, title, summary, tags,
- * date, body }`, where `body` is already the lowercased distinct tokens of the
- * article text.
- *
- * Cross-realm values: arrays and objects created inside the vm context carry
- * that context's prototypes, which `assert.deepStrictEqual` treats as
- * different from local literals. Results are copied into this realm
- * (`Array.from`, `urls`) before any deep comparison; primitives are compared
- * directly.
- *
- * Run: node --test tests/unit/search.test.mjs (Node 22 or later), or as part
- * of `node --test "tests/**\/*.test.mjs"`. It needs no Jekyll build, browser
- * or network, and writes no files.
+ * Run: node --test tests/unit/search.test.mjs (Node 22 or later). It needs no
+ * Jekyll build, browser or network, and writes no files.
  */
 
 import { test } from 'node:test';
@@ -63,15 +32,12 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 
-/* ------------------------------------------------------------------------ */
-/* Loading blog/search.js                                                    */
-/* ------------------------------------------------------------------------ */
+/* Loading blog/search.js */
 
 const ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const SEARCH_JS = path.join(ROOT, 'blog', 'search.js');
 const src = fs.readFileSync(SEARCH_JS, 'utf8');
 
-/** The functions `window.CabrilloBlogSearch` must carry. */
 const API_NAMES = ['normalize', 'tokenize', 'prepare', 'rank'];
 
 /**
@@ -131,17 +97,13 @@ function makeSandbox() {
   return { sandbox, domAccesses };
 }
 
-/** The realm every case shares unless it needs its own. */
 const shared = makeSandbox();
 vm.createContext(shared.sandbox);
 vm.runInContext(src, shared.sandbox, { filename: 'blog/search.js' });
 
-/** The API under test, as the script exported it. */
 const S = shared.sandbox.CabrilloBlogSearch;
 
-/* ------------------------------------------------------------------------ */
-/* Helpers                                                                   */
-/* ------------------------------------------------------------------------ */
+/* Helpers */
 
 /** Default `date`, in the `date_to_xmlschema` form the built index uses. */
 const DEFAULT_DATE = '2026-01-01T00:00:00+00:00';
@@ -214,9 +176,7 @@ function assertExportedBeforeDomAccess(domAccesses, api) {
   }
 }
 
-/* ------------------------------------------------------------------------ */
-/* Cases                                                                     */
-/* ------------------------------------------------------------------------ */
+/* Cases */
 
 test('[AC-09][F-019] search.js exports the API before touching the DOM', () => {
   assert.equal(typeof S, 'object', 'window.CabrilloBlogSearch must be an object');
@@ -225,7 +185,6 @@ test('[AC-09][F-019] search.js exports the API before touching the DOM', () => {
     assert.equal(typeof S[name], 'function', `CabrilloBlogSearch.${name} must be a function`);
   }
 
-  // The stub `document` recorded what was exported at each call it received.
   assertExportedBeforeDomAccess(shared.domAccesses, S);
 });
 
@@ -249,7 +208,6 @@ test('[AC-09][F-019] normalize falls back to lowercase only without String.proto
   vm.runInContext(src, fallback.sandbox, { filename: 'blog/search.js' });
   const F = fallback.sandbox.CabrilloBlogSearch;
 
-  // The lookups still all fail, and still come after the export.
   assertExportedBeforeDomAccess(fallback.domAccesses, F);
 
   assert.equal(F.normalize('CAF\u00c9'), 'caf\u00e9', 'without NFD the text is lowercased and keeps its accent');

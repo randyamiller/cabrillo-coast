@@ -20,7 +20,7 @@
 }
 .post-empty { text-align: center; color: var(--muted); font-size: 1.05rem; }
 
-/* ---------- Search (the same look and focus ring as .field input in styles.css) ---------- */
+/* ---------- Search: token-based variant of the shared field styling ---------- */
 .blog-search { max-width: 640px; margin-inline: auto; margin-block: 0 36px; display: grid; gap: 8px; }
 .blog-search label { font-size: .9rem; font-weight: 600; }
 .blog-search input {

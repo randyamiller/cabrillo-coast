@@ -4,35 +4,17 @@
  * guard, each run as a child process exactly as an author or a git hook runs
  * it.
  *
- *   - new, check, publish and unpublish run in temporary roots: plain folders
- *     holding a copy of `_templates/article.md`, addressed with `--root` and
- *     used as the working directory.
- *   - guard --staged runs in temporary git repositories with the case's files
- *     staged; guard --pre-push additionally pushes to a local bare repository
- *     and receives on standard input the ref line git would pass the hook.
- *   - failures part way through new, publish and unpublish use fault
- *     injection: a `node --import` preload, written into the parent folder at
- *     run time, makes chosen `node:fs` calls fail, write short or edit a file
- *     mid-command, so rollback and retry are exercised without depending on
- *     file permissions (the suite may run as root).
- *   - two guard cases put a stand-in git first on PATH that kills itself with
- *     SIGKILL on one command, so guard must refuse instead of reading the
- *     missing answer as "no".
+ * new, check, publish and unpublish run in temporary roots holding a copy of
+ * `_templates/article.md`, addressed with `--root`. guard runs in temporary
+ * git repositories, and --pre-push pushes to a local bare repository. All of
+ * it is written below one folder in `os.tmpdir()`, removed after the run.
  *
- * Everything is written below one parent folder in `os.tmpdir()`, removed
- * after the run, so nothing is written inside this repository.
- *
- * Git isolation: every git call, and every tool run (the tool spawns git
- * itself), gets `ENV`, made by `isolatedEnv`. It replaces the system and
- * global configuration with an empty file and the template folder
- * (`GIT_TEMPLATE_DIR`, which outranks `init.templateDir`) with an empty
- * folder, so no developer hook, `core.hooksPath`, template hook or template
- * configuration, signing or LFS filter can influence a case or run during
- * one, and it drops the variables a git hook exports (`GIT_DIR`,
- * `GIT_INDEX_FILE`, …) that would otherwise redirect the temporary
- * repositories to the repository running the tests. Setup commits and pushes
- * use `--no-verify`. One case builds a hostile template and shows that it is
- * imported and run without the override and never with it.
+ * Every git call and every tool run is isolated from the developer's git
+ * configuration, hooks and template, and from the variables a running git
+ * hook exports, so none can influence a case or redirect it to this
+ * repository; setup commits and pushes also use `--no-verify`. Failures part
+ * way through are injected into `node:fs` calls rather than caused by file
+ * permissions, which do not stop the root user the suite may run as.
  *
  * Run: node --test tests/unit/article-cli.test.mjs (Node 22 or later, git 2.32
  * or later for GIT_CONFIG_GLOBAL; HOME and XDG_CONFIG_HOME are redirected as
@@ -47,9 +29,7 @@ import os from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
-/* ------------------------------------------------------------------------ */
 /* Paths and isolation                                                       */
-/* ------------------------------------------------------------------------ */
 
 const ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const ARTICLE_MJS = path.join(ROOT, 'scripts/article.mjs');
@@ -122,18 +102,14 @@ function isolatedEnv(base) {
   });
 }
 
-/** The environment of every git call and every tool run. */
 const ENV = isolatedEnv(process.env);
 
-/** Time limit for cases that create repositories, clone or push. */
 const GIT_CASE = { timeout: 60000 };
 
 /** Bytes of a stand-in image; the tool only checks that the file exists and moves it. */
 const PNG = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
 
-/* ------------------------------------------------------------------------ */
 /* Process helpers                                                           */
-/* ------------------------------------------------------------------------ */
 
 /**
  * Describes what happened to a child process, for a failure message: the
@@ -237,9 +213,7 @@ function indexMode(repo, rel) {
   return git(repo, 'ls-files', '-s', '--', rel).split(' ')[0];
 }
 
-/* ------------------------------------------------------------------------ */
 /* Fault injection                                                           */
-/* ------------------------------------------------------------------------ */
 
 /**
  * A `node --import` preload that makes chosen `node:fs` calls of the tool
@@ -331,9 +305,7 @@ function cliWithFaults(root, faults, ...args) {
   });
 }
 
-/* ------------------------------------------------------------------------ */
 /* Dates, text and files                                                     */
-/* ------------------------------------------------------------------------ */
 
 /** Today's date in UTC as `YYYY-MM-DD`, the clock the tool dates posts by. */
 function todayUtc() {
@@ -345,7 +317,6 @@ function addDaysUtc(days) {
   return new Date(Date.now() + days * 86400000).toISOString().slice(0, 10);
 }
 
-/** Filename date of existing posts: well in the past whenever the suite runs. */
 const PAST = addDaysUtc(-30);
 
 /** Escapes text for use inside a regular expression. */
@@ -359,9 +330,12 @@ function quoted(value) {
 }
 
 /**
- * An article that passes every schema rule as a draft and as a post: quoted
- * `title` and `summary`, a flow list of kebab-case `tags`, an optional
- * `updated` date and any `extra` front-matter lines, then a non-empty body.
+ * An article source: quoted `title` and `summary`, a flow list of `tags`, an
+ * optional `updated` date and any `extra` front-matter lines, then the body.
+ * The defaults (kebab-case tags, a non-empty body, no `updated` or `extra`)
+ * pass every schema rule as a draft and as a post; a caller's `title`,
+ * `summary`, `tags`, `body`, `updated` or `extra` may deliberately build an
+ * article the schema rejects.
  */
 function validArticle({
   title = 'A valid article',
@@ -390,12 +364,10 @@ function write(root, rel, content) {
   fs.writeFileSync(target, content);
 }
 
-/** True when anything exists at the path. */
 function exists(root, rel) {
   return fs.existsSync(abs(root, rel));
 }
 
-/** The file's text. */
 function read(root, rel) {
   return fs.readFileSync(abs(root, rel), 'utf8');
 }
@@ -405,9 +377,7 @@ function list(root, rel) {
   return exists(root, rel) ? fs.readdirSync(abs(root, rel)).sort() : [];
 }
 
-/* ------------------------------------------------------------------------ */
 /* Case folders                                                              */
-/* ------------------------------------------------------------------------ */
 
 let caseCount = 0;
 
@@ -472,9 +442,7 @@ function prePush(repo, localRef, remoteRef, remoteSha) {
   return run(['guard', '--pre-push'], { cwd: repo, input: `${localRef} ${localSha} ${remoteRef} ${remoteSha}\n` });
 }
 
-/* ------------------------------------------------------------------------ */
 /* State snapshots                                                           */
-/* ------------------------------------------------------------------------ */
 
 /**
  * Every entry below `dir`, keyed by its POSIX path relative to `dir`: the
@@ -576,9 +544,7 @@ function prePushUnchanged({ repo, remote }, localRef, remoteRef, remoteSha) {
   );
 }
 
-/* ------------------------------------------------------------------------ */
 /* Temporary repository isolation                                            */
-/* ------------------------------------------------------------------------ */
 
 /** Hooks of the hostile template: client hooks `--no-verify` does not skip, and the hooks a push runs on the remote. */
 const HOSTILE_HOOKS = [
@@ -638,7 +604,7 @@ function assertNoTemplateImports(gitDir, label) {
 test('[AC-03][F-017] temporary repositories take no hooks or configuration from an inherited git template', GIT_CASE, async (t) => {
   await t.test('[AC-03][F-017] without the override, an inherited template is imported by init and run by clone and push', GIT_CASE, () => {
     const hostile = hostileTemplate();
-    // ENV as it was before it overrode the template: what an inherited GIT_TEMPLATE_DIR did to every case.
+    // Negative control: explicitly inherit the hostile template to prove isolation is necessary.
     const leaky = { ...ENV, GIT_TEMPLATE_DIR: hostile.template };
     /** Runs git with the leaky environment; returns its result and description, as the hostile hooks may fail it. */
     const leakyGit = (cwd, ...args) => {
@@ -719,9 +685,7 @@ test('[AC-03][F-017] temporary repositories take no hooks or configuration from 
   });
 });
 
-/* ------------------------------------------------------------------------ */
 /* Usage                                                                     */
-/* ------------------------------------------------------------------------ */
 
 test('[AC-03][F-017] usage errors exit 2: no command, an unknown command, publish without a slug', () => {
   const root = makeRoot();
@@ -733,9 +697,7 @@ test('[AC-03][F-017] usage errors exit 2: no command, an unknown command, publis
   assert.deepEqual(list(root, '.'), ['_templates'], 'a usage error writes nothing');
 });
 
-/* ------------------------------------------------------------------------ */
 /* new <slug>                                                                */
-/* ------------------------------------------------------------------------ */
 
 test('[AC-03][F-017] new copies the template to _drafts/<slug>.md, creates assets/drafts/<slug>/ and warns without core.hooksPath', () => {
   const root = makeRoot();
@@ -827,9 +789,7 @@ test('[AC-03][F-017] new leaves no draft when its image folder cannot be created
   });
 });
 
-/* ------------------------------------------------------------------------ */
 /* check [files…]                                                            */
-/* ------------------------------------------------------------------------ */
 
 test('[AC-03][F-017] check rejects the untouched template and accepts a valid draft', () => {
   const root = makeRoot();
@@ -1167,9 +1127,7 @@ test('[AC-03][F-017] check refuses a pile-up of unclosed <img> tags too large to
   assert.match(result.stderr, /too many overlapping <img> tags to check/);
 });
 
-/* ------------------------------------------------------------------------ */
 /* publish <slug>                                                            */
-/* ------------------------------------------------------------------------ */
 
 /** The `_posts/` files published under `slug`. */
 function postsFor(root, slug) {
@@ -1248,7 +1206,6 @@ test('[AC-03][F-017] publish refuses a draft that fails check and moves nothing'
 });
 
 test('[AC-03][F-017] publish checks the post it would write, so an updated date before the UTC publish date is refused', async (t) => {
-  /** A valid draft with one image, `updated` set to `updated`. */
   const draftWithImage = (slug, updated) => validArticle({
     updated,
     body: `Figure:\n\n![A labelled figure]({{ '/assets/drafts/${slug}/figure.png' | relative_url }})`,
@@ -1292,9 +1249,7 @@ test('[AC-03][F-017] publish checks the post it would write, so an updated date 
   });
 });
 
-/* ------------------------------------------------------------------------ */
 /* unpublish <slug>                                                          */
-/* ------------------------------------------------------------------------ */
 
 test('[AC-03][F-017] unpublish moves the post and its images back to the drafts folders and rewrites the paths', () => {
   const root = makeRoot();
@@ -1379,7 +1334,6 @@ test('[AC-03][F-017] unpublish refuses while a post_url and an ordinary link nam
   const lineOf = (text, needle) => text.split('\n').findIndex((line) => line.includes(needle)) + 1;
   const taggedAt = new RegExp(`${escapeRegExp(taggedRel)}:${lineOf(taggedText, 'post_url')}: `);
   const linkedAt = new RegExp(`${escapeRegExp(linkedRel)}:${lineOf(linkedText, '/blog/target/')}: `);
-  /** Asserts that nothing moved: the post and its image are unchanged and no draft exists. */
   const unmoved = () => {
     assertStillPost(root, 'target', target);
     assert.equal(exists(root, '_drafts'), false, 'nothing is moved to _drafts/');
@@ -1483,9 +1437,7 @@ test('[AC-03][F-017] unpublish of an image-free post in a fresh clone moves only
     'the only change is the unstaged deletion; the git-ignored draft does not show');
 });
 
-/* ------------------------------------------------------------------------ */
 /* Failures part way: rollback and retry                                     */
-/* ------------------------------------------------------------------------ */
 
 /** Writes a valid draft of `slug` with one image in `assets/drafts/<slug>/`; returns the draft text. */
 function writeDraftWithImage(root, slug) {
@@ -1546,6 +1498,207 @@ function assertRetryUnpublishes(root, slug, { rel }) {
   assert.equal(exists(root, rel), false, 'the retry removes the post');
 }
 
+/** Options of the cases that create symbolic links, which Windows allows only with extra privileges. */
+const LINK_CASE = { skip: process.platform === 'win32' ? 'symbolic links need extra privileges on Windows' : false };
+
+/** Creates `rel` in `root` as a symbolic link to `target`, creating its parent folders. */
+function link(root, rel, target) {
+  fs.mkdirSync(path.dirname(abs(root, rel)), { recursive: true });
+  fs.symlinkSync(target, abs(root, rel));
+}
+
+/**
+ * Runs `cli(root, …args)` and asserts that it is refused with exit 1, naming
+ * each path of `named` as a symbolic link and saying nothing was changed,
+ * and that it left `root` and every folder of `outside` exactly as they
+ * were: nothing was written, moved or removed, in the root or through a
+ * link, the slug's lock included.
+ */
+function refusedThroughLink(root, outside, args, named) {
+  const result = unchangedBy(
+    () => [root, ...outside].map((dir) => treeSnapshot(dir)),
+    () => cli(root, ...args),
+    `the root ${root} and the folders its links point to`,
+  );
+  expectExit(result, 1);
+  for (const rel of named) {
+    assert.match(result.stderr, new RegExp(`error: ${escapeRegExp(rel)} is a symbolic link; `),
+      `the refusal names ${rel} as the link to replace`);
+  }
+  assert.match(result.stderr, /nothing was changed/);
+  return result;
+}
+
+test('[AC-03][F-017] new refuses a _drafts or assets folder aliased to a public folder, and writes nothing through it', LINK_CASE, async (t) => {
+  for (const [alias, target, publicDir] of [
+    ['_drafts', 'blog', 'blog'],
+    ['assets/drafts', '../blog', 'blog'],
+    ['assets', 'public', 'public'],
+  ]) {
+    await t.test(`[AC-03][F-017] new refuses ${alias} linked to the tracked ${publicDir}/`, () => {
+      const root = makeRoot();
+      write(root, `${publicDir}/index.html`, '<p>Public page</p>\n');
+      link(root, alias, target);
+      refusedThroughLink(root, [], ['new', 'leak'], [alias]);
+      assert.deepEqual(list(root, publicDir), ['index.html'], `no draft, image folder or lock lands in ${publicDir}/`);
+    });
+  }
+});
+
+test('[AC-03][F-017] publish and unpublish refuse _drafts, _posts or assets/blog linked outside the root', LINK_CASE, async (t) => {
+  for (const alias of ['_drafts', '_posts', 'assets/blog']) {
+    await t.test(`[AC-03][F-017] publish refuses ${alias} linked outside the root`, () => {
+      const root = makeRoot();
+      const outside = caseDir('outside');
+      const text = writeDraftWithImage(root, 'escape');
+      if (alias === '_drafts') {
+        fs.rmSync(abs(root, '_drafts'), { recursive: true });
+        write(outside, 'escape.md', text);
+      }
+      link(root, alias, outside);
+      refusedThroughLink(root, [outside], ['publish', 'escape'], [alias]);
+      assert.equal(fs.existsSync(path.join(outside, '.escape.lock')), false, 'no lock is written through the link');
+    });
+    await t.test(`[AC-03][F-017] unpublish refuses ${alias} linked outside the root`, () => {
+      const root = makeRoot();
+      const outside = caseDir('outside');
+      const post = writePostWithImage(root, 'escape');
+      if (alias === '_posts') {
+        fs.rmSync(abs(root, '_posts'), { recursive: true });
+        write(outside, path.posix.basename(post.rel), post.text);
+      } else if (alias === 'assets/blog') {
+        fs.rmSync(abs(root, 'assets/blog'), { recursive: true });
+        write(outside, 'escape/figure.png', PNG);
+      }
+      link(root, alias, outside);
+      refusedThroughLink(root, [outside], ['unpublish', 'escape'], [alias]);
+      assert.equal(fs.existsSync(path.join(outside, '.escape.lock')), false, 'no lock is written through the link');
+    });
+  }
+  await t.test('[AC-03][F-017] new refuses _drafts linked outside the root and writes no lock there', () => {
+    const root = makeRoot();
+    const outside = caseDir('outside');
+    link(root, '_drafts', outside);
+    refusedThroughLink(root, [outside], ['new', 'escape'], ['_drafts']);
+    assert.deepEqual(fs.readdirSync(outside), [], 'no draft or lock is written through the link');
+  });
+});
+
+test('[AC-03][F-017] new, publish and unpublish refuse a template, draft or post that is a symbolic link', LINK_CASE, async (t) => {
+  await t.test('[AC-03][F-017] new refuses a linked _templates/article.md', () => {
+    const root = makeRoot();
+    const outside = caseDir('outside');
+    write(outside, 'article.md', fs.readFileSync(TEMPLATE));
+    fs.rmSync(abs(root, '_templates/article.md'));
+    link(root, '_templates/article.md', path.join(outside, 'article.md'));
+    refusedThroughLink(root, [outside], ['new', 'linked'], ['_templates/article.md']);
+  });
+  await t.test('[AC-03][F-017] publish refuses a linked _drafts/<slug>.md', () => {
+    const root = makeRoot();
+    const outside = caseDir('outside');
+    write(outside, 'linked.md', validArticle({ title: 'Kept outside the root' }));
+    link(root, '_drafts/linked.md', path.join(outside, 'linked.md'));
+    refusedThroughLink(root, [outside], ['publish', 'linked'], ['_drafts/linked.md']);
+  });
+  await t.test('[AC-03][F-017] unpublish refuses a linked _posts/<date>-<slug>.md', () => {
+    const root = makeRoot();
+    const outside = caseDir('outside');
+    write(outside, 'linked.md', validArticle({ title: 'Kept outside the root' }));
+    link(root, `_posts/${PAST}-linked.md`, path.join(outside, 'linked.md'));
+    refusedThroughLink(root, [outside], ['unpublish', 'linked'], [`_posts/${PAST}-linked.md`]);
+  });
+});
+
+test('[AC-03][F-017] check and publish refuse an image reached through a symbolic link', LINK_CASE, async (t) => {
+  for (const [linked, what] of [
+    ['assets/drafts/pic/figure.png', 'image file'],
+    ['assets/drafts/pic', 'image folder'],
+  ]) {
+    await t.test(`[AC-03][F-017] a linked ${what} counts as missing for check and is refused by publish`, () => {
+      const root = makeRoot();
+      const outside = caseDir('outside');
+      const text = writeDraftWithImage(root, 'pic');
+      fs.rmSync(abs(root, linked), { recursive: true });
+      write(outside, 'figure.png', PNG);
+      link(root, linked, what === 'image file' ? path.join(outside, 'figure.png') : outside);
+      const checked = checkRoot(root, '_drafts/pic.md');
+      expectExit(checked, 1);
+      assert.match(checked.stderr, /image \/assets\/drafts\/pic\/figure\.png does not exist/);
+      assert.match(checked.stderr, new RegExp(`${escapeRegExp(linked)} is a symbolic link, so the images through it `
+        + 'count as missing'), 'check says why an image on disk counts as missing');
+
+      refusedThroughLink(root, [outside], ['publish', 'pic'], [linked]);
+      assert.equal(read(root, '_drafts/pic.md'), text, 'the draft stays in _drafts/');
+    });
+  }
+});
+
+test('[AC-03][F-017] check reports a _drafts or _posts folder that is a symbolic link instead of following it', LINK_CASE, async (t) => {
+  for (const [folder, rel, namedRel] of [
+    ['_drafts', 'outside.md', `_posts/${PAST}-named.md`],
+    ['_posts', `${PAST}-outside.md`, '_drafts/named.md'],
+  ]) {
+    await t.test(`[AC-03][F-017] check refuses a linked ${folder}/`, () => {
+      const root = makeRoot();
+      const outside = caseDir('outside');
+      write(outside, rel, validArticle({ title: 'Kept outside the root' }));
+      link(root, folder, outside);
+      const listed = checkRoot(root);
+      expectExit(listed, 1);
+      assert.match(listed.stderr, new RegExp(`error: ${folder} is a symbolic link, which check does not follow`));
+      assert.doesNotMatch(listed.stdout, /outside\.md/, 'nothing is checked through the link');
+
+      write(root, namedRel, validArticle({ title: 'Named article' }));
+      const named = checkRoot(root, namedRel);
+      expectExit(named, 1);
+      assert.match(named.stderr, new RegExp(`error: ${folder} is a symbolic link`),
+        'a named article is not checked for slug uniqueness against a folder that cannot be listed');
+    });
+  }
+});
+
+test('[AC-03][F-017] the root itself may be a symbolic link, as os.tmpdir() is on macOS', LINK_CASE, () => {
+  const root = makeRoot();
+  const linkedRoot = path.join(PARENT, `${path.basename(root)}-link`);
+  fs.symlinkSync(root, linkedRoot);
+  expectExit(run(['new', 'via-link', '--root', linkedRoot], { cwd: root }), 0);
+  assert.deepEqual(fs.readFileSync(abs(root, '_drafts/via-link.md')), fs.readFileSync(TEMPLATE));
+  write(root, '_drafts/via-link.md', validArticle({ title: 'Through a linked root' }));
+  expectExit(run(['publish', 'via-link', '--root', linkedRoot], { cwd: root }), 0);
+  assert.equal(postsFor(root, 'via-link').length, 1, 'the post is written in the real root');
+});
+
+test('[AC-03][F-017] a failure after a folder became a symbolic link rolls nothing back through the link', LINK_CASE, () => {
+  const root = makeRoot();
+  const outside = caseDir('outside');
+  // A copy of the draft new writes, which a rollback through the link would delete as its own.
+  write(outside, 'swap.md', fs.readFileSync(TEMPLATE));
+  const out = path.join(root, '..', `${path.basename(root)}-swap.json`);
+  // Run as new creates the image folder: the draft is written, _drafts/ becomes a link and assets/ a file.
+  const swap = [
+    "const fs = require('node:fs');",
+    "fs.renameSync('_drafts', 'moved-drafts');",
+    `fs.symlinkSync(${JSON.stringify(outside)}, '_drafts');`,
+    "fs.writeFileSync('assets', 'a file, not a folder');",
+  ].join('\n');
+  const result = unchangedBy(
+    () => treeSnapshot(outside),
+    () => cliWithFaults(root, [{
+      fn: 'mkdirSync', path: 'assets/drafts/swap', action: 'run-tool', argv: ['-e', swap], cwd: root, out,
+    }], 'new', 'swap'),
+    `the folder ${outside} that _drafts/ was linked to`,
+  );
+  const swapped = JSON.parse(fs.readFileSync(out, 'utf8'));
+  assert.equal(swapped.status, 0, `the swap ran:\n${swapped.stderr}`);
+  expectExit(result, 1);
+  assert.match(result.stderr, /new failed: cannot create assets\/drafts\/swap\//);
+  assert.match(result.stderr, /rollback skipped: _drafts is a symbolic link; it must be a real folder/);
+  assert.match(result.stderr, /not every change could be rolled back; fix these paths by hand/);
+  assert.doesNotMatch(result.stderr, /every change was rolled back/);
+  assert.deepEqual(fs.readFileSync(abs(root, 'moved-drafts/swap.md')), fs.readFileSync(TEMPLATE),
+    'the draft written before the swap is left for repair by hand');
+});
+
 test('[AC-03][F-017] a short write leaves no partial file behind, and the command can then be run again', async (t) => {
   const shortWrite = (pathPart) => [{ fn: 'writeSync', path: pathPart, action: 'short-write', code: 'ENOSPC' }];
 
@@ -1589,8 +1742,9 @@ test('[AC-03][F-017] a short write leaves no partial file behind, and the comman
 });
 
 test('[AC-03][F-017] a failure removing the source undoes every earlier step, and the command can then be run again', async (t) => {
-  // The source is first set aside with a rename, then the set-aside copy is
-  // removed: a failure at either half of that commit point is undone.
+  // The source is first set aside with a rename, then given a backup name,
+  // then the set-aside name is removed: a failure at any step of that commit
+  // point is undone, the backup name included.
   const unlinkFault = (pathPart) => [{ fn: 'unlinkSync', path: pathPart, action: 'throw', code: 'EPERM' }];
   const renameFault = (pathPart) => [{ fn: 'renameSync', path: pathPart, action: 'throw', code: 'EPERM' }];
 
@@ -1603,6 +1757,7 @@ test('[AC-03][F-017] a failure removing the source undoes every earlier step, an
     assert.match(failed.stderr, /every change was rolled back and nothing was moved/);
     assertStillDraft(root, 'stuck', text);
     assert.equal(exists(root, '_drafts/.stuck.publishing'), false, 'no set-aside copy is left');
+    assert.equal(exists(root, '_drafts/.stuck.publish-backup'), false, 'the backup name made for it is removed');
     assertRetryPublishes(root, 'stuck');
   });
 
@@ -1663,6 +1818,7 @@ test('[AC-03][F-017] a failure removing the source undoes every earlier step, an
     assert.match(failed.stderr, /every change was rolled back and nothing was moved/);
     assertStillPost(root, 'stuck', post);
     assert.equal(exists(root, '_drafts/.stuck.unpublishing'), false, 'no set-aside copy is left');
+    assert.equal(exists(root, '_drafts/.stuck.unpublish-backup'), false, 'the backup name made for it is removed');
     assertRetryUnpublishes(root, 'stuck', post);
   });
 
@@ -1909,9 +2065,7 @@ test('[AC-03][F-017] a per-slug lock serializes new, publish and unpublish, and 
   });
 });
 
-/* ------------------------------------------------------------------------ */
 /* Next steps and --root                                                     */
-/* ------------------------------------------------------------------------ */
 
 test('[AC-03][F-017] the next steps start with a quoted cd to --root when the tool runs from another folder, and only then', () => {
   const base = caseDir('elsewhere');
@@ -1955,9 +2109,319 @@ test('[AC-03][F-017] the next steps start with a quoted cd to --root when the to
   assert.deepEqual(cdLines(unpublishedHere), []);
 });
 
-/* ------------------------------------------------------------------------ */
+test('[AC-03][F-017] the printed git add commands pass each path as one argument and run nothing, even for a post folder named with quotes and $(…)', () => {
+  const root = makeRoot();
+  const stubDir = caseDir('git-argv');
+  const argvFile = path.join(stubDir, 'argv');
+  fs.writeFileSync(path.join(stubDir, 'git'), ['#!/bin/sh', `printf '%s\\0' "$@" > ${shQuote(argvFile)}`, ''].join('\n'),
+    { mode: 0o755 });
+  /** The arguments `git` receives when the one printed `git add` line of `result` is pasted into a POSIX shell. */
+  const pastedArgv = (result) => {
+    const lines = result.stdout.split('\n').filter((line) => line.startsWith('  git add '));
+    assert.equal(lines.length, 1, `one git add line:\n${result.stdout}`);
+    fs.rmSync(argvFile, { force: true });
+    spawnOk('sh', ['-c', lines[0]], { cwd: root, env: { ...ENV, PATH: `${stubDir}${path.delimiter}${ENV.PATH ?? ''}` } });
+    return fs.readFileSync(argvFile, 'utf8').split('\0').slice(0, -1);
+  };
+
+  const created = cli(root, 'new', 'odd');
+  expectExit(created, 0);
+  assert.ok(created.stdout.includes('  3. node scripts/article.mjs check _drafts/odd.md\n'),
+    `an ordinary path is printed as it is:\n${created.stdout}`);
+  writeDraftWithImage(root, 'odd');
+  const published = cli(root, 'publish', 'odd');
+  expectExit(published, 0);
+  const [postFile] = postsFor(root, 'odd');
+  assert.deepEqual(pastedArgv(published), ['add', '--', `_posts/${postFile}`, 'assets/blog/odd']);
+
+  const folder = `it's "a" \`touch tick\` $(touch marker) \\ folder`;
+  const nestedRel = `_posts/${folder}/${postFile}`;
+  fs.mkdirSync(abs(root, `_posts/${folder}`));
+  fs.renameSync(abs(root, `_posts/${postFile}`), abs(root, nestedRel));
+  const unpublished = cli(root, 'unpublish', 'odd');
+  expectExit(unpublished, 0);
+  assert.deepEqual(pastedArgv(unpublished), ['add', '-A', '--', nestedRel, 'assets/blog/odd'],
+    'the nested post path reaches git as one argument, byte for byte');
+  assert.equal(exists(root, 'marker'), false, 'no $(…) in the path ran');
+  assert.equal(exists(root, 'tick'), false, 'no backtick command in the path ran');
+});
+
+test('[AC-03][F-017] a stale lock is replaced by one run only, under a reclaim token, and a live lock is never removed', async (t) => {
+  const lockRel = (slug) => `_drafts/.${slug}.lock`;
+  const tokenRel = (slug) => `${lockRel(slug)}.reclaim`;
+  const host = escapeRegExp(os.hostname());
+  /** A `<pid> <host>` record naming a process of this host that has exited. */
+  const goneRecord = () => `${spawnOk(process.execPath, ['-e', '']).pid} ${os.hostname()}\n`;
+  /** What a `run-tool` rule wrote to `out`, failing unless that run took place while `first` ran. */
+  const ranMeanwhile = (out, first) => {
+    assert.ok(fs.existsSync(out), `the competing run was started while the first one ran:\n${first.out}`);
+    return JSON.parse(fs.readFileSync(out, 'utf8'));
+  };
+
+  await t.test('[AC-03][F-017] a publish started inside another one\'s replacement of the stale lock is refused, and that run\'s lock stays live', () => {
+    const root = makeRoot();
+    write(root, '_drafts/race.md', validArticle({ title: 'Race' }));
+    write(root, lockRel('race'), goneRecord());
+    const outInside = path.join(root, '..', `${path.basename(root)}-inside.json`);
+    const outAfter = path.join(root, '..', `${path.basename(root)}-after.json`);
+    const competitor = (out) => ({
+      action: 'run-tool', argv: [ARTICLE_MJS, 'publish', 'race', '--root', root], cwd: root, out,
+    });
+    const first = cliWithFaults(root, [
+      // As the first run, holding the token, removes the stale lock.
+      { fn: 'unlinkSync', path: lockRel('race'), ...competitor(outInside) },
+      // Once the first run holds its own lock and writes the post.
+      { fn: 'openSync', path: '_posts/', ...competitor(outAfter) },
+    ], 'publish', 'race');
+
+    const inside = ranMeanwhile(outInside, first);
+    assert.equal(inside.status, 1, `the run inside the replacement is refused:\n${inside.stderr}`);
+    assert.match(inside.stderr, new RegExp(`another article\\.mjs run \\(process \\d+ on ${host}\\) is replacing the stale `
+      + `lock ${escapeRegExp(lockRel('race'))}; run publish again once it has finished`));
+    assert.match(inside.stderr, new RegExp(`delete ${escapeRegExp(tokenRel('race'))} first; nothing was changed`));
+    const after = ranMeanwhile(outAfter, first);
+    assert.equal(after.status, 1, `a run while the first one holds its lock is refused:\n${after.stderr}`);
+    assert.match(after.stderr, new RegExp(`another article\\.mjs run \\(process \\d+ on ${host}\\) is changing slug race`),
+      'the lock the first run took is live');
+
+    expectExit(first, 0);
+    assert.match(first.stderr, new RegExp(`replaced the stale lock ${escapeRegExp(lockRel('race'))}`));
+    assert.equal(postsFor(root, 'race').length, 1, 'exactly one run published the slug');
+    assert.equal(exists(root, '_drafts/race.md'), false);
+    assert.equal(exists(root, lockRel('race')), false, 'the lock is released');
+    assert.equal(exists(root, tokenRel('race')), false, 'the token is released');
+  });
+
+  await t.test('[AC-03][F-017] a run whose stale reading is overtaken by a live lock before it takes the token leaves that lock alone', () => {
+    const root = makeRoot();
+    const text = validArticle({ title: 'Overtaken' });
+    write(root, '_drafts/overtaken.md', text);
+    write(root, lockRel('overtaken'), goneRecord());
+    const live = `${process.pid} ${os.hostname()}\n`;
+    const out = path.join(root, '..', `${path.basename(root)}-overtake.json`);
+    const writeLive = `require('node:fs').writeFileSync(${JSON.stringify(abs(root, lockRel('overtaken')))}, ${
+      JSON.stringify(live)})`;
+    // Another run replaces the stale lock with its own, live one just before this run creates the token.
+    const result = cliWithFaults(root, [
+      { fn: 'openSync', path: tokenRel('overtaken'), action: 'run-tool', argv: ['-e', writeLive], cwd: root, out },
+    ], 'publish', 'overtaken');
+    assert.equal(ranMeanwhile(out, result).status, 0, 'the live lock was written');
+    expectExit(result, 1);
+    assert.match(result.stderr,
+      new RegExp(`another article\\.mjs run \\(process ${process.pid} on ${host}\\) is changing slug overtaken`));
+    assert.doesNotMatch(result.stderr, /replaced the stale lock/);
+    assert.equal(read(root, lockRel('overtaken')), live, 'the live lock is kept');
+    assert.equal(exists(root, tokenRel('overtaken')), false, 'the token is released');
+    assert.equal(read(root, '_drafts/overtaken.md'), text, 'the draft is untouched');
+    assert.deepEqual(postsFor(root, 'overtaken'), [], 'nothing is published');
+  });
+
+  await t.test('[AC-03][F-017] a reclaim token left by a stopped run, or held by a running one, refuses until it is deleted by hand', () => {
+    const cases = [
+      [goneRecord(), new RegExp(`${escapeRegExp(tokenRel('left'))} was left by process \\d+, which stopped while `
+        + `replacing the stale lock ${escapeRegExp(lockRel('left'))}`)],
+      [`${process.pid} ${os.hostname()}\n`, new RegExp(`another article\\.mjs run \\(process ${process.pid} on ${host}\\) `
+        + `is replacing the stale lock ${escapeRegExp(lockRel('left'))}`)],
+    ];
+    for (const [token, message] of cases) {
+      const root = makeRoot();
+      const text = validArticle({ title: 'Left token' });
+      write(root, '_drafts/left.md', text);
+      const stale = goneRecord();
+      write(root, lockRel('left'), stale);
+      write(root, tokenRel('left'), token);
+      const refused = cli(root, 'publish', 'left');
+      expectExit(refused, 1);
+      assert.match(refused.stderr, message);
+      assert.match(refused.stderr, new RegExp(`delete ${escapeRegExp(tokenRel('left'))}`));
+      assert.equal(read(root, tokenRel('left')), token, 'the token is never removed automatically');
+      assert.equal(read(root, lockRel('left')), stale, 'the stale lock stays while the token is taken');
+      assert.equal(read(root, '_drafts/left.md'), text, 'the draft is untouched');
+      assert.deepEqual(postsFor(root, 'left'), [], 'nothing is published');
+
+      fs.unlinkSync(abs(root, tokenRel('left')));
+      const retried = cli(root, 'publish', 'left');
+      expectExit(retried, 0);
+      assert.match(retried.stderr, new RegExp(`replaced the stale lock ${escapeRegExp(lockRel('left'))}`));
+      assert.equal(postsFor(root, 'left').length, 1, 'the retry publishes');
+      assert.equal(exists(root, lockRel('left')), false, 'the lock is released');
+      assert.equal(exists(root, tokenRel('left')), false, 'no token is left');
+    }
+  });
+
+  await t.test('[AC-03][F-017] a stale lock that cannot be removed refuses the run and releases the token', () => {
+    const root = makeRoot();
+    const text = validArticle({ title: 'Stuck lock' });
+    write(root, '_drafts/stuck.md', text);
+    const stale = goneRecord();
+    write(root, lockRel('stuck'), stale);
+    const result = cliWithFaults(root, [{ fn: 'unlinkSync', path: lockRel('stuck'), action: 'throw', code: 'EACCES' }],
+      'publish', 'stuck');
+    expectExit(result, 1);
+    assert.match(result.stderr, new RegExp(`publish failed: cannot replace the stale lock ${escapeRegExp(lockRel('stuck'))} `
+      + `\\(EACCES[^)]*\\); delete ${escapeRegExp(lockRel('stuck'))} by hand, then run publish again; nothing was changed`));
+    assert.equal(read(root, lockRel('stuck')), stale, 'the stale lock is kept');
+    assert.equal(exists(root, tokenRel('stuck')), false, 'the token is released');
+    assert.equal(read(root, '_drafts/stuck.md'), text, 'the draft is untouched');
+    assert.deepEqual(postsFor(root, 'stuck'), [], 'nothing is published');
+  });
+});
+
+test('[AC-03][F-017] publish never deletes an image saved into the empty draft image folder while it is removed', () => {
+  const root = makeRoot();
+  expectExit(cli(root, 'new', 'arrival'), 0);
+  const text = validArticle({ title: 'An image arrives late' });
+  write(root, '_drafts/arrival.md', text);
+  fs.mkdirSync(abs(root, 'assets/drafts/arrival/raw'));
+  const imageRel = 'assets/drafts/arrival/figure.png';
+  const LATE = 'image bytes saved as publish removed the empty folders';
+  // Saved after the emptiness check, as the deepest empty folder is removed.
+  const failed = cliWithFaults(root, [
+    { fn: 'rmdirSync', path: 'assets/drafts/arrival/raw', action: 'append-to-file', file: abs(root, imageRel), text: LATE },
+  ], 'publish', 'arrival');
+  expectExit(failed, 1);
+  assert.match(failed.stderr, /publish failed: assets\/drafts\/arrival\/ gained a file while publishing; it is kept/);
+  assert.match(failed.stderr, /every change was rolled back and nothing was moved/);
+  assert.equal(read(root, imageRel), LATE, 'the image saved meanwhile is kept');
+  assert.ok(fs.statSync(abs(root, 'assets/drafts/arrival/raw')).isDirectory(), 'the subfolder already removed is recreated');
+  assert.equal(read(root, '_drafts/arrival.md'), text, 'the draft is unchanged');
+  assert.deepEqual(postsFor(root, 'arrival'), [], 'nothing is published');
+  assert.equal(exists(root, 'assets/blog/arrival'), false, 'no published image folder');
+
+  expectExit(cli(root, 'publish', 'arrival'), 0);
+  assert.equal(postsFor(root, 'arrival').length, 1, 'the retry publishes');
+  assert.equal(read(root, 'assets/blog/arrival/figure.png'), LATE, 'the retry moves the image with the article');
+  assert.equal(exists(root, 'assets/drafts/arrival'), false, 'the draft image folder is gone');
+});
+
+test('[AC-03][F-017] publish and unpublish keep the article they retire as a backup, so a write through a file still open is never lost', async (t) => {
+  const LATE = '\nA late edit written through a file the editor kept open.\n';
+  const backupRel = (slug, command, n = 1) => `_drafts/.${slug}.${command}-backup${n > 1 ? `-${n}` : ''}`;
+  /**
+   * Opens `rel` for appending before `runTool` runs and writes `LATE` through
+   * that descriptor once the tool has exited, as an editor that kept the file
+   * open would; returns what `runTool` returned.
+   */
+  const writeAfterExit = (root, rel, runTool) => {
+    const fd = fs.openSync(abs(root, rel), 'a');
+    try {
+      const result = runTool();
+      fs.writeSync(fd, LATE);
+      return result;
+    } finally {
+      fs.closeSync(fd);
+    }
+  };
+  const keptMessage = (sourceRel, keptRel) => new RegExp(`Kept the checked ${escapeRegExp(sourceRel)} as `
+    + `${escapeRegExp(keptRel)} \\(git-ignored\\), in case a program still has it open; delete it once you no longer `
+    + 'need it\\.');
+  const lateMessage = (sourceRel, command, resultRel, keptRel) => new RegExp(`${escapeRegExp(sourceRel)} was written `
+    + `to through a file still open as ${command}ing finished: ${escapeRegExp(resultRel)} holds the checked text, `
+    + `and that later edit is in ${escapeRegExp(keptRel)};`);
+
+  await t.test('[AC-03][F-017] publish: a write through a descriptor held across the whole run lands in the backup', () => {
+    const root = makeRoot();
+    const text = writeDraftWithImage(root, 'open');
+    const result = writeAfterExit(root, '_drafts/open.md', () => cli(root, 'publish', 'open'));
+    expectExit(result, 0);
+    const [postFile] = postsFor(root, 'open');
+    assert.match(result.stdout, keptMessage('_drafts/open.md', backupRel('open', 'publish')));
+    assert.equal(read(root, `_posts/${postFile}`), text.split('/assets/drafts/open/').join('/assets/blog/open/'),
+      'the post is the checked text');
+    assert.equal(read(root, backupRel('open', 'publish')), text + LATE, 'the late write is kept in the backup');
+    assert.equal(exists(root, '_drafts/open.md'), false, 'the draft is retired');
+    assert.equal(exists(root, '_drafts/.open.publishing'), false, 'no set-aside copy is left');
+  });
+
+  await t.test('[AC-03][F-017] unpublish: a write through a descriptor held across the whole run lands in the backup, never under _posts/', () => {
+    const root = makeRoot();
+    const post = writePostWithImage(root, 'open');
+    const result = writeAfterExit(root, post.rel, () => cli(root, 'unpublish', 'open'));
+    expectExit(result, 0);
+    assert.match(result.stdout, keptMessage(post.rel, backupRel('open', 'unpublish')));
+    assert.equal(read(root, '_drafts/open.md'), post.text.split('/assets/blog/open/').join('/assets/drafts/open/'),
+      'the draft is the checked text');
+    assert.equal(read(root, backupRel('open', 'unpublish')), post.text + LATE, 'the late write is kept in the backup');
+    assert.deepEqual(list(root, '_posts'), [], 'nothing under _posts/ holds the late edit');
+    assert.equal(exists(root, '_drafts/.open.unpublishing'), false, 'no set-aside copy is left');
+  });
+
+  for (const command of ['publish', 'unpublish']) {
+    await t.test(`[AC-03][F-017] ${command}: writes after the check, before and after the backup is named, are kept and reported`, () => {
+      const root = makeRoot();
+      const source = command === 'publish'
+        ? { rel: '_drafts/between.md', text: writeDraftWithImage(root, 'between') }
+        : writePostWithImage(root, 'between');
+      const asideRel = `_drafts/.between.${command}ing`;
+      const result = cliWithFaults(root, [
+        { fn: 'linkSync', path: asideRel, action: 'append-to-file', file: abs(root, asideRel), text: LATE },
+        { fn: 'unlinkSync', path: asideRel, action: 'append-to-file', file: abs(root, asideRel), text: LATE },
+      ], command, 'between');
+      expectExit(result, 0);
+      const resultRel = command === 'publish' ? `_posts/${postsFor(root, 'between')[0]}` : '_drafts/between.md';
+      const checked = command === 'publish'
+        ? source.text.split('/assets/drafts/between/').join('/assets/blog/between/')
+        : source.text.split('/assets/blog/between/').join('/assets/drafts/between/');
+      assert.match(result.stderr, lateMessage(source.rel, command, resultRel, backupRel('between', command)));
+      assert.equal(read(root, resultRel), checked, `the ${command}ed file is the checked text`);
+      assert.equal(read(root, backupRel('between', command)), source.text + LATE + LATE, 'both late writes are kept');
+      assert.equal(exists(root, asideRel), false, 'no set-aside copy is left');
+    });
+  }
+
+  await t.test('[AC-03][F-017] publish: an earlier backup is never overwritten; the next free number is used', () => {
+    const root = makeRoot();
+    const text = writeDraftWithImage(root, 'again');
+    write(root, backupRel('again', 'publish'), 'an earlier backup');
+    const result = cli(root, 'publish', 'again');
+    expectExit(result, 0);
+    assert.match(result.stdout, keptMessage('_drafts/again.md', backupRel('again', 'publish', 2)));
+    assert.equal(read(root, backupRel('again', 'publish')), 'an earlier backup', 'nothing is overwritten');
+    assert.equal(read(root, backupRel('again', 'publish', 2)), text);
+  });
+
+  await t.test('[AC-03][F-017] publish: without hard links the set-aside copy is renamed to the backup and still receives the late write', () => {
+    const root = makeRoot();
+    const text = writeDraftWithImage(root, 'nolink');
+    const result = writeAfterExit(root, '_drafts/nolink.md', () => cliWithFaults(root,
+      [{ fn: 'linkSync', path: '_drafts/.nolink.publishing', action: 'throw', code: 'EPERM' }], 'publish', 'nolink'));
+    expectExit(result, 0);
+    assert.match(result.stdout, keptMessage('_drafts/nolink.md', backupRel('nolink', 'publish')));
+    assert.equal(read(root, backupRel('nolink', 'publish')), text + LATE, 'the late write is kept in the backup');
+    assert.equal(exists(root, '_drafts/.nolink.publishing'), false, 'no set-aside copy is left');
+  });
+
+  await t.test('[AC-03][F-017] publish: when no backup can be made, every step is undone and the open file is the draft again', () => {
+    const root = makeRoot();
+    const text = writeDraftWithImage(root, 'nobackup');
+    const failed = writeAfterExit(root, '_drafts/nobackup.md', () => cliWithFaults(root,
+      [{ fn: 'linkSync', path: '_drafts/.nobackup.publishing', action: 'throw', code: 'EIO' }], 'publish', 'nobackup'));
+    expectExit(failed, 1);
+    assert.match(failed.stderr, /publish failed: cannot keep the checked _drafts\/nobackup\.md as a backup \(EIO/);
+    assert.match(failed.stderr, /every change was rolled back and nothing was moved/);
+    assert.deepEqual(postsFor(root, 'nobackup'), [], 'nothing is published');
+    assert.equal(read(root, '_drafts/nobackup.md'), text + LATE, 'the restored draft is the file still open');
+    assert.deepEqual(list(root, '_drafts'), ['nobackup.md'], 'no backup or set-aside copy is left');
+  });
+
+  await t.test('[AC-03][F-017] unpublish: when every backup name is taken, every step is undone and the post is kept', () => {
+    const root = makeRoot();
+    const post = writePostWithImage(root, 'full');
+    for (let n = 1; n <= 99; n += 1) write(root, backupRel('full', 'unpublish', n), `backup ${n}`);
+    const failed = writeAfterExit(root, post.rel, () => cli(root, 'unpublish', 'full'));
+    expectExit(failed, 1);
+    assert.match(failed.stderr, new RegExp(`unpublish failed: cannot keep the checked ${escapeRegExp(post.rel)} as a `
+      + 'backup \\(every backup name from _drafts/\\.full\\.unpublish-backup to _drafts/\\.full\\.unpublish-backup-99 '
+      + 'is taken; delete the backups you no longer need\\)'));
+    assert.match(failed.stderr, /every change was rolled back and nothing was moved/);
+    assert.equal(read(root, post.rel), post.text + LATE, 'the restored post is the file still open');
+    assert.deepEqual(fs.readFileSync(abs(root, 'assets/blog/full/figure.png')), PNG, 'its image stays published');
+    assert.equal(exists(root, '_drafts/full.md'), false, 'no draft is left');
+    assert.equal(read(root, backupRel('full', 'unpublish', 99)), 'backup 99', 'no backup is overwritten');
+  });
+});
+
 /* guard --staged                                                            */
-/* ------------------------------------------------------------------------ */
 
 const HOOK_TEXT = '#!/bin/sh\nexec node scripts/article.mjs guard --staged\n';
 
@@ -2084,6 +2548,24 @@ test('[AC-03][F-017] guard --staged accepts a hook once its index mode is 100755
   expectExit(guardStaged(repo), 0);
 });
 
+test('[AC-03][F-017] the hook-mode remedy guard --staged prints fixes that hook when pasted, even one named with quotes and $(…)', GIT_CASE, () => {
+  const repo = makeRepo();
+  const hookRel = `.githooks/it's "a" $(touch marker) hook`;
+  write(repo, hookRel, HOOK_TEXT);
+  fs.chmodSync(abs(repo, hookRel), 0o644);
+  git(repo, 'add', '--', hookRel);
+  assert.equal(indexMode(repo, hookRel), '100644', 'staged as a plain file');
+
+  const refused = guardStaged(repo);
+  expectExit(refused, 1);
+  const remedy = /; run (git update-index --chmod=\+x -- .+)$/m.exec(refused.stderr);
+  assert.ok(remedy, `the refusal prints a remedy:\n${refused.stderr}`);
+  spawnOk('sh', ['-c', remedy[1]], { cwd: repo, env: ENV });
+  assert.equal(exists(repo, 'marker'), false, 'no $(…) in the path ran');
+  assert.equal(indexMode(repo, hookRel), '100755', 'the remedy reached git as that one path');
+  expectExit(guardStaged(repo), 0);
+});
+
 test('[AC-03][F-017] guard --staged judges the index, not the working tree: article text, image existence and image folders', GIT_CASE, async (t) => {
   const postRel = `_posts/${PAST}-diverge.md`;
   const imageRel = 'assets/blog/diverge/fig.png';
@@ -2200,9 +2682,7 @@ test('[AC-03][F-017] guard --staged judges the index, not the working tree: arti
   });
 });
 
-/* ------------------------------------------------------------------------ */
 /* guard --pre-push                                                          */
-/* ------------------------------------------------------------------------ */
 
 test('[AC-03][F-017] guard --pre-push refuses a range in which one commit adds a draft and a later one deletes it', GIT_CASE, () => {
   const { repo, remote } = makeRemoteRepo();
@@ -2243,8 +2723,8 @@ test('[AC-03][F-017] guard --pre-push refuses a commit that deletes a post but l
     assert.match(result.stderr, /assets\/blog\/gone/);
   });
 
-  // Every pushed commit is published, so a later commit that removes the
-  // folder does not make the orphaning commit acceptable.
+  // Every pushed commit becomes public in repository history, so a later
+  // commit that removes the folder does not make the orphaning commit acceptable.
   await t.test('[AC-03][F-017] guard --pre-push refuses even when a later commit in the range removes the folder', GIT_CASE, () => {
     const { repo, remote, remoteSha } = orphanedRepo();
     git(repo, 'rm', '-q', '-r', 'assets/blog/gone');
@@ -2343,9 +2823,7 @@ test('[AC-03][F-017] guard --pre-push accepts an empty push, checking no commit,
   });
 });
 
-/* ------------------------------------------------------------------------ */
 /* Article analyses reused by blob id                                        */
-/* ------------------------------------------------------------------------ */
 
 test('[AC-03][F-017] guard --pre-push checks a recurring article blob in every commit, refusing only the one lacking its image', GIT_CASE, () => {
   const { repo, remote } = makeRemoteRepo();
@@ -2380,6 +2858,205 @@ test('[AC-03][F-017] guard --pre-push checks a recurring article blob in every c
   assert.deepEqual(reported, [`error: ${tip}: ${postRel}:7: image /assets/blog/recurring/fig.png does not exist`],
     'the blob passes in the commits that hold its image and fails only in the one that does not');
   assert.match(result.stderr, /push refused \(1 problem in 1 commit\)/);
+});
+
+/**
+ * Stages `text` as a regular file at a path given as bytes, through
+ * `git update-index -z --index-info`, so a case can use a name that is not
+ * valid UTF-8 whatever the filesystem (APFS and NTFS refuse to create one).
+ *
+ * @param {string} repo The repository.
+ * @param {Buffer} pathBytes The repository-relative path, exactly as git stores it.
+ * @param {string} text The file's content.
+ */
+function stageAtBytes(repo, pathBytes, text) {
+  const blob = spawnOk('git', ['hash-object', '-w', '--stdin'], { cwd: repo, env: ENV, input: text }).stdout.trim();
+  spawnOk('git', ['update-index', '-z', '--index-info'], {
+    cwd: repo,
+    env: ENV,
+    input: Buffer.concat([Buffer.from(`100644 ${blob}\t`), pathBytes, Buffer.from([0])]),
+  });
+}
+
+test('[AC-03][F-017] guard refuses byte-distinct paths that are not valid UTF-8, so neither hides the other', GIT_CASE, async (t) => {
+  // Decoded lossily, both names read `_posts/\uFFFD/…-twin.md`, and the valid
+  // twin's blob would be checked in place of the one holding `published:`.
+  const twinPath = (byte) => Buffer.concat([
+    Buffer.from('_posts/'), Buffer.from([byte]), Buffer.from(`/${PAST}-twin.md`),
+  ]);
+  const stageTwins = (repo) => {
+    stageAtBytes(repo, twinPath(0x80), validArticle({ extra: 'published: false' }));
+    stageAtBytes(repo, twinPath(0x81), validArticle());
+  };
+  const refusal = new RegExp(`^error: the git record "[^"\\n]*\\\\t_posts/\\\\200/${PAST}-twin\\.md" `
+    + 'is not valid UTF-8; .*rename it to a valid UTF-8 name$', 'm');
+
+  await t.test('[AC-03][F-017] guard --staged refuses the staged twins, naming the first as git quotes it', GIT_CASE, () => {
+    const repo = makeRepo();
+    stageTwins(repo);
+    const result = guardStagedUnchanged(repo);
+    expectExit(result, 1);
+    assert.match(result.stderr, refusal);
+    assert.match(result.stderr, /refuses \(fail closed\)/);
+    assert.equal(result.stdout, '');
+  });
+
+  await t.test('[AC-03][F-017] guard --pre-push refuses a pushed commit holding the twins', GIT_CASE, () => {
+    const { repo, remote } = makeRemoteRepo();
+    const remoteSha = git(repo, 'rev-parse', 'HEAD');
+    stageTwins(repo);
+    commit(repo, 'Add byte-distinct twins');
+    const result = prePushUnchanged({ repo, remote }, 'refs/heads/main', 'refs/heads/main', remoteSha);
+    expectExit(result, 1);
+    assert.match(result.stderr, refusal);
+    assert.equal(result.stdout, '');
+  });
+});
+
+test('[AC-03][F-017] guard reads valid UTF-8 paths exactly: a non-ASCII post folder and a name led by a byte-order mark', GIT_CASE, async (t) => {
+  const postRel = `_posts/café/${PAST}-ok.md`;
+  // Not an article: with its byte-order mark dropped it would read as one.
+  const markedRel = `\uFEFF_posts/${PAST}-ok.md`;
+  const stageBoth = (repo) => {
+    write(repo, postRel, validArticle());
+    write(repo, markedRel, 'Notes kept outside the posts.\n');
+    git(repo, 'add', postRel, markedRel);
+  };
+
+  await t.test('[AC-03][F-017] guard --staged accepts them, checking the one article', GIT_CASE, () => {
+    const repo = makeRepo();
+    stageBoth(repo);
+    const result = guardStagedUnchanged(repo);
+    expectExit(result, 0);
+    assert.equal(result.stdout, 'guard: staged tree ok (1 changed article checked)\n');
+  });
+
+  await t.test('[AC-03][F-017] guard --pre-push accepts a commit adding them', GIT_CASE, () => {
+    const { repo, remote } = makeRemoteRepo();
+    const remoteSha = git(repo, 'rev-parse', 'HEAD');
+    stageBoth(repo);
+    commit(repo, 'Publish: ok');
+    const result = prePushUnchanged({ repo, remote }, 'refs/heads/main', 'refs/heads/main', remoteSha);
+    expectExit(result, 0);
+    assert.equal(result.stdout, 'guard: ok (1 commit checked)\n');
+  });
+});
+
+/**
+ * Stages a symbolic link to `target` at `rel` through `git update-index
+ * --cacheinfo`, recording it as `git add` would, without creating it on disk
+ * (where symbolic links can need privileges or `core.symlinks` is off).
+ */
+function stageSymlink(repo, rel, target) {
+  const blob = spawnOk('git', ['hash-object', '-w', '--stdin'], { cwd: repo, env: ENV, input: target }).stdout.trim();
+  git(repo, 'update-index', '--add', '--cacheinfo', `120000,${blob},${rel}`);
+}
+
+/** Stages a submodule (gitlink) at `rel` pointing at the repository's own `HEAD` commit. */
+function stageGitlink(repo, rel) {
+  git(repo, 'update-index', '--add', '--cacheinfo', `160000,${git(repo, 'rev-parse', 'HEAD')},${rel}`);
+}
+
+/**
+ * The `error: ` lines of a guard run without that prefix and, given the
+ * commit's short id `short`, without the `<short>: ` that `guard --pre-push` adds.
+ */
+function guardErrors(result, short = '') {
+  return result.stderr.split('\n').filter((line) => line.startsWith('error: '))
+    .map((line) => line.slice('error: '.length))
+    .map((line) => (short !== '' && line.startsWith(`${short}: `) ? line.slice(short.length + 2) : line));
+}
+
+test('[AC-03][F-017] guard checks an article path that changes type and refuses one that is not a regular file anywhere in the tree', GIT_CASE, async (t) => {
+  const rel = `_posts/${PAST}-typed.md`;
+  const hidden = validArticle({ extra: 'published: false' });
+  const writeHidden = (repo) => {
+    write(repo, rel, hidden);
+    git(repo, 'add', rel);
+  };
+  const writeValid = (repo) => {
+    write(repo, rel, validArticle());
+    git(repo, 'add', rel);
+  };
+  const publishedKey = new RegExp(`^${escapeRegExp(rel)}: published: `);
+  const isLink = new RegExp(`^${escapeRegExp(rel)}: a symbolic link cannot be an article$`);
+  const isSubmodule = new RegExp(`^${escapeRegExp(rel)}: a submodule cannot be an article$`);
+  // `before` is committed (and, for guard --pre-push, already on the remote);
+  // `change` is what the commit or push being judged adds. Each case is
+  // refused with exactly the one error `expect` matches.
+  const cases = [
+    {
+      name: 'a symbolic link that becomes a regular file holding published: false',
+      before: (repo) => stageSymlink(repo, rel, 'elsewhere.md'),
+      change: writeHidden,
+      expect: publishedKey,
+    },
+    {
+      name: 'a submodule that becomes a regular file holding published: false',
+      before: (repo) => stageGitlink(repo, rel),
+      change: writeHidden,
+      expect: publishedKey,
+    },
+    {
+      name: 'a regular file that becomes a symbolic link',
+      before: writeValid,
+      change: (repo) => stageSymlink(repo, rel, 'elsewhere.md'),
+      expect: isLink,
+    },
+    {
+      name: 'a regular file that becomes a submodule',
+      before: writeValid,
+      change: (repo) => stageGitlink(repo, rel),
+      expect: isSubmodule,
+    },
+    {
+      name: 'an unchanged symbolic link article beside a valid new post',
+      before: (repo) => stageSymlink(repo, rel, 'elsewhere.md'),
+      change: (repo) => {
+        write(repo, `_posts/${PAST}-fresh.md`, validArticle({ title: 'Fresh' }));
+        git(repo, 'add', `_posts/${PAST}-fresh.md`);
+      },
+      expect: isLink,
+    },
+  ];
+
+  for (const { name, before, change, expect } of cases) {
+    await t.test(`[AC-03][F-017] guard --staged refuses ${name}`, GIT_CASE, () => {
+      const repo = makeRepo();
+      before(repo);
+      commit(repo, 'Before');
+      change(repo);
+      const result = guardStagedUnchanged(repo);
+      expectExit(result, 1);
+      const errors = guardErrors(result);
+      assert.equal(errors.length, 1, `exactly one error:\n${result.stderr}`);
+      assert.match(errors[0], expect);
+    });
+
+    await t.test(`[AC-03][F-017] guard --pre-push refuses ${name}`, GIT_CASE, () => {
+      const { repo, remote } = makeRemoteRepo((r) => {
+        before(r);
+        commit(r, 'Before');
+      });
+      const remoteSha = git(repo, 'rev-parse', 'HEAD');
+      change(repo);
+      commit(repo, 'Change');
+      const result = prePushUnchanged({ repo, remote }, 'refs/heads/main', 'refs/heads/main', remoteSha);
+      expectExit(result, 1);
+      const errors = guardErrors(result, git(repo, 'rev-parse', 'HEAD').slice(0, 7));
+      assert.equal(errors.length, 1, `exactly one error:\n${result.stderr}`);
+      assert.match(errors[0], expect);
+    });
+  }
+
+  await t.test('[AC-03][F-017] guard accepts a symbolic link outside the article folders', GIT_CASE, () => {
+    const { repo, remote } = makeRemoteRepo();
+    const remoteSha = git(repo, 'rev-parse', 'HEAD');
+    stageSymlink(repo, 'notes/latest.md', '../README.md');
+    expectExit(guardStagedUnchanged(repo), 0);
+    commit(repo, 'Link the notes');
+    expectExit(prePushUnchanged({ repo, remote }, 'refs/heads/main', 'refs/heads/main', remoteSha), 0);
+  });
 });
 
 test('[AC-03][F-017] checkTrackedContent reuses a cached analysis per id across trees and redoes it for changed text', async () => {
@@ -2439,9 +3116,7 @@ test('[AC-03][F-017] checkTrackedContent reuses a cached analysis per id across 
   }
 });
 
-/* ------------------------------------------------------------------------ */
 /* guard when git itself does not answer                                     */
-/* ------------------------------------------------------------------------ */
 
 /** The shim is a POSIX shell script, which Windows cannot run as `git`. */
 const SHIM_CASE = { ...GIT_CASE, skip: process.platform === 'win32' ? 'the git shim needs a POSIX shell' : false };

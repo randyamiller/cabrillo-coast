@@ -5,39 +5,16 @@ description: Technical articles from Cabrillo Coast on software architecture, te
 search: true
 ---
 {%- comment -%}
-  Blog listing, rendered by Jekyll to /blog/ (page.url is /blog/, which the header include uses
-  to mark the Blog link as the current page). The blog layout supplies the whole document:
-  head, policy, chrome, the main element and both scripts (search.js because search is true).
-  This file supplies only what goes inside main, so it holds no html, head, main, header,
-  footer or script markup.
+  data-url is post.url passed through relative_url, the same string search.json writes as each
+  entry's url, so search.js joins list items to index entries under any base path.
 
-  Two states, decided by whether site.posts is empty:
-    - No published articles (the launch state): only the section head and the empty-state
-      paragraph. No search form and no list, because a search control over nothing does
-      nothing. The launch-state test asserts both are absent.
-    - One or more articles: the search form, then the ordered list, newest first in
-      site.posts order, on a single page. There is no pagination: in-page search needs every
-      item present.
+  The form ships with the hidden attribute, so visitors without JavaScript see the full list
+  rather than a control that does nothing; search.js removes it once it can run.
 
-  Contracts other files rely on:
-    - search.js finds the form, its input and its status line by id, reads the index URL
-      from the form's data-index attribute, and joins each list item to its index entry on
-      data-url. data-url is post.url passed through relative_url, the same string the index
-      writes as each entry's url, so the join holds under any base path; escape leaves slug
-      URLs unchanged.
-    - The form carries the hidden attribute in the source and keeps it without JavaScript,
-      so visitors without scripts see the complete list rather than a control that does
-      nothing. search.js removes it once it can run. Submitting it without scripts is a GET
-      to /blog/ that lists every article.
-    - Tag markup and the date format match the article layout, so blog.css styles both pages
-      with the same rules. Summaries are shown in full; the schema caps them at 200 characters.
+  One page, no pagination: in-page search needs every item present.
 
-  Every printed front-matter value passes through escape, and every internal URL through
-  relative_url, so the page works on the custom domain and under a project path alike.
-  The blog policy blocks inline scripts, inline event-handler attributes and javascript: URLs.
-  It permits inline styles only because kramdown writes table-alignment style attributes into
-  articles. By convention this listing adds no inline script, event handler or inline style.
-  Keep braces out of this comment, because Liquid would read them as markup.
+  The blog policy permits inline styles only because kramdown writes table-alignment style
+  attributes into articles. This listing adds none.
 {%- endcomment -%}
 <section class="section blog-index">
   <div class="container">
@@ -58,7 +35,7 @@ search: true
 {%- for post in site.posts %}
       <li class="card post-card" data-url="{{ post.url | relative_url | escape }}">
         <h2><a href="{{ post.url | relative_url | escape }}">{{ post.title | escape }}</a></h2>
-        <p class="post-meta"><time datetime="{{ post.date | date: '%Y-%m-%d' }}">{{ post.date | date: '%B %-d, %Y' }}</time></p>
+        <p class="post-meta"><time datetime="{{ post.date | date: '%Y-%m-%d' | escape }}">{{ post.date | date: '%B %-d, %Y' | escape }}</time></p>
         <p class="post-summary">{{ post.summary | escape }}</p>
         {%- if post.tags.size > 0 %}
         <ul class="tag-list" aria-label="Tags">{% for tag in post.tags %}<li><a class="tag-link" href="{{ '/blog/' | relative_url }}?q={{ tag | url_encode }}">{{ tag | escape }}</a></li>{% endfor %}</ul>

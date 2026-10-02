@@ -93,6 +93,9 @@ prints `Visual comparison skipped: base <commit> has no _layouts/post.html`, tak
 screenshots and still exits 0. Look for that line before counting a pass as a visual
 comparison.
 
+The fixture builds are removed after every run. To inspect them after a failure, add
+`--keep-fixtures`; the run then prints the folder it kept.
+
 Never set `JEKYLL_ENV=production` locally: without a Pages API token, a production
 build derives the wrong base path (`/pages/randyamiller/cabrillo-coast`).
 
@@ -145,7 +148,10 @@ Do the [one-time setup](#one-time-setup) first, including
 4. **Publish.** `node scripts/article.mjs publish <slug>` re-runs the check, moves the
    draft to `_posts/<UTC date>-<slug>.md`, moves its images to `assets/blog/<slug>/`
    and rewrites their paths. An empty image folder is deleted instead, so an article
-   without images gets no image folder.
+   without images gets no image folder. The draft it retires is kept as the
+   git-ignored backup `_drafts/.<slug>.publish-backup` (numbered when that name is
+   taken), so an edit written late by an editor that still has the draft open is not
+   lost; `publish` names the backup, and you delete it once you no longer need it.
 5. **Verify.** `node scripts/verify.mjs`. Exit code 0 means every check passed, but
    the visual comparison may have been skipped; see [Checks](#checks).
 6. **Release.** Run the rest of the commands `publish` printed under `Next:`, from the
@@ -155,7 +161,7 @@ Do the [one-time setup](#one-time-setup) first, including
    are:
 
    ```bash
-   git add _posts/2026-10-01-kubernetes-upgrades.md assets/blog/kubernetes-upgrades
+   git add -- _posts/2026-10-01-kubernetes-upgrades.md assets/blog/kubernetes-upgrades
    git commit -m "Publish: Upgrading Kubernetes without downtime"
    git push origin main
    ```
@@ -164,7 +170,7 @@ Do the [one-time setup](#one-time-setup) first, including
    folder:
 
    ```bash
-   git add _posts/2026-10-01-kubernetes-upgrades.md
+   git add -- _posts/2026-10-01-kubernetes-upgrades.md
    ```
 
    The hooks run `guard`, Pages rebuilds, and the article goes live (see
@@ -232,7 +238,11 @@ While drafting, keep images in `assets/drafts/<slug>/` and reference them like t
 
 Alt text is required. Images must be local files in the article's own folder;
 external and `data:` images are rejected by `check` and blocked by the blog's
-Content-Security-Policy.
+Content-Security-Policy. `check` applies these rules to the `src` and `alt` the page
+will render, including values set by kramdown attribute lists such as `{: alt="…"}`.
+Use a single `src`: `srcset` is not supported. Write image paths with plain
+characters: character references (`&…;`), malformed percent-encoding and control
+characters are refused.
 
 #### Code and links
 
@@ -259,9 +269,10 @@ Content-Security-Policy.
 `node scripts/article.mjs unpublish <slug>` refuses while other articles still
 reference the post (a `post_url` tag or a link to `/blog/<slug>/`) and lists each file
 and line. Repoint or remove those references first. Otherwise it moves the post back
-to `_drafts/<slug>.md` and any images back to `assets/drafts/<slug>/`. Then commit the
-deletions and push (it prints the commands). The next build removes the page, its
-search entry and its images.
+to `_drafts/<slug>.md` and any images back to `assets/drafts/<slug>/`, and keeps the
+post it retired as the git-ignored backup `_drafts/.<slug>.unpublish-backup` for you
+to delete. Then commit the deletions and push (it prints the commands). The next
+build removes the page, its search entry and its images.
 
 Unpublishing ends current publication only: everything already pushed stays readable
 in git history.

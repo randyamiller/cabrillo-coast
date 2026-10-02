@@ -37,9 +37,14 @@
  * exit 1, and `new` warns.
  *
  * Changing files: `new`, `publish` and `unpublish` hold a per-slug lock,
- * `_drafts/.<slug>.lock`, while they change files, and undo every completed
- * step when a later one fails, so a failed run leaves the files as it found
- * them and can simply be run again.
+ * `_drafts/.<slug>.lock`, while they change files; a competing run for the
+ * same slug is refused and must be run again. `publish` and `unpublish` never
+ * delete the article they retire: it stays in the git-ignored
+ * `_drafts/.<slug>.<command>-backup` (numbered when taken) for the author to
+ * delete. When a step fails, they try to undo the completed steps, newest
+ * first, and each undo first checks that it removes no content the run did
+ * not write. An undo that cannot complete is reported with the paths to
+ * repair by hand; empty folders made on the way may remain.
  *
  * Exit codes: 0 success, 1 validation failure (details on stderr), 2 usage
  * error. Unwrapped Liquid inside code is a warning and never changes the
@@ -127,15 +132,13 @@ class UsageError extends Error {}
 /** A git command that failed; `guard` treats it as a refusal (fail closed). */
 class GitError extends Error {}
 
-/** The article being moved was edited or removed while `publish` or `unpublish` ran; its message says which. */
+/** The article or image folder being moved was changed while `publish` or `unpublish` ran; its message says which. */
 class SourceChanged extends Error {}
 
-/** Progress and next-step commands go to stdout. */
 function say(message = '') {
   process.stdout.write(`${message}\n`);
 }
 
-/** Findings and failures go to stderr, prefixed `error: `. */
 function fail(message) {
   process.stderr.write(`error: ${message}\n`);
 }
@@ -158,6 +161,17 @@ function plural(count, word) {
 function shellQuote(text) {
   if (/^[^"$`\\!]*$/.test(text)) return `"${text}"`;
   return `'${text.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * A repository-relative path as one argument of a printed next-step command.
+ * A path of only letters, digits, `.`, `_`, `/` and `-` that does not start
+ * with `-` is printed as it is; any other is quoted with `shellQuote`, so a
+ * nested `_posts/` folder whose name holds a space, a quote or `$(…)` is
+ * neither split nor run when the command is pasted into a POSIX shell.
+ */
+function shellPath(relPath) {
+  return /^(?!-)[A-Za-z0-9._/-]+$/.test(relPath) ? relPath : shellQuote(relPath);
 }
 
 /**
@@ -247,11 +261,73 @@ function containsFiles(absDir) {
 }
 
 /**
+ * The first component of the repository-relative `relPath` through which a
+ * read or write could leave the root or land in another folder, or `null`
+ * when there is none. Every component below the root is read with `lstat`,
+ * so no link is followed: a symbolic link is returned with reason `link`, and
+ * so is the last component when it exists but is not what `leaf` asks for,
+ * with reason `type`. The root itself may be a link (macOS `/var`); once
+ * every component below it is a real folder, `relPath` resolves inside the
+ * root's real path. A missing component ends the walk, as does one below a
+ * component that is not a folder (`ENOTDIR`): nothing can exist there, and
+ * creating anything there fails before it writes.
+ *
+ * @param {string} root Absolute repository root.
+ * @param {string} relPath Repository-relative POSIX path; a trailing `/` is ignored.
+ * @param {'folder' | 'file'} leaf What the last component must be when it exists.
+ * @returns {{ rel: string, reason: 'link' | 'type', must: string } | null} `must` names what
+ *   `rel` has to be, for a message.
+ * @throws {Error} when a component cannot be read, such as `EACCES`.
+ */
+function firstUnconfined(root, relPath, leaf) {
+  const segments = relPath.split('/').filter((segment) => segment !== '');
+  for (let i = 0; i < segments.length; i += 1) {
+    const rel = segments.slice(0, i + 1).join('/');
+    const last = i === segments.length - 1;
+    const must = last && leaf === 'file' ? 'a regular file' : 'a real folder';
+    const stat = statOrUndefined(inRoot(root, rel), false);
+    if (stat === undefined) return null;
+    if (stat.isSymbolicLink()) return { rel, reason: 'link', must };
+    if (last && !(leaf === 'file' ? stat.isFile() : stat.isDirectory())) return { rel, reason: 'type', must };
+  }
+  return null;
+}
+
+/** Why `relPath` is not confined (see `firstUnconfined`), as a message, or `null` when it is. */
+function confinementProblem(root, relPath, leaf) {
+  const found = firstUnconfined(root, relPath, leaf);
+  if (found === null) return null;
+  let what = 'a symbolic link';
+  if (found.reason === 'type') what = found.must === 'a regular file' ? 'not a regular file' : 'not a folder';
+  return `${found.rel} is ${what}; it must be ${found.must} inside the repository`;
+}
+
+/** Every symbolic link below the real folder `relDir`, searched recursively without following any, sorted. */
+function linksBelow(root, relDir) {
+  const links = [];
+  const entries = fs.readdirSync(inRoot(root, relDir), { withFileTypes: true });
+  entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  for (const entry of entries) {
+    const child = `${relDir}/${entry.name}`;
+    if (entry.isSymbolicLink()) links.push(child);
+    else if (entry.isDirectory()) links.push(...linksBelow(root, child));
+  }
+  return links;
+}
+
+/**
  * Every `*.md` regular file under `folder` (repository-relative), searched
  * recursively, as sorted repository-relative POSIX paths. A missing folder
- * yields `[]`.
+ * yields `[]`. No symbolic link is followed or listed, `folder` itself
+ * included; each one met is added to `links` when the caller passes an
+ * array, so the caller can report it.
+ *
+ * @param {string} root Absolute repository root.
+ * @param {string} folder Repository-relative folder, such as `_posts`.
+ * @param {string[]} [links] Receives the repository-relative path of every symbolic link met.
+ * @returns {string[]}
  */
-function listMarkdown(root, folder) {
+function listMarkdown(root, folder, links) {
   const found = [];
   const visit = (relDir) => {
     let entries;
@@ -264,20 +340,30 @@ function listMarkdown(root, folder) {
     entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     for (const entry of entries) {
       const child = `${relDir}/${entry.name}`;
-      if (entry.isDirectory()) visit(child);
+      if (entry.isSymbolicLink()) links?.push(child);
+      else if (entry.isDirectory()) visit(child);
       else if (entry.isFile() && entry.name.endsWith('.md')) found.push(child);
     }
   };
-  visit(folder);
+  if (statOrUndefined(inRoot(root, folder), false)?.isSymbolicLink()) links?.push(folder);
+  else visit(folder);
   return found;
 }
 
-/** Posts under `_posts/` (recursively) whose filename is `<date>-<slug>.md`. */
-function findPosts(root, slug) {
-  return listMarkdown(root, '_posts').filter((rel) => {
+/**
+ * Posts under `_posts/` (recursively) whose filename is `<date>-<slug>.md`.
+ * Symbolic links with such a name are not posts; they are added to `links`
+ * when the caller passes an array.
+ */
+function findPosts(root, slug, links) {
+  const isPost = (rel) => {
     const m = POST_FILE_RE.exec(path.posix.basename(rel));
     return m !== null && m[2] === slug;
-  });
+  };
+  const met = [];
+  const posts = listMarkdown(root, '_posts', met).filter(isPost);
+  links?.push(...met.filter(isPost));
+  return posts;
 }
 
 /** Drafts under `_drafts/` (recursively) named `<slug>.md`. */
@@ -286,12 +372,82 @@ function findDrafts(root, slug) {
 }
 
 /**
+ * Refuses `new`, `publish` or `unpublish` of `slug` unless every path it
+ * reads, creates or moves is confined (see `firstUnconfined`): `_drafts/`
+ * with the slug's lock, draft and set-aside copy, `_posts/` and, for
+ * `unpublish`, the slug's post with its folders, `assets/drafts/<slug>/`,
+ * `assets/blog/<slug>/` and, for `new`, `_templates/article.md`. A folder
+ * aliased by a symbolic link would otherwise put a draft, its lock or its
+ * images in a folder git publishes, or outside the root; a linked source
+ * file would be read from wherever it points. `publish` also refuses links
+ * inside the draft image folder, as git would commit the link instead of the
+ * image. Each command runs this before taking the lock and again under it,
+ * before its first change. Returns `false` once the refusal is reported.
+ *
+ * @param {string} root Absolute repository root.
+ * @param {'new' | 'publish' | 'unpublish'} command The command about to change files.
+ * @param {string} slug A valid slug.
+ * @returns {boolean}
+ */
+function pathsConfined(root, command, slug) {
+  const draftImagesRel = `assets/drafts/${slug}`;
+  // The lock path is the one acquireSlugLock creates.
+  const checks = [
+    [`_drafts/.${slug}.lock`, 'file'],
+    [`_drafts/${slug}.md`, 'file'],
+    ['_posts', 'folder'],
+    [draftImagesRel, 'folder'],
+  ];
+  if (command === 'new') checks.push(['_templates/article.md', 'file']);
+  else checks.push([asideRelFor(slug, command), 'file'], [`assets/blog/${slug}`, 'folder']);
+  const problems = new Set();
+  try {
+    for (const [rel, leaf] of checks) {
+      const problem = confinementProblem(root, rel, leaf);
+      if (problem !== null) problems.add(problem);
+    }
+    if (command === 'unpublish' && problems.size === 0) {
+      const links = [];
+      for (const post of findPosts(root, slug, links)) {
+        const problem = confinementProblem(root, post, 'file');
+        if (problem !== null) problems.add(problem);
+      }
+      for (const link of links) {
+        problems.add(`${link} is a symbolic link; it must be a regular file inside the repository`);
+      }
+    }
+    if (command === 'publish' && problems.size === 0 && isRealDirectory(inRoot(root, draftImagesRel))) {
+      for (const link of linksBelow(root, draftImagesRel)) {
+        problems.add(`${link} is a symbolic link; images must be regular files in real folders, `
+          + 'as git would commit the link instead of the image');
+      }
+    }
+  } catch (err) {
+    fail(`${command} failed: cannot check the paths it uses (${err.message}); nothing was changed`);
+    return false;
+  }
+  if (problems.size === 0) return true;
+  for (const problem of problems) fail(problem);
+  fail(`${command} refused: it uses only real folders and regular files inside the repository, never a `
+    + 'symbolic link, which could lead outside it or into a folder git publishes; fix the '
+    + `${problems.size === 1 ? 'path' : 'paths'} above, then run ${command} again; nothing was changed`);
+  return false;
+}
+
+/**
  * `imageExists` for `validateArticle`: maps a root-relative public path such
  * as `/assets/drafts/foo/fig.png` to the file `<root>/assets/drafts/foo/fig.png`.
  * A path with `.`, `..` or empty segments, or one that would resolve outside
- * the root, never exists; neither does a folder.
+ * the root, never exists; neither does a folder, nor a file reached through
+ * a symbolic link: GitHub Pages does not follow links, and git would commit
+ * the link instead of the image. Each such link is added to `links` when the
+ * caller passes an array.
+ *
+ * @param {string} root Absolute repository root.
+ * @param {string[]} [links] Receives the repository-relative path of each symbolic link that hides an image.
+ * @returns {(publicPath: string) => boolean}
  */
-function makeImageExists(root) {
+function makeImageExists(root, links) {
   return (publicPath) => {
     if (typeof publicPath !== 'string' || !publicPath.startsWith('/') || publicPath.includes('\0')) return false;
     const segments = publicPath.slice(1).split('/');
@@ -302,7 +458,9 @@ function makeImageExists(root) {
       return false;
     }
     try {
-      return isFile(target);
+      const found = firstUnconfined(root, segments.join('/'), 'file');
+      if (found?.reason === 'link') links?.push(found.rel);
+      return found === null && pathExists(target);
     } catch {
       return false;
     }
@@ -368,16 +526,22 @@ function checkText(root, relPath, kind, today, text) {
   for (const message of parseErrors) errors.push(`${relPath}: ${message}`);
   // The body is the exact suffix of the text, so this is the file line on which it starts.
   const bodyStartLine = text.slice(0, text.length - body.length).split('\n').length;
+  const imageLinks = [];
   const articleErrors = validateArticle({
     path: relPath,
     data,
     body,
     kind,
     todayUtc: today,
-    imageExists: makeImageExists(root),
+    imageExists: makeImageExists(root, imageLinks),
     bodyStartLine,
   });
   for (const message of articleErrors) errors.push(message);
+  // Says why an image that is on disk was reported missing.
+  for (const link of new Set(imageLinks)) {
+    errors.push(`${relPath}: ${link} is a symbolic link, so the images through it count as missing; images must `
+      + 'be regular files in real folders inside the repository');
+  }
   for (const message of slugConflicts(root, relPath, kind)) errors.push(message);
   for (const finding of scanUnsafeMarkup(body)) {
     errors.push(`${relPath}:${bodyStartLine + finding.line - 1}: unsafe markup "${finding.text}"`);
@@ -478,9 +642,65 @@ function git(cwd, args, input) {
   return result.stdout;
 }
 
-/** Splits `-z` output into its NUL-terminated records, decoded as UTF-8. */
+/**
+ * Decodes UTF-8 exactly: an invalid byte is an error rather than U+FFFD, and
+ * a leading byte-order mark stays part of the text rather than being dropped.
+ */
+const STRICT_UTF8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+
+/** The C escapes git uses when it quotes a path, by byte. */
+const GIT_QUOTE_ESCAPES = new Map([
+  [0x07, 'a'], [0x08, 'b'], [0x09, 't'], [0x0a, 'n'], [0x0b, 'v'], [0x0c, 'f'], [0x0d, 'r'],
+  [0x22, '"'], [0x5c, '\\'],
+]);
+
+/**
+ * Bytes quoted as `git status` quotes a path (`core.quotePath`, the default):
+ * printable ASCII as is, every other byte as a C or octal escape, so a name
+ * that is not valid UTF-8 is shown exactly and matches git's own output.
+ */
+function gitQuote(bytes) {
+  let quoted = '';
+  for (const byte of bytes) {
+    if (GIT_QUOTE_ESCAPES.has(byte)) quoted += `\\${GIT_QUOTE_ESCAPES.get(byte)}`;
+    else if (byte >= 0x20 && byte < 0x7f) quoted += String.fromCharCode(byte);
+    else quoted += `\\${byte.toString(8).padStart(3, '0')}`;
+  }
+  return `"${quoted}"`;
+}
+
+/**
+ * Decodes bytes git printed as UTF-8, refusing any that are not valid UTF-8.
+ * Git prints path bytes unchanged, and a lossy decoding gives byte-distinct
+ * paths one name, so that one index or tree entry would hide another from
+ * every check; such a name therefore makes `guard` refuse (fail closed).
+ *
+ * @param {Buffer} bytes Git's output.
+ * @param {string} what What the bytes are, as the error names them.
+ * @param {string} remedy What the author must do, as the error states it.
+ * @throws {GitError} quoting the bytes as git does, when they are not valid UTF-8.
+ */
+function decodeGitText(bytes, what, remedy) {
+  try {
+    return STRICT_UTF8.decode(bytes);
+  } catch {
+    throw new GitError(`${what} ${gitQuote(bytes)} is not valid UTF-8; ${remedy}`);
+  }
+}
+
+/** Splits `-z` output into its NUL-terminated records, each decoded by `decodeGitText`. */
 function splitNul(buffer) {
-  return buffer.toString('utf8').split('\0').filter((record) => record !== '');
+  const records = [];
+  for (let start = 0; start < buffer.length;) {
+    const nul = buffer.indexOf(0, start);
+    const end = nul === -1 ? buffer.length : nul;
+    if (end > start) {
+      records.push(decodeGitText(buffer.subarray(start, end), 'the git record',
+        'guard cannot tell such a path from others, so rename it to a valid UTF-8 name'));
+    }
+    start = end + 1;
+  }
+  return records;
 }
 
 /** Splits line-oriented output into its non-empty lines. */
@@ -494,7 +714,8 @@ function splitLines(buffer) {
  * subtree, so running it from a subfolder would hide drafts elsewhere.
  */
 function gitToplevel(root) {
-  const top = git(root, ['rev-parse', '--show-toplevel']).toString('utf8').replace(/\r?\n$/, '');
+  const top = decodeGitText(git(root, ['rev-parse', '--show-toplevel']), 'the repository folder',
+    'move the repository to a folder whose path is valid UTF-8').replace(/\r?\n$/, '');
   if (top === '') throw new GitError(`git rev-parse --show-toplevel found no working tree for ${root}`);
   return top;
 }
@@ -566,9 +787,11 @@ function createExclusive(absPath, bytes) {
 }
 
 /**
- * The compensations for the steps a command has completed, so a failure part
- * way leaves the files as the command found them. A step's undo is recorded
- * only once the step has succeeded.
+ * The compensations for the steps a command has completed, run newest first
+ * when a later step fails. A step's undo is recorded only once the step has
+ * succeeded. Each undo checks before it changes anything that it removes no
+ * content the command did not write, and throws when it cannot complete;
+ * `reportFailure` then lists the paths to repair by hand.
  */
 class UndoLog {
   constructor() {
@@ -652,10 +875,12 @@ function asideRelFor(slug, command) {
 }
 
 /**
- * First half of the commit point of `publish` and `unpublish`: moves the
+ * First step of the commit point of `publish` and `unpublish`: moves the
  * source article to `asideRel` with one atomic rename. From then on an editor
- * saving the article writes a new file at `sourceRel`, never into the copy
- * about to be deleted. A source already gone throws `SourceChanged`.
+ * saving the article by its path writes a new file at `sourceRel`, never into
+ * the copy being retired; a program that kept the file open still writes
+ * into the copy, which `nameBackup` keeps under a backup name. A source
+ * already gone throws `SourceChanged`.
  */
 function setAside(root, sourceRel, asideRel, command) {
   try {
@@ -667,7 +892,7 @@ function setAside(root, sourceRel, asideRel, command) {
 }
 
 /**
- * Second half of the commit point: throws `SourceChanged` unless the
+ * Second step of the commit point: throws `SourceChanged` unless the
  * set-aside copy holds exactly `snapshot`, the bytes the command read,
  * checked and copied, and nothing has been saved at `sourceRel` since it was
  * set aside. The undo of `setAside` then keeps the edit.
@@ -683,12 +908,127 @@ function assertAsideUnchanged(root, asideRel, sourceRel, snapshot, command) {
 }
 
 /**
- * First undo of `setAside`: copies the set-aside article back to `sourceRel`
- * without overwriting anything. When a newer save already occupies
- * `sourceRel` there is nothing to put back; `removeAside` then decides what
- * happens to the set-aside copy.
+ * Error codes of a filesystem that cannot make hard links (FAT, exFAT and
+ * some network shares), on which `nameBackup` renames instead.
+ */
+const NO_HARD_LINK_CODES = new Set(['EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS']);
+
+/**
+ * The names under which `publish` or `unpublish` keeps the article it
+ * retired: `_drafts/.<slug>.<command>-backup`, then `-backup-2` to
+ * `-backup-99`. The folder is git-ignored, and the leading dot and the
+ * missing `.md` keep Jekyll and `check` from reading the file.
+ */
+function backupRelsFor(slug, command) {
+  const base = `_drafts/.${slug}.${command}-backup`;
+  return [base, ...Array.from({ length: 98 }, (_, i) => `${base}-${i + 2}`)];
+}
+
+/**
+ * Third step of the commit point: gives the set-aside copy `asideRel` the
+ * first free name of `candidates`, so the file the command retires is never
+ * deleted. A program that kept the article open writes into that file
+ * however late it writes, and the write stays readable under the backup
+ * name; the author deletes the backup once it is no longer needed.
+ *
+ * The name is added with a hard link, which never replaces an existing file
+ * (a taken name is skipped), and the caller then removes the name
+ * `asideRel`. On a filesystem without hard links the copy is renamed to a
+ * name found free instead; the slug's lock keeps other runs from taking it
+ * meanwhile.
+ *
+ * @param {string} root Absolute repository root.
+ * @param {string} asideRel The set-aside copy, already checked.
+ * @param {string[]} candidates Backup names, in order of preference.
+ * @returns {{ rel: string, linked: boolean }} The backup name, and whether
+ *   `asideRel` still names the file too (a hard link was made).
+ * @throws {Error} when every name is taken or the name cannot be added.
+ */
+function nameBackup(root, asideRel, candidates) {
+  const asideAbs = inRoot(root, asideRel);
+  for (const rel of candidates) {
+    const backupAbs = inRoot(root, rel);
+    try {
+      fs.linkSync(asideAbs, backupAbs);
+      return { rel, linked: true };
+    } catch (err) {
+      if (err.code === 'EEXIST') continue;
+      if (!NO_HARD_LINK_CODES.has(err.code)) throw err;
+    }
+    if (pathExists(backupAbs)) continue;
+    fs.renameSync(asideAbs, backupAbs);
+    return { rel, linked: false };
+  }
+  throw new Error(`every backup name from ${candidates[0]} to ${candidates.at(-1)} is taken; `
+    + 'delete the backups you no longer need');
+}
+
+/**
+ * Undo of `nameBackup` when it made a hard link: removes the name
+ * `backupRel` only while `asideRel` still names the same file, so its
+ * content keeps a name; otherwise the backup is kept and the undo throws
+ * naming it. A backup already gone counts as undone.
+ */
+function removeBackupName(root, backupRel, asideRel) {
+  const backup = statOrUndefined(inRoot(root, backupRel), false);
+  if (backup === undefined) return;
+  const aside = statOrUndefined(inRoot(root, asideRel), false);
+  if (aside === undefined || aside.ino !== backup.ino || aside.dev !== backup.dev) {
+    throw new Error(`${asideRel} no longer names the same file, so ${backupRel} is kept as the only copy`);
+  }
+  fs.unlinkSync(inRoot(root, backupRel));
+}
+
+/**
+ * Says, once `publish` or `unpublish` has finished, where the retired
+ * article is kept (see `nameBackup`). When the backup no longer holds
+ * `snapshot`, a program that kept the article open wrote to it after the
+ * check: `resultRel` holds the checked text and the later edit is in the
+ * backup, which a warning names. The backup is never removed here.
+ *
+ * @param {string} root Absolute repository root.
+ * @param {object} args
+ * @param {string} args.backupRel The backup name.
+ * @param {string} args.sourceRel Where the article was before it was retired.
+ * @param {Buffer} args.snapshot The checked bytes.
+ * @param {'publish' | 'unpublish'} args.command The command at its end.
+ * @param {string} args.resultRel The file that now holds the checked text.
+ */
+function reportBackup(root, { backupRel, sourceRel, snapshot, command, resultRel }) {
+  let bytes;
+  try {
+    bytes = fs.readFileSync(inRoot(root, backupRel));
+  } catch (err) {
+    warn(`cannot read the backup ${backupRel} (${err.message}); it is kept: compare it with ${resultRel}, `
+      + 'then delete it');
+    return;
+  }
+  if (bytes.equals(snapshot)) {
+    say(`Kept the checked ${sourceRel} as ${backupRel} (git-ignored), in case a program still has it open; `
+      + 'delete it once you no longer need it.');
+    return;
+  }
+  warn(`${sourceRel} was written to through a file still open as ${command}ing finished: ${resultRel} holds the `
+    + `checked text, and that later edit is in ${backupRel}; copy it into ${resultRel} if you want it, then `
+    + `delete ${backupRel}`);
+}
+
+/**
+ * First undo of `setAside`: gives the set-aside article its name `sourceRel`
+ * again with a hard link, which never overwrites anything, so a program that
+ * kept it open goes on writing into the restored file; on a filesystem
+ * without hard links its bytes are copied there instead. When a newer save
+ * already occupies `sourceRel` there is nothing to put back; `removeAside`
+ * then decides what happens to the set-aside copy.
  */
 function putBack(root, asideRel, sourceRel) {
+  try {
+    fs.linkSync(inRoot(root, asideRel), inRoot(root, sourceRel));
+    return;
+  } catch (err) {
+    if (err.code === 'EEXIST') return;
+    if (!NO_HARD_LINK_CODES.has(err.code)) throw err;
+  }
   try {
     createExclusive(inRoot(root, sourceRel), fs.readFileSync(inRoot(root, asideRel)));
   } catch (err) {
@@ -792,15 +1132,20 @@ function releaseSlugLock(root, rel, owner, madeDrafts) {
 
 /**
  * Takes the lock `_drafts/.<slug>.lock` for one run of `new`, `publish` or
- * `unpublish`, so two runs for the same slug never interleave. Exclusive
- * creation of the dated post alone cannot serialize them: two runs on either
- * side of UTC midnight write different filenames. The lock file names its
- * holder as `<pid> <host>`. A lock whose holder ran on this host and is no
- * longer running is stale and is replaced with a warning, so a killed run
- * never blocks a retry; any other existing lock refuses the run and names
- * the file to delete once no run is active. Two runs replacing the same
- * stale lock at the same instant could both proceed; the window is the gap
- * between reading and removing the stale file.
+ * `unpublish`. While one run holds it, a competing run for the same slug is
+ * refused, not queued: it exits 1 naming the holder, changes nothing, and
+ * must be run again once the holder has finished. Exclusive creation of the
+ * dated post alone cannot serialize the runs: two on either side of UTC
+ * midnight write different filenames. The lock file names its holder as
+ * `<pid> <host>`.
+ *
+ * A lock whose holder ran on this host and is no longer running is stale, so
+ * a killed run does not block a retry: `reclaimStaleLock` replaces it, with a
+ * warning, under an exclusive reclaim token. Any other existing lock (a
+ * running holder, another host, unreadable content) refuses the run and
+ * names the file to delete once no run is active. A run removes only its own
+ * lock and token, and a stale lock only while it holds the token; deleting a
+ * lock or token by hand while its run is still active defeats the lock.
  *
  * A `_drafts/` folder made for the lock is removed again on release when
  * empty, so a refused command still writes nothing.
@@ -849,20 +1194,14 @@ function takeLockFile(root, rel, owner, slug, command) {
       fail(`${command} failed: cannot read the lock ${rel} (${err.message}); nothing was changed`);
       return false;
     }
-    const holder = /^(\d+) (\S+)\n$/.exec(held.toString('utf8'));
-    if (holder !== null && holder[2] === os.hostname() && !processRunning(Number(holder[1]))) {
-      try {
-        if (fs.readFileSync(absPath).equals(held)) fs.unlinkSync(absPath);
-      } catch (err) {
-        if (err.code !== 'ENOENT') {
-          fail(`${command} failed: cannot remove the stale lock ${rel} (${err.message}); delete it by hand`);
-          return false;
-        }
-      }
-      warn(`replaced the stale lock ${rel}: process ${holder[1]}, which held it, is no longer running`);
+    const holder = parseHolder(held);
+    if (holderGone(holder)) {
+      const outcome = reclaimStaleLock(root, rel, owner, held, command);
+      if (outcome === 'taken') return true;
+      if (outcome === 'refused') return false;
       continue;
     }
-    const who = holder === null ? '' : ` (process ${holder[1]} on ${holder[2]})`;
+    const who = holder === null ? '' : ` (process ${holder.pid} on ${holder.host})`;
     fail(`another article.mjs run${who} is changing slug ${slug}; wait for it to finish, then run ${command} `
       + `again. If no such run is active, delete ${rel} first; nothing was changed`);
     return false;
@@ -871,10 +1210,123 @@ function takeLockFile(root, rel, owner, slug, command) {
   return false;
 }
 
+/** The `<pid> <host>` record of a lock or reclaim token, or `null` for any other content. */
+function parseHolder(bytes) {
+  const match = /^(\d+) (\S+)\n$/.exec(bytes.toString('utf8'));
+  return match === null ? null : { pid: match[1], host: match[2] };
+}
+
+/** True when `holder` (from `parseHolder`) ran on this host and is no longer running. */
+function holderGone(holder) {
+  return holder !== null && holder.host === os.hostname() && !processRunning(Number(holder.pid));
+}
+
+/**
+ * Replaces the stale lock `rel`, which held `stale` when it was read, with
+ * one holding `owner`. Only the run that creates the reclaim token
+ * `<rel>.reclaim` exclusively may do so, so two runs that read the same stale
+ * lock never both act on that reading: under the token the lock is read
+ * again, removed only while it still holds `stale` and its holder is still
+ * gone, and this run's lock is created exclusively before the token is
+ * removed. A run that finds the token taken is refused (`refuseHeldToken`).
+ *
+ * @returns {'taken' | 'refused' | 'changed'} `taken` once this run holds the
+ *   lock; `refused` once the reason it cannot is reported; `changed` when the
+ *   lock is no longer the stale one read, or the token was released while
+ *   being read, so the caller looks at the lock again.
+ */
+function reclaimStaleLock(root, rel, owner, stale, command) {
+  const absPath = inRoot(root, rel);
+  const tokenRel = `${rel}.reclaim`;
+  try {
+    createExclusive(inRoot(root, tokenRel), owner);
+  } catch (err) {
+    if (err.code === 'EEXIST') return refuseHeldToken(root, tokenRel, rel, command);
+    fail(`${command} failed: cannot create ${tokenRel} to replace the stale lock ${rel} (${err.message}); `
+      + 'nothing was changed');
+    return 'refused';
+  }
+  let removed = false;
+  try {
+    let current;
+    try {
+      current = fs.readFileSync(absPath);
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
+    }
+    if (current !== undefined) {
+      if (!current.equals(stale) || !holderGone(parseHolder(current))) return 'changed';
+      try {
+        fs.unlinkSync(absPath);
+      } catch (err) {
+        if (err.code !== 'ENOENT') throw err;
+      }
+    }
+    removed = true;
+    try {
+      createExclusive(absPath, owner);
+    } catch (err) {
+      // A run that found no lock at all took it first.
+      if (err.code === 'EEXIST') return 'changed';
+      throw err;
+    }
+    if (current !== undefined) {
+      warn(`replaced the stale lock ${rel}: process ${parseHolder(stale).pid}, which held it, is no longer running`);
+    }
+    return 'taken';
+  } catch (err) {
+    fail(`${command} failed: cannot replace the stale lock ${rel} (${err.message}); `
+      + `${removed ? '' : `delete ${rel} by hand, then `}run ${command} again; nothing was changed`);
+    return 'refused';
+  } finally {
+    releaseReclaimToken(root, tokenRel, owner);
+  }
+}
+
+/**
+ * Reports that the reclaim token `tokenRel` of the lock `rel` is taken,
+ * naming its holder. A token whose holder is gone is never removed here, as
+ * removing it would race with the run creating the next one, so the author is
+ * told to delete it. Returns `changed` when the token is already gone, since
+ * its holder has just finished, and `refused` once the refusal is reported.
+ */
+function refuseHeldToken(root, tokenRel, rel, command) {
+  let bytes;
+  try {
+    bytes = fs.readFileSync(inRoot(root, tokenRel));
+  } catch (err) {
+    if (err.code === 'ENOENT') return 'changed';
+    fail(`${command} failed: cannot read ${tokenRel} (${err.message}); nothing was changed`);
+    return 'refused';
+  }
+  const holder = parseHolder(bytes);
+  if (holderGone(holder)) {
+    fail(`${tokenRel} was left by process ${holder.pid}, which stopped while replacing the stale lock ${rel}; `
+      + `delete ${tokenRel}, then run ${command} again; nothing was changed`);
+  } else {
+    const who = holder === null ? '' : ` (process ${holder.pid} on ${holder.host})`;
+    fail(`another article.mjs run${who} is replacing the stale lock ${rel}; run ${command} again once it has `
+      + `finished. If no such run is active, delete ${tokenRel} first; nothing was changed`);
+  }
+  return 'refused';
+}
+
+/** Removes this run's reclaim token, leaving one that holds another run's record; a failure is only a warning. */
+function releaseReclaimToken(root, tokenRel, owner) {
+  const absPath = inRoot(root, tokenRel);
+  try {
+    if (fs.readFileSync(absPath).equals(owner)) fs.unlinkSync(absPath);
+    else warn(`${tokenRel} no longer holds this run's record, so it is left in place`);
+  } catch (err) {
+    if (err.code !== 'ENOENT') warn(`cannot remove ${tokenRel} (${err.message}); delete it by hand`);
+  }
+}
+
 /**
  * Runs `body` while holding the slug's lock and returns its exit code; the
- * lock is released however `body` ends. Returns 1 when the lock is held by
- * another run.
+ * lock is released however `body` ends. Returns 1 without running `body`
+ * when the lock cannot be taken, such as while another run holds it; the
+ * command must then be run again.
  */
 function withSlugLock(root, slug, command, body) {
   const lock = acquireSlugLock(root, slug, command);
@@ -892,6 +1344,11 @@ function withSlugLock(root, slug, command, body) {
  * cleanup error attached to it and each rollback failure. Then it either says
  * that every change was rolled back (only when that is true), or lists which
  * of `paths` now exist and which are missing, for the author to fix by hand.
+ * Nothing is rolled back when one of `paths` or `leftovers` is no longer
+ * confined (see `firstUnconfined`), such as a folder replaced by a symbolic
+ * link while the command ran: undoing through the link could remove or move
+ * files outside the repository or into a folder git publishes, so every
+ * completed step is left in place and reported for repair by hand.
  *
  * @param {object} args
  * @param {'new' | 'publish' | 'unpublish'} args.command The command that failed.
@@ -910,9 +1367,19 @@ function reportFailure({ command, root, step, err, undo, paths, leftovers = [], 
   else fail(`${command} failed: cannot ${step} (${err?.message ?? String(err)})`);
   const cleanupErrors = Array.isArray(err?.cleanupErrors) ? err.cleanupErrors : [];
   for (const cleanupErr of cleanupErrors) fail(`cleanup failed: ${cleanupErr?.message ?? String(cleanupErr)}`);
-  const failures = undo.rollback();
+  const unconfined = new Set();
+  for (const rel of [...paths, ...leftovers]) {
+    try {
+      const problem = confinementProblem(root, rel, rel.endsWith('/') ? 'folder' : 'file');
+      if (problem !== null) unconfined.add(problem);
+    } catch (statErr) {
+      unconfined.add(`cannot check ${rel} (${statErr?.code ?? statErr?.message ?? String(statErr)})`);
+    }
+  }
+  for (const problem of unconfined) fail(`rollback skipped: ${problem}`);
+  const failures = unconfined.size === 0 ? undo.rollback() : [];
   for (const message of failures) fail(`rollback failed: ${message}`);
-  if (cleanupErrors.length === 0 && failures.length === 0) {
+  if (cleanupErrors.length === 0 && failures.length === 0 && unconfined.size === 0) {
     fail(`every change was rolled back and ${untouched}; fix the cause and run ${command} again`);
     return EXIT_INVALID;
   }
@@ -961,11 +1428,13 @@ function hooksEnabled(root) {
 
 function cmdNew(root, slug) {
   if (!isValidSlug(slug)) return refuseSlug(slug);
+  if (!pathsConfined(root, 'new', slug)) return EXIT_INVALID;
   return withSlugLock(root, slug, 'new', () => createDraft(root, slug));
 }
 
 /** `new <slug>` once the slug's lock is held. */
 function createDraft(root, slug) {
+  if (!pathsConfined(root, 'new', slug)) return EXIT_INVALID;
   const draftRel = `_drafts/${slug}.md`;
   const used = [...findDrafts(root, slug), ...findPosts(root, slug)];
   if (pathExists(inRoot(root, draftRel)) && !used.includes(draftRel)) used.unshift(draftRel);
@@ -975,11 +1444,6 @@ function createDraft(root, slug) {
   }
   const draftImagesRel = `assets/drafts/${slug}`;
   const draftImagesAbs = inRoot(root, draftImagesRel);
-  if (pathExists(draftImagesAbs) && !isRealDirectory(draftImagesAbs)) {
-    fail(`${draftImagesRel} is not a folder (or is a symbolic link); move it aside and run new again; `
-      + 'nothing was created');
-    return EXIT_INVALID;
-  }
 
   let template;
   try {
@@ -1029,7 +1493,7 @@ function createDraft(root, slug) {
   say(`     {{ '/assets/drafts/${slug}/figure.png' | relative_url }}`);
   say('  2. Preview: bundle exec jekyll serve --drafts --config _config.yml,_config.preview.yml');
   say(`     then open http://localhost:4000/blog/${slug}/`);
-  say(`  3. node scripts/article.mjs check ${draftRel}`);
+  say(`  3. node scripts/article.mjs check ${shellPath(draftRel)}`);
   say(`  4. node scripts/article.mjs publish ${slug}`);
   return EXIT_OK;
 }
@@ -1056,13 +1520,25 @@ function resolveCheckTargets(root, files) {
 }
 
 function cmdCheck(root, files) {
+  const links = [];
   const targets = files.length > 0
     ? resolveCheckTargets(root, files)
     : [
-      ...listMarkdown(root, '_drafts').map((rel) => ({ rel, kind: 'draft' })),
-      ...listMarkdown(root, '_posts').map((rel) => ({ rel, kind: 'post' })),
+      ...listMarkdown(root, '_drafts', links).map((rel) => ({ rel, kind: 'draft' })),
+      ...listMarkdown(root, '_posts', links).map((rel) => ({ rel, kind: 'post' })),
     ];
+  // Named files are checked for slug uniqueness against both folders, which are never listed through a link.
+  if (files.length > 0) {
+    for (const folder of ['_drafts', '_posts']) {
+      if (statOrUndefined(inRoot(root, folder), false)?.isSymbolicLink()) links.push(folder);
+    }
+  }
+  for (const rel of links) {
+    fail(`${rel} is a symbolic link, which check does not follow; articles and their folders must be regular `
+      + 'files and real folders inside the repository');
+  }
   if (targets.length === 0) {
+    if (links.length > 0) return EXIT_INVALID;
     say('No articles to check.');
     return EXIT_OK;
   }
@@ -1082,14 +1558,13 @@ function cmdCheck(root, files) {
     }
   }
   say(`${targets.length} checked, ${withErrors} with errors, ${plural(warningCount, 'warning')}`);
-  return withErrors > 0 ? EXIT_INVALID : EXIT_OK;
+  return withErrors > 0 || links.length > 0 ? EXIT_INVALID : EXIT_OK;
 }
 
 /* ------------------------------------------------------------------------ */
 /* publish <slug>                                                            */
 /* ------------------------------------------------------------------------ */
 
-/** Replaces every occurrence of `from` with `to`. */
 function replaceAllText(text, from, to) {
   return text.split(from).join(to);
 }
@@ -1138,6 +1613,7 @@ function checkProspectivePost(root, postRel, slug, today, postText) {
 
 function cmdPublish(root, slug) {
   if (!isValidSlug(slug)) return refuseSlug(slug);
+  if (!pathsConfined(root, 'publish', slug)) return EXIT_INVALID;
   const draftRel = `_drafts/${slug}.md`;
   if (!isFile(inRoot(root, draftRel))) {
     fail(`${draftRel} does not exist; start a draft with: node scripts/article.mjs new ${slug}`);
@@ -1148,6 +1624,7 @@ function cmdPublish(root, slug) {
 
 /** `publish <slug>` once the slug's lock is held; the date is read under the lock as well. */
 function publishDraft(root, slug) {
+  if (!pathsConfined(root, 'publish', slug)) return EXIT_INVALID;
   const today = todayUtc();
   const draftRel = `_drafts/${slug}.md`;
   const draftAbs = inRoot(root, draftRel);
@@ -1207,19 +1684,26 @@ function publishDraft(root, slug) {
   }
 
   // Order: write the post, then move the images, then retire the draft. Each
-  // step records its undo once it has succeeded, and any failure undoes the
-  // steps before it, newest first, so a failed publish can simply be run
-  // again. Retiring the draft is the commit point: it is the last step, and
-  // the draft is untouched until then. Folders made on the way (`_posts/`,
-  // `assets/blog/`) stay: an empty folder is invisible to git and to a retry.
+  // step records its undo once it has succeeded, and a failure runs the undos
+  // of the steps before it, newest first; each keeps content it did not
+  // write, and one that cannot complete is reported with the paths to repair
+  // by hand. Retiring the draft is the commit point: it is the last step, and
+  // the draft is untouched until then. The retired draft is never deleted: it
+  // is kept as a git-ignored backup in `_drafts/` (see `nameBackup`) for the
+  // author to delete. Folders made on the way (`_posts/`, `assets/blog/`)
+  // stay: an empty folder is invisible to git and to a retry.
   //
-  // Concurrency: competing new, publish and unpublish runs for this slug wait
-  // on its lock, held by the caller. An editor saving the draft meanwhile is
+  // Concurrency: the caller holds this slug's lock, so a competing new,
+  // publish or unpublish run for it is refused meanwhile and must be run
+  // again once this one has finished. An editor saving the draft meanwhile is
   // handled at the commit point: the draft is set aside with one rename, its
   // bytes must still be the checked snapshot, and nothing may have been saved
-  // in its place; otherwise everything is undone and the edit is kept.
+  // in its place; otherwise the earlier steps are undone as above and the
+  // edit is kept. A program that keeps the draft open and writes after that
+  // check writes into the backup, which is reported once the run ends.
   const undo = new UndoLog();
   let step = 'create the _posts/ folder';
+  let backup;
   try {
     fs.mkdirSync(inRoot(root, '_posts'), { recursive: true });
     step = `write ${postRel}`;
@@ -1234,15 +1718,25 @@ function publishDraft(root, slug) {
         () => fs.renameSync(blogImagesAbs, draftImagesAbs));
     } else if (imageFolder) {
       // Only empty folders remain inside, so an article without images creates
-      // no image folder. Recreating folders is harmless where they still
-      // exist, so this undo is recorded first: it also repairs a removal that
-      // stopped part way.
+      // no image folder. Each folder is removed on its own, deepest first, and
+      // `rmdirSync` refuses one that is not empty, so an image saved into it
+      // since the check is never deleted: the run fails and is undone instead.
+      // Recreating folders is harmless where they still exist, so this undo is
+      // recorded first: it also repairs a removal that stopped part way.
       step = `remove the empty ${draftImagesRel}/`;
       const folders = [draftImagesAbs, ...listFolders(draftImagesAbs)];
       undo.push(`recreate the empty ${draftImagesRel}/`, () => {
         for (const folder of folders) fs.mkdirSync(folder, { recursive: true });
       });
-      fs.rmSync(draftImagesAbs, { recursive: true });
+      for (const folder of [...folders].reverse()) {
+        try {
+          fs.rmdirSync(folder);
+        } catch (err) {
+          if (err.code !== 'ENOTEMPTY' && err.code !== 'EEXIST') throw err;
+          throw new SourceChanged(`${toPosix(path.relative(root, folder))}/ gained a file while publishing; it is `
+            + 'kept; reference it from the draft or move it out, then publish again');
+        }
+      }
     }
     step = `set ${draftRel} aside as ${asideRel}`;
     setAside(root, draftRel, asideRel, 'publish');
@@ -1250,11 +1744,18 @@ function publishDraft(root, slug) {
     undo.push(`put ${draftRel} back from ${asideRel}`, () => putBack(root, asideRel, draftRel));
     step = `check that ${draftRel} is unchanged`;
     assertAsideUnchanged(root, asideRel, draftRel, snapshot, 'publish');
-    // The commit point; nothing can fail after it. The draft is no longer at
-    // its path, so a save landing now creates a new draft rather than being
-    // deleted with this copy; it is reported below.
-    step = `remove ${draftRel}`;
-    fs.unlinkSync(inRoot(root, asideRel));
+    step = `keep the checked ${draftRel} as a backup`;
+    backup = nameBackup(root, asideRel, backupRelsFor(slug, 'publish'));
+    if (backup.linked) {
+      undo.push(`remove the backup name ${backup.rel}`, () => removeBackupName(root, backup.rel, asideRel));
+      // The last transactional file mutation: nothing is rolled back once it
+      // has succeeded. The draft is no longer at its path, so a save landing
+      // now creates a new draft rather than being deleted, and the retired
+      // file keeps its backup name, so a write through a file still open
+      // stays readable there; both are reported below.
+      step = `remove ${draftRel}`;
+      fs.unlinkSync(inRoot(root, asideRel));
+    }
   } catch (err) {
     return reportFailure({
       command: 'publish',
@@ -1263,7 +1764,7 @@ function publishDraft(root, slug) {
       err,
       undo,
       paths: [draftRel, postRel, `${draftImagesRel}/`, `${blogImagesRel}/`],
-      leftovers: [asideRel],
+      leftovers: backup === undefined ? [asideRel] : [asideRel, backup.rel],
       untouched: 'nothing was moved',
     });
   }
@@ -1275,12 +1776,13 @@ function publishDraft(root, slug) {
   say(`Published ${draftRel} as ${postRel}.`);
   if (moveImages) say(`Moved ${draftImagesRel}/ to ${blogImagesRel}/ and rewrote the image paths.`);
   else if (imageFolder) say(`Removed the empty ${draftImagesRel}/.`);
+  reportBackup(root, { backupRel: backup.rel, sourceRel: draftRel, snapshot, command: 'publish', resultRel: postRel });
   const title = typeof data.title === 'string' ? data.title : slug;
   say();
   say('Next:');
   if (runsOutsideRoot(root)) say(`  cd ${shellQuote(root)}`);
   say('  node scripts/verify.mjs');
-  say(`  git add ${postRel}${moveImages ? ` ${blogImagesRel}` : ''}`);
+  say(`  git add -- ${shellPath(postRel)}${moveImages ? ` ${shellPath(blogImagesRel)}` : ''}`);
   say(`  git commit -m ${shellQuote(`Publish: ${title}`)}`);
   say('  git push origin main');
   say('Once pushed, the article is public and stays in git history, even after unpublishing.');
@@ -1293,11 +1795,13 @@ function publishDraft(root, slug) {
 
 function cmdUnpublish(root, slug) {
   if (!isValidSlug(slug)) return refuseSlug(slug);
+  if (!pathsConfined(root, 'unpublish', slug)) return EXIT_INVALID;
   return withSlugLock(root, slug, 'unpublish', () => unpublishPost(root, slug));
 }
 
 /** `unpublish <slug>` once the slug's lock is held. */
 function unpublishPost(root, slug) {
+  if (!pathsConfined(root, 'unpublish', slug)) return EXIT_INVALID;
   const posts = findPosts(root, slug);
   if (posts.length === 0) {
     fail(`no published article with slug ${slug} in _posts/`);
@@ -1362,11 +1866,15 @@ function unpublishPost(root, slug) {
 
   // Order: write the draft, then move the images, then retire the post, with
   // the same undo log, lock and commit point as publish; the post is set
-  // aside in the git-ignored _drafts/ folder. A failure therefore never
-  // leaves the live post with its images moved to the git-ignored
-  // assets/drafts/.
+  // aside in the git-ignored _drafts/ folder and kept there as a backup the
+  // author deletes. A failure before the post is
+  // retired runs the undos, which move the images back to assets/blog/ and
+  // remove the draft, so the live post is not left with its images in the
+  // git-ignored assets/drafts/; an undo that cannot complete is reported with
+  // the paths to repair by hand.
   const undo = new UndoLog();
   let step = 'create the _drafts/ folder';
+  let backup;
   try {
     fs.mkdirSync(inRoot(root, '_drafts'), { recursive: true });
     step = `write ${draftRel}`;
@@ -1386,10 +1894,17 @@ function unpublishPost(root, slug) {
     undo.push(`put ${postRel} back from ${asideRel}`, () => putBack(root, asideRel, postRel));
     step = `check that ${postRel} is unchanged`;
     assertAsideUnchanged(root, asideRel, postRel, snapshot, 'unpublish');
-    // The commit point, as in publish: a save landing now recreates the post
-    // rather than being deleted with this copy; it is reported below.
-    step = `remove ${postRel}`;
-    fs.unlinkSync(inRoot(root, asideRel));
+    step = `keep the checked ${postRel} as a backup`;
+    backup = nameBackup(root, asideRel, backupRelsFor(slug, 'unpublish'));
+    if (backup.linked) {
+      undo.push(`remove the backup name ${backup.rel}`, () => removeBackupName(root, backup.rel, asideRel));
+      // The last transactional file mutation, as in publish: a save landing
+      // now recreates the post rather than being deleted, and a write through
+      // a file still open stays readable in the backup, which lies in the
+      // git-ignored _drafts/, never under _posts/; both are reported below.
+      step = `remove ${postRel}`;
+      fs.unlinkSync(inRoot(root, asideRel));
+    }
   } catch (err) {
     return reportFailure({
       command: 'unpublish',
@@ -1398,7 +1913,7 @@ function unpublishPost(root, slug) {
       err,
       undo,
       paths: [postRel, draftRel, `${blogImagesRel}/`, `${draftImagesRel}/`],
-      leftovers: [asideRel],
+      leftovers: backup === undefined ? [asideRel] : [asideRel, backup.rel],
       untouched: 'nothing was moved',
     });
   }
@@ -1410,10 +1925,17 @@ function unpublishPost(root, slug) {
   }
   say(`Unpublished ${postRel}; it is now the draft ${draftRel}.`);
   if (moveImages) say(`Moved ${blogImagesRel}/ to ${draftImagesRel}/ and rewrote the image paths.`);
+  reportBackup(root, {
+    backupRel: backup.rel,
+    sourceRel: postRel,
+    snapshot,
+    command: 'unpublish',
+    resultRel: draftRel,
+  });
   say();
   say('Next:');
   if (runsOutsideRoot(root)) say(`  cd ${shellQuote(root)}`);
-  say(`  git add -A -- ${postRel}${moveImages ? ` ${blogImagesRel}` : ''}`);
+  say(`  git add -A -- ${shellPath(postRel)}${moveImages ? ` ${shellPath(blogImagesRel)}` : ''}`);
   say(`  git commit -m "Unpublish: ${slug}"`);
   say('  git push origin main');
   warn('everything already pushed stays readable in git history; unpublishing only removes the article '
@@ -1438,14 +1960,34 @@ function parseIndex(buffer) {
   });
 }
 
+/** Index and tree modes of a regular file, the only kind of entry that can be an article. */
+const REGULAR_FILE_MODES = new Set(['100644', EXECUTABLE_MODE]);
+
+/** Index and tree mode of a symbolic link. */
+const SYMLINK_MODE = '120000';
+
 /**
- * Paths the commit adds, copies, modifies or renames. On an unborn branch
- * `git diff --cached` already compares against the empty tree; should a git
- * version refuse it there, the comparison is rerun against the empty tree,
- * computed by `hash-object` without `-w`, so nothing is written.
+ * The refusal for an article path (`ARTICLE_PATH_RE`) whose index or tree
+ * entry is not a regular file, or null for every other entry. Only a regular
+ * file holds article text, so both guards apply this to every entry of the
+ * complete tree, changed or not.
+ */
+function articleModeProblem(p, mode) {
+  if (!ARTICLE_PATH_RE.test(p) || REGULAR_FILE_MODES.has(mode)) return null;
+  if (mode === SYMLINK_MODE) return `${p}: a symbolic link cannot be an article`;
+  if (mode === GITLINK_MODE) return `${p}: a submodule cannot be an article`;
+  return `${p}: an article must be a regular file, not an entry of mode ${mode}`;
+}
+
+/**
+ * Paths the commit adds, copies, modifies, renames or changes the type of (a
+ * symbolic link or submodule that becomes a regular file, or the reverse). On
+ * an unborn branch `git diff --cached` already compares against the empty
+ * tree; should a git version refuse it there, the comparison is rerun against
+ * the empty tree, computed by `hash-object` without `-w`, so nothing is written.
  */
 function stagedChanges(top) {
-  const args = ['diff', '--cached', '--name-only', '--diff-filter=ACMR', '-z'];
+  const args = ['diff', '--cached', '--name-only', '--diff-filter=ACMRT', '-z'];
   const first = runGit(top, args);
   if (first.ok) return splitNul(first.stdout);
   if (runGit(top, ['rev-parse', '--verify', '--quiet', 'HEAD^{commit}']).ok) {
@@ -1457,18 +1999,16 @@ function stagedChanges(top) {
 
 /**
  * Reads the given articles from tree or index entries, each with its blob id
- * as `id`; a submodule in an article path is an error.
+ * as `id`. An entry that is not a regular file has no article text and is
+ * never read; `articleModeProblem`, applied to the complete tree, refuses it.
  */
-function readArticles(changedPaths, entryFor, readBlob, errors) {
+function readArticles(changedPaths, entryFor, readBlob) {
   const articles = [];
   for (const p of changedPaths) {
     if (!ARTICLE_PATH_RE.test(p)) continue;
     const entry = entryFor(p);
     if (entry === undefined) throw new GitError(`${p} is listed as changed but has no entry in the tree`);
-    if (entry.mode === GITLINK_MODE) {
-      errors.push(`${p}: a submodule cannot be an article`);
-      continue;
-    }
+    if (!REGULAR_FILE_MODES.has(entry.mode)) continue;
     articles.push({ path: p, text: readBlob(entry.oid), id: entry.oid });
   }
   return articles;
@@ -1481,20 +2021,29 @@ function cmdGuardStaged(root) {
   const errors = [];
 
   // The complete staged tree, with the stage-0 entry of each path for reading.
+  // The mode rules apply to every record, conflict stages included, and
+  // report a path once.
   const paths = [];
   const entries = new Map();
-  const hookModeReported = new Set();
+  const modeReported = new Set();
   for (const record of records) {
     if (!entries.has(record.path)) paths.push(record.path);
     if (!entries.has(record.path) || record.stage === '0') entries.set(record.path, record);
-    if (record.path.startsWith('.githooks/') && record.mode !== EXECUTABLE_MODE && !hookModeReported.has(record.path)) {
-      hookModeReported.add(record.path);
-      errors.push(`${record.path}: staged with mode ${record.mode}; run git update-index --chmod=+x ${record.path}`);
+    if (modeReported.has(record.path)) continue;
+    if (record.path.startsWith('.githooks/') && record.mode !== EXECUTABLE_MODE) {
+      modeReported.add(record.path);
+      errors.push(`${record.path}: staged with mode ${record.mode}; run git update-index --chmod=+x -- `
+        + shellPath(record.path));
+    }
+    const modeProblem = articleModeProblem(record.path, record.mode);
+    if (modeProblem !== null) {
+      modeReported.add(record.path);
+      errors.push(modeProblem);
     }
   }
 
   const readBlob = makeBlobReader(top);
-  const articles = readArticles(stagedChanges(top), (p) => entries.get(p), readBlob, errors);
+  const articles = readArticles(stagedChanges(top), (p) => entries.get(p), readBlob);
   for (const message of checkTrackedContent({ paths, articles, todayUtc: today })) errors.push(message);
 
   if (errors.length > 0) {
@@ -1575,14 +2124,23 @@ function commitsToPush(top, lines) {
   return commits;
 }
 
-/** Parses `git ls-tree -r -z --full-tree`: `<mode> <type> <object>\t<path>` records, keyed by path. */
+/**
+ * Parses `git ls-tree -r -z --full-tree`: `<mode> <type> <object>\t<path>`
+ * records, keyed by path. A path listed twice is refused, since keying it
+ * would let one entry hide the other from the checks.
+ */
 function parseTree(buffer) {
   const entries = new Map();
   for (const record of splitNul(buffer)) {
     const tab = record.indexOf('\t');
     const [mode, type, oid] = record.slice(0, tab).split(' ');
     if (tab <= 0 || !OBJECT_ID_RE.test(oid ?? '')) throw new GitError(`unexpected git ls-tree record: ${record}`);
-    entries.set(record.slice(tab + 1), { mode, type, oid });
+    const p = record.slice(tab + 1);
+    if (entries.has(p)) {
+      throw new GitError(`git ls-tree listed ${JSON.stringify(p)} twice; a tree with duplicate entries `
+        + 'cannot be checked');
+    }
+    entries.set(p, { mode, type, oid });
   }
   return entries;
 }
@@ -1606,11 +2164,15 @@ function cmdGuardPrePush(root) {
     const tree = parseTree(git(top, ['ls-tree', '-r', '-z', '--full-tree', commit]));
     // --root lists a root commit's files; --diff-merges=first-parent lists a merge's changes.
     const changed = splitNul(git(top, [
-      'diff-tree', '-r', '--root', '--no-commit-id', '--name-only', '--diff-filter=AM',
+      'diff-tree', '-r', '--root', '--no-commit-id', '--name-only', '--diff-filter=AMT',
       '--diff-merges=first-parent', '-z', commit,
     ]));
     const errors = [];
-    const articles = readArticles(changed, (p) => tree.get(p), readBlob, errors);
+    for (const [p, { mode }] of tree) {
+      const modeProblem = articleModeProblem(p, mode);
+      if (modeProblem !== null) errors.push(modeProblem);
+    }
+    const articles = readArticles(changed, (p) => tree.get(p), readBlob);
     const content = checkTrackedContent({ paths: [...tree.keys()], articles, todayUtc: today, cache: analyses });
     for (const message of content) errors.push(message);
     if (errors.length > 0) {

@@ -1,29 +1,18 @@
 /* Cabrillo Coast LLC — Playwright Test configuration for the blog visual comparison */
 /**
- * Visual regression of the blog (AC-16): full-page screenshots of the listing
- * and one fixture article at 375px, 800px and 1280px, in light and dark
- * schemes, taken by `blog-visual.spec.mjs` in Playwright's Chromium.
+ * Configuration for `blog-visual.spec.mjs`, the blog's visual regression
+ * check (AC-16), in Playwright's Chromium only.
  *
- * Run it only through `node tests/visual/run-visual.mjs`. That script builds
- * the base revision and the working tree, serves each on 127.0.0.1, and calls
- * Playwright twice with this file: first in update mode against the base
- * build, which writes the baseline, then in compare mode against the
- * working-tree build. Snapshot updating is chosen on that command line, never
- * here. It passes the baseline directory in `VISUAL_BASELINE_DIR`, the
- * served site in `VISUAL_BASE_URL` and, for the comparison run, the JSON
- * results file in `VISUAL_RESULTS_FILE`.
- *
- * Baselines are written to a temporary directory outside the repository and
- * are never committed: both sides are rendered by the same browser build on
- * the same machine in one run, so a committed image would only add operating
- * system and font drift.
- *
- * The spec folder, test artefacts and report are resolved from this file's
- * folder, never from `process.cwd()`, so they land in the same place wherever
- * Playwright was launched. Comparison strictness (`threshold: 0`, `maxDiffPixels: 0`) is set
- * on each `toHaveScreenshot` call in the spec, which then compares every
- * pixel again at zero tolerance (`lib/pixels.mjs`), and is deliberately not
- * loosened here.
+ * Run only through `node tests/visual/run-visual.mjs`. It supplies
+ * `VISUAL_BASELINE_DIR` (required; see the guard below), `VISUAL_BASE_URL`
+ * (read by the spec) and, for the comparison run only, `VISUAL_RESULTS_FILE`,
+ * and chooses snapshot updating on its command line, never here. Baselines
+ * live in a temporary directory and are never committed: both sides render
+ * in the same browser build on the same machine, so a committed image would
+ * only add operating system and font drift. Comparison strictness is set in
+ * the spec and deliberately not loosened here. The spec folder, artefacts and
+ * report are resolved from this file's folder, never `process.cwd()`, so they
+ * land in the same place wherever Playwright was launched.
  */
 
 import { defineConfig } from "@playwright/test";
