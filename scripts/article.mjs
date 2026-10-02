@@ -12,7 +12,10 @@
  *   node scripts/article.mjs guard --pre-push  pre-push: the same for every commit being pushed
  *
  * `--root <dir>` (anywhere on the command line) names the repository root and
- * defaults to the current directory.
+ * defaults to the current directory. `new`, `check`, `publish` and
+ * `unpublish` refuse a root without `_config.yml` (exit 2), so a run from a
+ * subfolder is never taken for a site without articles; `guard` finds the
+ * repository root with git.
  *
  * Why it exists: the repository is public, so a draft is private only while
  * it stays out of git. Drafts live in the git-ignored `_drafts/` and
@@ -113,7 +116,8 @@ Commands:
                       git's ref lines on stdin (run by .githooks/pre-push)
 
 Options:
-  --root <dir>        Repository root (default: the current directory)
+  --root <dir>        Repository root, the folder holding _config.yml (default:
+                      the current directory)
   -h, --help          Show this help
 
 Slugs: lowercase letters and digits in groups joined by single hyphens, at most
@@ -135,17 +139,45 @@ class GitError extends Error {}
 /** The article or image folder being moved was changed while `publish` or `unpublish` ran; its message says which. */
 class SourceChanged extends Error {}
 
+/**
+ * Standard output and error streams on which a write has failed (see
+ * `watchOutput`); `say`, `fail` and `warn` write nothing more to them.
+ */
+const closedStreams = new Set();
+
+/**
+ * Handles a failed write to stdout or stderr, which Node reports as an
+ * `error` event once the command has returned (its writes are synchronous)
+ * and which, unhandled, would end the run with a stack trace and exit 1. A
+ * reader that closes its end early (`| head -1`) makes writes fail with
+ * EPIPE; that loses only output nobody reads, so the stream is muted and the
+ * command's own exit code stands, 0 for a publish whose moves completed. Any
+ * other failure, a full disk say, loses output the author needs: it is
+ * reported on stderr while stderr still works, and the exit code becomes 1.
+ */
+function watchOutput() {
+  for (const [stream, name] of [[process.stdout, 'standard output'], [process.stderr, 'standard error']]) {
+    stream.on('error', (err) => {
+      if (closedStreams.has(stream)) return;
+      closedStreams.add(stream);
+      if (err?.code === 'EPIPE') return;
+      process.exitCode = EXIT_INVALID;
+      fail(`cannot write to ${name} (${err?.message ?? String(err)}); output was lost`);
+    });
+  }
+}
+
 function say(message = '') {
-  process.stdout.write(`${message}\n`);
+  if (!closedStreams.has(process.stdout)) process.stdout.write(`${message}\n`);
 }
 
 function fail(message) {
-  process.stderr.write(`error: ${message}\n`);
+  if (!closedStreams.has(process.stderr)) process.stderr.write(`error: ${message}\n`);
 }
 
 /** Advisory findings go to stderr, prefixed `warning: `; they never change the exit code. */
 function warn(message) {
-  process.stderr.write(`warning: ${message}\n`);
+  if (!closedStreams.has(process.stderr)) process.stderr.write(`warning: ${message}\n`);
 }
 
 /** `1 problem`, `2 problems`. */
@@ -554,8 +586,85 @@ function checkText(root, relPath, kind, today, text) {
 }
 
 /**
- * Runs `checkText` on one file on disk; a file that cannot be read is
- * reported as an error.
+ * Offset of the first byte of the first sequence in `bytes` that is not
+ * valid UTF-8, or -1 when every byte is. Validity is the WHATWG Encoding
+ * Standard's, which Ruby's, and so Jekyll's, matches: a stray continuation
+ * byte, the bytes C0, C1 and F5 to FF, an overlong form, a surrogate
+ * (U+D800 to U+DFFF), a code point above U+10FFFF and a sequence cut short
+ * by another byte or by the end of the bytes are all invalid, each at the
+ * offset of the byte that starts it.
+ *
+ * @param {Uint8Array} bytes
+ * @returns {number}
+ */
+function invalidUtf8Offset(bytes) {
+  for (let i = 0; i < bytes.length;) {
+    const lead = bytes[i];
+    if (lead < 0x80) {
+      i += 1;
+      continue;
+    }
+    let needed;
+    let lower = 0x80;
+    let upper = 0xbf;
+    if (lead >= 0xc2 && lead <= 0xdf) {
+      needed = 1;
+    } else if (lead >= 0xe0 && lead <= 0xef) {
+      needed = 2;
+      if (lead === 0xe0) lower = 0xa0; // below: an overlong form
+      if (lead === 0xed) upper = 0x9f; // above: a surrogate
+    } else if (lead >= 0xf0 && lead <= 0xf4) {
+      needed = 3;
+      if (lead === 0xf0) lower = 0x90; // below: an overlong form
+      if (lead === 0xf4) upper = 0x8f; // above: beyond U+10FFFF
+    } else {
+      return i;
+    }
+    for (let k = 1; k <= needed; k += 1) {
+      const next = bytes[i + k];
+      if (next === undefined || next < lower || next > upper) return i;
+      lower = 0x80;
+      upper = 0xbf;
+    }
+    i += needed + 1;
+  }
+  return -1;
+}
+
+/**
+ * Decodes an article's bytes exactly as UTF-8 (`STRICT_UTF8`: a leading
+ * byte-order mark is kept, as a lossy read keeps it), or locates the first
+ * invalid sequence. The Pages build cannot read an article that is not
+ * UTF-8: Jekyll logs "invalid byte sequence in UTF-8", leaves the article out
+ * of the site and still succeeds, so check, publish and guard refuse it
+ * instead of checking the replacement characters a lossy read would give.
+ * The result depends on the bytes alone, so `guard` caches it by blob id.
+ *
+ * @param {Uint8Array} bytes The article's complete content.
+ * @returns {{ text: string, invalid: null } | { text: null, invalid: string }} `invalid` locates
+ *   the first invalid sequence by byte offset (from 0) and line (from 1), for `notUtf8`.
+ * @throws {Error} what the decoder threw, when it failed for a reason other than invalid bytes.
+ */
+function decodeUtf8(bytes) {
+  try {
+    return { text: STRICT_UTF8.decode(bytes), invalid: null };
+  } catch (err) {
+    const offset = err?.code === 'ERR_ENCODING_INVALID_ENCODED_DATA' ? invalidUtf8Offset(bytes) : -1;
+    if (offset === -1) throw err;
+    let line = 1;
+    for (let nl = bytes.indexOf(0x0a); nl !== -1 && nl < offset; nl = bytes.indexOf(0x0a, nl + 1)) line += 1;
+    return { text: null, invalid: `byte offset ${offset}, line ${line}` };
+  }
+}
+
+/** The error for an article that `decodeUtf8` found is not valid UTF-8. */
+function notUtf8(relPath, invalid) {
+  return `${relPath}: not valid UTF-8 (${invalid}); save the file as UTF-8`;
+}
+
+/**
+ * Runs `checkText` on one file on disk; a file that cannot be read, or is
+ * not valid UTF-8 (`decodeUtf8`), is reported as its only error.
  *
  * @param {string} root Absolute repository root.
  * @param {string} relPath Repository-relative POSIX path of the article.
@@ -564,13 +673,15 @@ function checkText(root, relPath, kind, today, text) {
  * @returns {{ errors: string[], warnings: string[], text: string, data: Record<string, unknown> }}
  */
 function checkFile(root, relPath, kind, today = todayUtc()) {
-  let text;
+  let bytes;
   try {
-    text = fs.readFileSync(inRoot(root, relPath), 'utf8');
+    bytes = fs.readFileSync(inRoot(root, relPath));
   } catch (err) {
     const errors = [`${relPath}: cannot read the file (${err.code ?? err.message})`];
     return { errors, warnings: [], text: '', data: {} };
   }
+  const { text, invalid } = decodeUtf8(bytes);
+  if (invalid !== null) return { errors: [notUtf8(relPath, invalid)], warnings: [], text: '', data: {} };
   return checkText(root, relPath, kind, today, text);
 }
 
@@ -721,18 +832,21 @@ function gitToplevel(root) {
 }
 
 /**
- * Reads a blob's exact bytes by object id and decodes them as UTF-8, caching
- * by id so a blob shared by several commits is read once. Reading by id with
- * `cat-file blob` returns the stored content with no textconv or filter
- * applied, so the checks always see exactly what would be published. Each
- * article also carries this id to `checkTrackedContent`, which caches the
- * blob's parse and text analysis under it (`guard --pre-push` shares one
- * cache across all its commits), so such a blob is also parsed once.
+ * Reads a blob's exact bytes by object id and decodes them with `decodeUtf8`,
+ * caching the result by id so a blob shared by several commits is read and
+ * decoded once. Reading by id with `cat-file blob` returns the stored content
+ * with no textconv or filter applied, so the checks always see exactly what
+ * would be published. Each article also carries this id to
+ * `checkTrackedContent`, which caches the blob's parse and text analysis
+ * under it (`guard --pre-push` shares one cache across all its commits), so
+ * such a blob is also parsed once.
+ *
+ * @returns {(oid: string) => { text: string, invalid: null } | { text: null, invalid: string }}
  */
 function makeBlobReader(cwd) {
   const cache = new Map();
   return (oid) => {
-    if (!cache.has(oid)) cache.set(oid, git(cwd, ['cat-file', 'blob', oid]).toString('utf8'));
+    if (!cache.has(oid)) cache.set(oid, decodeUtf8(git(cwd, ['cat-file', 'blob', oid])));
     return cache.get(oid);
   };
 }
@@ -1616,6 +1730,14 @@ function cmdPublish(root, slug) {
   if (!pathsConfined(root, 'publish', slug)) return EXIT_INVALID;
   const draftRel = `_drafts/${slug}.md`;
   if (!isFile(inRoot(root, draftRel))) {
+    // A repeat publish finds the post rather than a draft; `new` would refuse its slug.
+    const posts = findPosts(root, slug);
+    if (posts.length > 0) {
+      fail(`slug ${slug} is already published as ${posts.join(', ')} and ${draftRel} does not exist; to update `
+        + 'the article, edit the post, set updated: YYYY-MM-DD, then check, verify, commit and push; to take it '
+        + `down, run: node scripts/article.mjs unpublish ${slug}`);
+      return EXIT_INVALID;
+    }
     fail(`${draftRel} does not exist; start a draft with: node scripts/article.mjs new ${slug}`);
     return EXIT_INVALID;
   }
@@ -1639,7 +1761,10 @@ function publishDraft(root, slug) {
     fail(`${draftRel}: cannot read the file (${err.code ?? err.message}); nothing was moved`);
     return EXIT_INVALID;
   }
-  const { errors, warnings, text, data } = checkText(root, draftRel, 'draft', today, snapshot.toString('utf8'));
+  const decoded = decodeUtf8(snapshot);
+  const { errors, warnings, text, data } = decoded.invalid === null
+    ? checkText(root, draftRel, 'draft', today, decoded.text)
+    : { errors: [notUtf8(draftRel, decoded.invalid)], warnings: [], text: '', data: {} };
   for (const message of warnings) warn(message);
   if (errors.length > 0) {
     for (const message of errors) fail(message);
@@ -1935,9 +2060,12 @@ function unpublishPost(root, slug) {
   say();
   say('Next:');
   if (runsOutsideRoot(root)) say(`  cd ${shellQuote(root)}`);
-  say(`  git add -A -- ${shellPath(postRel)}${moveImages ? ` ${shellPath(blogImagesRel)}` : ''}`);
+  // Stages the deletion of every path git tracks here and, unlike `git add`, ignores a path it never tracked.
+  say(`  git rm -r -q --cached --ignore-unmatch -- ${shellPath(postRel)}`
+    + `${moveImages ? ` ${shellPath(blogImagesRel)}` : ''}`);
   say(`  git commit -m "Unpublish: ${slug}"`);
   say('  git push origin main');
+  say('If the post was never committed, there is nothing to commit: skip the commit and the push.');
   warn('everything already pushed stays readable in git history; unpublishing only removes the article '
     + 'from the live site at the next Pages build');
   return EXIT_OK;
@@ -2001,15 +2129,19 @@ function stagedChanges(top) {
  * Reads the given articles from tree or index entries, each with its blob id
  * as `id`. An entry that is not a regular file has no article text and is
  * never read; `articleModeProblem`, applied to the complete tree, refuses it.
+ * An article that is not valid UTF-8, which the Pages build would leave out,
+ * is not checked further: its refusal is added to `errors` instead.
  */
-function readArticles(changedPaths, entryFor, readBlob) {
+function readArticles(changedPaths, entryFor, readBlob, errors) {
   const articles = [];
   for (const p of changedPaths) {
     if (!ARTICLE_PATH_RE.test(p)) continue;
     const entry = entryFor(p);
     if (entry === undefined) throw new GitError(`${p} is listed as changed but has no entry in the tree`);
     if (!REGULAR_FILE_MODES.has(entry.mode)) continue;
-    articles.push({ path: p, text: readBlob(entry.oid), id: entry.oid });
+    const { text, invalid } = readBlob(entry.oid);
+    if (invalid === null) articles.push({ path: p, text, id: entry.oid });
+    else errors.push(notUtf8(p, invalid));
   }
   return articles;
 }
@@ -2043,7 +2175,7 @@ function cmdGuardStaged(root) {
   }
 
   const readBlob = makeBlobReader(top);
-  const articles = readArticles(stagedChanges(top), (p) => entries.get(p), readBlob);
+  const articles = readArticles(stagedChanges(top), (p) => entries.get(p), readBlob, errors);
   for (const message of checkTrackedContent({ paths, articles, todayUtc: today })) errors.push(message);
 
   if (errors.length > 0) {
@@ -2172,7 +2304,7 @@ function cmdGuardPrePush(root) {
       const modeProblem = articleModeProblem(p, mode);
       if (modeProblem !== null) errors.push(modeProblem);
     }
-    const articles = readArticles(changed, (p) => tree.get(p), readBlob);
+    const articles = readArticles(changed, (p) => tree.get(p), readBlob, errors);
     const content = checkTrackedContent({ paths: [...tree.keys()], articles, todayUtc: today, cache: analyses });
     for (const message of content) errors.push(message);
     if (errors.length > 0) {
@@ -2254,7 +2386,38 @@ function parseArgs(argv) {
   const root = path.resolve(rootArg ?? process.cwd());
   const rootStat = fs.statSync(root, { throwIfNoEntry: false });
   if (rootStat === undefined || !rootStat.isDirectory()) throw new UsageError(`--root ${root} is not a directory`);
+  if (command !== 'guard') assertSiteRoot(root, rootArg !== null);
   return { help, root, command, args, modes };
+}
+
+/**
+ * Refuses a root that is not the site root, the folder holding Jekyll's
+ * `_config.yml`. From a subfolder such as `blog/`, `check` would otherwise
+ * find no articles and exit 0, and `new`, `publish` and `unpublish` would
+ * fail with messages that never name the root. No git is run: these
+ * commands also work outside a repository. `guard` is not checked here, as
+ * it finds the repository root with git itself.
+ *
+ * @param {string} root Absolute root the command would use.
+ * @param {boolean} given True when `--root` named it, false when it is the current directory.
+ * @throws {UsageError} naming the root and the nearest folder above it that holds `_config.yml`, if any.
+ */
+function assertSiteRoot(root, given) {
+  if (isFile(path.join(root, '_config.yml'))) return;
+  let above = null;
+  for (let dir = root; above === null && path.dirname(dir) !== dir;) {
+    dir = path.dirname(dir);
+    try {
+      if (isFile(path.join(dir, '_config.yml'))) above = dir;
+    } catch {
+      // A folder that cannot be read only goes unnamed in the hint; the refusal stands.
+    }
+  }
+  const hint = above === null ? '' : ` (${above} holds _config.yml)`;
+  throw new UsageError(given
+    ? `--root ${root} is not the site root (it has no _config.yml); pass the repository root${hint}`
+    : `${root} is not the site root (it has no _config.yml); run the command from the repository root${hint} `
+      + 'or pass --root <dir>');
 }
 
 function run(argv) {
@@ -2281,9 +2444,11 @@ function run(argv) {
  * Entry point. Usage errors print the usage block and exit 2; every other
  * failure, git errors included, exits 1, so a guard that cannot complete its
  * checks refuses rather than allows. The exit code is set rather than forced
- * so buffered output to a pipe is flushed first.
+ * so buffered output to a pipe is flushed first. A closed output pipe leaves
+ * it as it is (`watchOutput`).
  */
 function main() {
+  watchOutput();
   try {
     process.exitCode = run(process.argv.slice(2));
   } catch (err) {

@@ -7,11 +7,15 @@
  *   node tests/fixtures/build-fixture-site.mjs <outDir> [--ref <rev>] [--fixtures-only]
  *
  *   <outDir>         Output folder: absent or empty, and outside the repository.
+ *                    Once every check has passed, the run claims it by
+ *                    creating `<outDir>/src` exclusively, so of several runs
+ *                    into one folder only the first proceeds.
  *   --ref <rev>      Take the site source from that commit (`git archive`)
  *                    instead of the working tree. The fixture articles always
  *                    come from the working tree.
  *   --fixtures-only  Leave the repository's real `_posts/` out, so only the
  *                    fixture articles are built.
+ *   -h, --help       Print the full help and exit 0.
  *
  * Output layout under <outDir>:
  *   src/                     Staged source: the allow-listed site files, the
@@ -30,8 +34,10 @@
  * Exit codes: 0 when all three variants are built; 1 for a copy, staging or
  * build failure, including a git, tar or Jekyll run that failed, was killed,
  * exceeded its deadline or could not be started; 2 for a usage error,
- * including a `--ref` that names no commit. On failure `<outDir>` is left in
- * place for inspection; its owner removes it.
+ * including a `--ref` that names no commit and an `<outDir>` that is not a
+ * folder, is not empty or was claimed by another run first. A run refused
+ * with 2 writes nothing. On failure `<outDir>` is left in place for
+ * inspection; its owner removes it.
  *
  * Nothing here is published: `_config.yml` excludes `tests/`, and the
  * synthetic draft, its image and the future-dated post are written only into
@@ -47,7 +53,7 @@ import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 
-import { DEADLINES, describeResult, runSync } from "../../scripts/lib/subprocess.mjs";
+import { DEADLINES, describeResult, formatDuration, runSync } from "../../scripts/lib/subprocess.mjs";
 
 /* ------------------------------------------------------------------------ */
 /* Public constants (imported by the built-output suites)                    */
@@ -386,17 +392,53 @@ function assertOutsideRepo(outDir) {
   }
 }
 
-/** Refuses an output folder that is a file or already has entries. */
+/**
+ * Refuses an output folder that is not a folder, lies below something that
+ * is not a folder, or already has entries.
+ * @throws {Error} exit code 2 for each of those; exit code 1 when `outDir`
+ *   cannot be inspected.
+ */
 function assertEmptyOrAbsent(outDir) {
   let stat;
   try {
     stat = fs.statSync(outDir);
   } catch (err) {
     if (err.code === "ENOENT") return;
+    if (err.code === "ENOTDIR") throw fail(`a parent of ${outDir} is not a folder`, 2);
     throw fail(`cannot inspect ${outDir}: ${err.message}`, 1);
   }
-  if (!stat.isDirectory() || fs.readdirSync(outDir).length > 0) {
-    throw fail(`${outDir} exists and is not empty`, 2);
+  if (!stat.isDirectory()) throw fail(`${outDir} exists and is not a folder`, 2);
+  if (fs.readdirSync(outDir).length > 0) throw fail(`${outDir} exists and is not empty`, 2);
+}
+
+/**
+ * Claims `outDir` for this run once every pre-flight check has passed and
+ * before anything else is written: `outDir` is created when absent, then
+ * `srcDir` inside it without `recursive`, which fails when it already
+ * exists. Of several runs into one folder exactly one gets past this, however
+ * their checks interleave; the others write and remove nothing below it.
+ * @param {string} outDir Absolute output folder.
+ * @param {string} srcDir `<outDir>/src`.
+ * @throws {Error} exit code 2 when `srcDir` already exists (another run
+ *   claimed `outDir` first), or when `outDir` or a folder above it is not a
+ *   folder; exit code 1 when either folder cannot be created otherwise.
+ */
+function claimOutDir(outDir, srcDir) {
+  try {
+    fs.mkdirSync(outDir, { recursive: true });
+  } catch (err) {
+    if (err.code === "EEXIST") throw fail(`${outDir} exists and is not a folder`, 2);
+    if (err.code === "ENOTDIR") throw fail(`a parent of ${outDir} is not a folder`, 2);
+    throw fail(`cannot create ${outDir}: ${err.message}`, 1);
+  }
+  try {
+    fs.mkdirSync(srcDir);
+  } catch (err) {
+    if (err.code === "EEXIST") {
+      throw fail(`${outDir} is already in use by another run (${srcDir} exists); give each run an empty folder of its own`, 2);
+    }
+    if (err.code === "ENOTDIR") throw fail(`a parent of ${srcDir} is not a folder`, 2);
+    throw fail(`cannot create ${srcDir}: ${err.message}`, 1);
   }
 }
 
@@ -678,7 +720,8 @@ function jekyllBuild({ source, destination, configs, extra = [] }) {
 
 /**
  * The whole run behind `buildFixtureSite`: option checks, pre-flight checks,
- * staging and the three builds. Its errors are normalized by that wrapper.
+ * the claim of `<outDir>`, staging and the three builds. Its errors are
+ * normalized by that wrapper.
  * @param {{ outDir?: string, ref?: string | null, fixturesOnly?: boolean }} options
  * @returns {Readonly<{ src: string, project: string, preview: string, empty: string }>}
  */
@@ -715,7 +758,9 @@ function stageAndBuild({ outDir, ref, fixturesOnly = false } = {}) {
   const emptySrc = path.join(out, "empty-src");
   const empty = path.join(out, "empty");
 
-  fs.mkdirSync(src, { recursive: true });
+  // After every pre-flight check, so a refused run leaves no folder; before any write, so a run that loses
+  // the claim to a concurrent one shares nothing with it.
+  claimOutDir(out, src);
 
   // 1. Stage the allow-listed site source, which must hold no draft image before anything is added.
   if (sha !== null) {
@@ -786,13 +831,17 @@ function stageAndBuild({ outDir, ref, fixturesOnly = false } = {}) {
  *   // project === "<tmp>/fx/project/cabrillo-coast"; serve "<tmp>/fx/project" for /cabrillo-coast/
  *
  * @param {object} options
- * @param {string} options.outDir Output folder: absent, or an empty folder, outside the repository.
+ * @param {string} options.outDir Output folder: absent, or an empty folder, outside the repository,
+ *   with no comma in its absolute path. Once every check has passed, the run claims it by creating
+ *   `<outDir>/src` exclusively; a concurrent run into the same folder is refused.
  * @param {string} [options.ref] Revision to take the site source from; the working tree when omitted.
  * @param {boolean} [options.fixturesOnly=false] Leave the real `_posts/` out of the staged source.
  * @returns {Promise<Readonly<{ src: string, project: string, preview: string, empty: string }>>}
  *   Absolute paths of the staged source and the three built sites (`project` is the site
  *   folder `<outDir>/project/cabrillo-coast`).
- * @throws {Error} with `exitCode` 2 for a usage error, 1 for a copy or build failure.
+ * @throws {Error} with `exitCode` 2 for a usage error, including an `outDir` that is not a folder,
+ *   is not empty or was claimed by another run first, with nothing written; 1 for a copy or build
+ *   failure.
  */
 export async function buildFixtureSite(options = {}) {
   try {
@@ -808,6 +857,66 @@ export async function buildFixtureSite(options = {}) {
 /* ------------------------------------------------------------------------ */
 /* Command line                                                              */
 /* ------------------------------------------------------------------------ */
+
+/** Help text; the paths, base path and deadlines come from the constants the run uses, so they cannot drift. */
+function helpText() {
+  const project = `project/${PROJECT_BASEURL.replace(/^\/+/, "")}/`;
+  return [
+    USAGE,
+    "",
+    "Stages an allow-listed copy of the site source with the fixture articles and synthetic private",
+    "content, and builds the project, preview and empty variants of the blog from it.",
+    "",
+    "Arguments:",
+    "  <outDir>         Output folder, relative to the current directory: absent or an empty folder,",
+    "                   outside the repository, with no comma in its absolute path (Jekyll splits",
+    "                   --config on commas). Once every check has passed, the run claims it by",
+    "                   creating <outDir>/src exclusively, so a second run into the same folder is",
+    "                   refused.",
+    "",
+    "Options:",
+    "  --ref <rev>      Take the site source from that commit with git archive instead of the",
+    "                   working tree; the fixture articles always come from the working tree. A",
+    `                   revision that lacks ${REQUIRED_PATHS.slice(0, -1).join(", ")} or ${REQUIRED_PATHS.at(-1)}`,
+    "                   predates the blog (exit 1); one that names no commit or starts with '-' is",
+    "                   refused (exit 2).",
+    "  --fixtures-only  Leave the repository's real _posts/ out, so only the fixture articles are built.",
+    "  -h, --help       Show this help.",
+    "",
+    "Output under <outDir>:",
+    "  src/                     Staged source: the allow-listed site files, the fixture posts, a",
+    "                           synthetic draft and its image, a post dated one year ahead and",
+    `                           ${PROJECT_OVERLAY}; never a real draft or draft image.`,
+    "  project-src/             src/ without CNAME (project-path deployment).",
+    `  ${project.padEnd(24)} Build of project-src/ at base path ${PROJECT_BASEURL}, with url`,
+    `                           ${PROJECT_URL}.`,
+    "  preview/                 --drafts build of src/ with _config.preview.yml: empty base path,",
+    "                           CNAME kept.",
+    "  empty-src/               src/ without _posts/.",
+    "  empty/                   Zero-article build (launch state).",
+    "",
+    "Environment:",
+    "  JEKYLL_ENV is removed from every git, tar and Jekyll child: a local production build derives",
+    "  the wrong base path, so the project base path is passed with --baseurl instead. Each build runs",
+    "  bundle exec jekyll build with BUNDLE_GEMFILE set to the repository Gemfile. bundle must be on",
+    "  PATH, and git and tar as well for --ref.",
+    "",
+    `Deadlines: each Jekyll build ${formatDuration(DEADLINES.jekyllBuild)}, git archive ${formatDuration(DEADLINES.gitArchive)}, ` +
+      `tar extraction ${formatDuration(DEADLINES.tarExtract)}, each git query ${formatDuration(DEADLINES.gitQuery)}.`,
+    "A child past its deadline is killed and the run exits 1.",
+    "",
+    "Exit status: 0 when all three variants are built; 1 for a copy, staging or build failure,",
+    "including a git, tar or Jekyll run that failed, was killed, exceeded its deadline or could not",
+    "be started; 2 for a usage error, including a --ref that names no commit and an <outDir> that is",
+    "inside the repository, holds a comma, is not a folder, is not empty or was claimed by another",
+    "run first. A run refused with 2 writes nothing. On failure <outDir> is left in place for",
+    "inspection; its owner removes it.",
+    "",
+    "Examples:",
+    '  node tests/fixtures/build-fixture-site.mjs "$(mktemp -d)"',
+    '  node tests/fixtures/build-fixture-site.mjs "$(mktemp -d)" --ref origin/main --fixtures-only',
+  ].join("\n");
+}
 
 /**
  * Parses the command line and runs the builder.
@@ -834,7 +943,7 @@ async function main(argv) {
   }
   const { values, positionals } = parsed;
   if (values.help) {
-    console.log(USAGE);
+    console.log(helpText());
     return 0;
   }
   if (positionals.length !== 1) {

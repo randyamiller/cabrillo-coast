@@ -15,12 +15,13 @@
  * Coverage (AC-08, and AC-02 for the index). Common cases run in both builds,
  * vacuously per entry on the empty one: entry shape, title, summary and tags
  * against the listing and the article page, one entry per built article, URL
- * resolution, newest-first and listing order, absence of private content,
- * distinct body tokens and the size budget. Fixture-only cases are skipped with
- * `FIXTURE_DIR not set` on the real build: body-only words and fenced code,
- * bodies against the built prose, leftover character references, and title,
- * summary and tags as raw text against the fixture sources, with dates from
- * the fixture filenames read in UTC.
+ * resolution, newest-first and listing order, distinct body tokens and the
+ * size budget. Fixture-only cases are skipped with `FIXTURE_DIR not set` on the
+ * real build: absence of private content, which first confirms the synthetic
+ * draft, its image and the future-dated post were staged in `FIXTURE_DIR/src`,
+ * body-only words and fenced code, bodies against the built prose, leftover
+ * character references, and title, summary and tags as raw text against the
+ * fixture sources, with dates from the fixture filenames read in UTC.
  *
  * The body oracle is derived from the article page alone, independent of the
  * template. With the explicit checks for live tags, case, separators, repeats
@@ -76,7 +77,7 @@ const BASE = (process.env.SITE_BASEURL || '').replace(/\/+$/, '');
 /** Fixture output folder from `build-fixture-site.mjs`, or `''` on the real build. */
 const FIXTURE_DIR = process.env.FIXTURE_DIR ? path.resolve(ROOT, process.env.FIXTURE_DIR) : '';
 
-/** Options for cases that need the fixture articles in `SITE_DIR`. */
+/** Options for cases that need the fixture build: its articles in `SITE_DIR` or its staged source in `FIXTURE_DIR`. */
 const FIXTURE_ONLY = Object.freeze({ skip: !FIXTURE_DIR && 'FIXTURE_DIR not set' });
 
 /* Constants */
@@ -198,11 +199,11 @@ const TOKEN_BODY_RE = /^[^\t\n\v\f\r ]+(?: [^\t\n\v\f\r ]+)*$/;
 
 /**
  * The synthetic draft's image folder (`assets/drafts/fixture-private-draft/`),
- * the AC-02 draft-image reference. It is the only draft-image folder a fixture
- * build's source holds (staging leaves the author's own out), and the real
- * build renders no draft. The bare `assets/drafts/` prefix is no needle: index
- * bodies are `strip_html` text, so on either build it could match only a
- * published article that names the path, which leaks nothing. The folder holds
+ * the AC-02 draft-image reference, searched for on the fixture build only. It
+ * is the only draft-image folder the fixture's staged source holds (staging
+ * leaves the author's own out). The bare `assets/drafts/` prefix is no needle:
+ * index bodies are `strip_html` text, so it could match only a published
+ * article that names the path, which leaks nothing. The folder holds
  * `DRAFT_SLUG`, so the slug needle matches it too; it is kept so that a failure
  * names the draft-image clause of AC-02.
  */
@@ -396,6 +397,21 @@ function fixtureSource(file) {
   const { data, body, errors } = parseArticle(readFileSync(source, 'utf8'));
   assert.deepEqual(errors, [], `${source} does not parse`);
   return { data, body };
+}
+
+/**
+ * Confirms the fixture builder wrote the synthetic draft, its image and the
+ * future-dated post into its staged source (`FIXTURE_DIR/src`), so their
+ * absence from the index proves exclusion rather than a missing input. Same
+ * check as `assertSyntheticSource` in `built-pages.test.mjs`.
+ */
+function assertSyntheticSource() {
+  const src = path.join(FIXTURE_DIR, 'src');
+  assert.ok(existsSync(path.join(src, '_drafts', `${DRAFT_SLUG}.md`)), `${src} holds no synthetic draft`);
+  assert.ok(existsSync(path.join(src, ...DRAFT_IMAGE.split('/'))), `${src} holds no synthetic draft image`);
+  const postsDir = path.join(src, '_posts');
+  const future = existsSync(postsDir) ? readdirSync(postsDir).filter((name) => name.endsWith(`-${FUTURE_SLUG}.md`)) : [];
+  assert.equal(future.length, 1, `${postsDir} holds no future-dated synthetic post`);
 }
 
 /**
@@ -629,7 +645,9 @@ function defineSuite() {
 
   /* Phase 3: AC-02, private content never reaches the index */
 
-  test('[AC-02][F-017] no draft or future-dated post reaches the index', () => {
+  test('[AC-02][F-017] no draft or future-dated post reaches the index', FIXTURE_ONLY, () => {
+    // Absence proves exclusion only once the private inputs are known to exist.
+    assertSyntheticSource();
     const entries = requireEntries();
     for (const { url } of entries) {
       assert.ok(!url.includes(DRAFT_SLUG), `the synthetic draft is indexed: ${url}`);

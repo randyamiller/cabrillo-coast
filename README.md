@@ -144,7 +144,9 @@ Do the [one-time setup](#one-time-setup) first, including
 3. **Check.** `node scripts/article.mjs check _drafts/<slug>.md` reports schema
    errors, placeholder markers left over from the article template, unsafe markup,
    missing, external or `data:` images, and Liquid in code that is not wrapped in
-   `{% raw %}`.
+   `{% raw %}`. Save articles as UTF-8: the Pages build silently leaves out a file in
+   any other encoding, so `check`, `publish` and the hooks refuse it and name the
+   first invalid byte.
 4. **Publish.** `node scripts/article.mjs publish <slug>` re-runs the check, moves the
    draft to `_posts/<UTC date>-<slug>.md`, moves its images to `assets/blog/<slug>/`
    and rewrites their paths. An empty image folder is deleted instead, so an article
@@ -182,6 +184,9 @@ because the date prefix is not part of it.
 
 Every `article.mjs` command exits 0 on success, 1 on a validation failure (details on
 stderr) and 2 on a usage error. `node scripts/article.mjs --help` lists them all.
+Run `new`, `check`, `publish` and `unpublish` from the repository root, the folder
+holding `_config.yml`, or pass `--root <dir>`; from any other folder they refuse with
+exit code 2.
 
 #### Safeguards and their limits
 

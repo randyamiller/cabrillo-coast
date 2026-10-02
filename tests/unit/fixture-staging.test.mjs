@@ -25,7 +25,16 @@
  *     post, the real draft or the draft image the base commit carries;
  *   - both stages hold the synthetic draft, which exists only there;
  *   - a `--ref` without `_layouts/post.html` exits 1 ("predates the blog")
- *     and one that names no commit exits 2.
+ *     and one that names no commit exits 2;
+ *   - `--help` and `-h` print the usage line, then the options, the
+ *     `<outDir>` rules, the output folders, the environment, the deadlines,
+ *     the exit codes and an example, and write nothing;
+ *   - a file as `<outDir>`, or a path below one, exits 2 as "not a folder",
+ *     and a folder with entries exits 2 as "not empty", each writing nothing;
+ *   - a run whose `<outDir>` another run claims while its `--ref` checks run
+ *     (a `git` wrapper creates `<outDir>/src` on `rev-parse`) exits 2 and
+ *     writes and removes nothing, and of four simultaneous runs into one
+ *     folder exactly one builds a complete stage while the others exit 2.
  *
  * A second repository's HEAD tracks a draft image beside an article image,
  * and `git` and `tar` wrappers first on PATH log the `JEKYLL_ENV` each child
@@ -51,6 +60,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { DEADLINES, formatDuration } from '../../scripts/lib/subprocess.mjs';
 import { DRAFT_IMAGE, DRAFT_MARKER, DRAFT_SLUG, FIXTURE_POSTS, FUTURE_SLUG } from '../fixtures/build-fixture-site.mjs';
 import {
   BASE_STYLES,
@@ -105,12 +115,16 @@ changeWorkingTree(REPO);
 
 /**
  * Runs the repository's copy of the builder with `args` and the stand-in
- * bundle first on PATH.
+ * bundle first on PATH, preceded by `bin` when given. The stand-in logs to
+ * `bundleLog`; `env` adds variables.
+ * @param {string[]} args
+ * @param {{ bin?: string, bundleLog?: string, env?: NodeJS.ProcessEnv }} [options]
  */
-function runBuilder(args) {
+function runBuilder(args, { bin, bundleLog = BUNDLE_LOG, env = {} } = {}) {
+  const PATH = [...(bin === undefined ? [] : [bin]), BIN, sandbox.env.PATH ?? ''].join(path.delimiter);
   return runNode([path.join(REPO, 'tests', 'fixtures', 'build-fixture-site.mjs'), ...args], {
     cwd: REPO,
-    env: { ...sandbox.env, PATH: `${BIN}${path.delimiter}${sandbox.env.PATH ?? ''}`, FAKE_BUNDLE_LOG: BUNDLE_LOG },
+    env: { ...sandbox.env, ...env, PATH, FAKE_BUNDLE_LOG: bundleLog },
     timeoutMs: 60000,
   });
 }
@@ -261,6 +275,168 @@ describe('[AC-16][F-018] build-fixture-site.mjs refuses a --ref it cannot build'
     assert.match(result.stderr, /^build-fixture-site: cannot resolve --ref no-such-revision$/m);
     assert.ok(result.stderr.split('\n').includes(USAGE), result.stderr);
     assert.ok(!fs.existsSync(out), 'nothing was staged');
+  });
+});
+
+/* ------------------------------------------------------------------------ */
+/* Help                                                                      */
+/* ------------------------------------------------------------------------ */
+
+describe('[AC-16][F-018] build-fixture-site.mjs --help documents its command line', { concurrency: 4 }, () => {
+  test('[AC-16][F-018] --help and -h print the full help on stdout, write nothing and exit 0', BUILD_CASE, async () => {
+    const out = path.join(sandbox.parent, 'out-help');
+    const phrases = [
+      // Options.
+      '--ref <rev>',
+      'git archive',
+      'the fixture articles always come from the working tree',
+      '--fixtures-only',
+      '-h, --help',
+      // <outDir> rules.
+      'absent or an empty folder',
+      'outside the repository',
+      'with no comma in its absolute path',
+      'the run claims it by',
+      'creating <outDir>/src exclusively',
+      // Environment and deadlines.
+      'JEKYLL_ENV is removed from every git, tar and Jekyll child',
+      'BUNDLE_GEMFILE set to the repository Gemfile',
+      `each Jekyll build ${formatDuration(DEADLINES.jekyllBuild)}`,
+      `git archive ${formatDuration(DEADLINES.gitArchive)}`,
+      `tar extraction ${formatDuration(DEADLINES.tarExtract)}`,
+      `each git query ${formatDuration(DEADLINES.gitQuery)}`,
+      // Exit codes and an example.
+      'Exit status: 0 when all three variants are built',
+      '1 for a copy, staging or build failure',
+      '2 for a usage error',
+      'On failure <outDir> is left in place',
+      'node tests/fixtures/build-fixture-site.mjs "$(mktemp -d)"',
+    ];
+    for (const flag of ['--help', '-h']) {
+      const result = await runBuilder([flag, out]);
+      expectExit(result, 0);
+      assert.equal(result.stderr, '', `${flag} writes nothing on stderr`);
+      assert.equal(result.stdout.split('\n')[0], USAGE, `${flag} prints the usage line first`);
+      for (const phrase of phrases) {
+        assert.ok(result.stdout.includes(phrase), `${flag} mentions ${JSON.stringify(phrase)}:\n${result.stdout}`);
+      }
+      for (const dir of ['src/', 'project-src/', 'project/cabrillo-coast/', 'preview/', 'empty-src/', 'empty/']) {
+        assert.match(result.stdout, new RegExp(`^  ${escapeRegExp(dir)} +\\S`, 'm'), `${flag} describes the output folder ${dir}`);
+      }
+      assert.ok(!fs.existsSync(out), `${flag} wrote nothing, not even the <outDir> it was given`);
+    }
+  });
+});
+
+/* ------------------------------------------------------------------------ */
+/* Output folder                                                             */
+/* ------------------------------------------------------------------------ */
+
+/** Asserts a refusal with exit 2: `message` as the builder's error line, then the usage line. */
+function expectRefused(result, message) {
+  expectExit(result, 2);
+  assert.match(result.stderr, new RegExp(`^${escapeRegExp(`build-fixture-site: ${message}`)}$`, 'm'));
+  assert.ok(result.stderr.split('\n').includes(USAGE), result.stderr);
+}
+
+/**
+ * Writes a `git` wrapper into `<sandbox>/<name>/` and returns that folder, to
+ * put first on PATH. On `git rev-parse`, the first query of the `--ref`
+ * checks, it creates `$FAKE_CLAIM_DIR/src/competitor-marker` as a concurrent
+ * run claiming the same `<outDir>` would, then runs the real git.
+ */
+function installClaimingGit(name) {
+  const bin = sandbox.folder(name);
+  fs.writeFileSync(
+    path.join(bin, 'git'),
+    [
+      '#!/bin/sh',
+      ': "${FAKE_CLAIM_DIR:?FAKE_CLAIM_DIR is not set}"',
+      'if [ "$1" = rev-parse ]; then',
+      `  mkdir -p "$FAKE_CLAIM_DIR/src" && printf '%s\\n' competitor > "$FAKE_CLAIM_DIR/src/competitor-marker" || exit 95`,
+      'fi',
+      `exec ${shQuote(commandPath('git'))} "$@"`,
+      '',
+    ].join('\n'),
+    { mode: 0o755 },
+  );
+  return bin;
+}
+
+describe('[AC-16][F-018] build-fixture-site.mjs refuses an output folder it cannot use or claim', { concurrency: 4 }, () => {
+  test('[AC-16][F-018] a file as <outDir> exits 2 as not a folder, and so does a path below it; the file is untouched', BUILD_CASE, async () => {
+    const parent = sandbox.folder('out-file');
+    const file = path.join(parent, 'afile');
+    fs.writeFileSync(file, '');
+    const written = fs.statSync(file);
+    const bundleLog = path.join(sandbox.folder('logs-out-file'), 'bundle.log');
+    const below = path.join(file, 'out');
+    expectRefused(await runBuilder([file, '--fixtures-only'], { bundleLog }), `${file} exists and is not a folder`);
+    expectRefused(await runBuilder([below, '--fixtures-only'], { bundleLog }), `a parent of ${below} is not a folder`);
+    assert.deepEqual(fs.readdirSync(parent), ['afile'], 'nothing was written beside the file');
+    const now = fs.statSync(file);
+    assert.ok(now.isFile(), 'the file is still a file');
+    assert.equal(now.size, 0, 'the file is still empty');
+    assert.equal(now.mtimeMs, written.mtimeMs, 'the file was not written');
+    assert.deepEqual(readJsonLines(bundleLog), [], 'nothing was built');
+  });
+
+  test('[AC-16][F-018] a folder that has entries still exits 2 as not empty and is left as it was', BUILD_CASE, async () => {
+    const out = sandbox.folder('out-not-empty');
+    fs.writeFileSync(path.join(out, 'keep.txt'), 'kept\n');
+    const bundleLog = path.join(sandbox.folder('logs-out-not-empty'), 'bundle.log');
+    expectRefused(await runBuilder([out, '--fixtures-only'], { bundleLog }), `${out} exists and is not empty`);
+    assert.deepEqual(fs.readdirSync(out), ['keep.txt'], 'nothing was added');
+    assert.equal(fs.readFileSync(path.join(out, 'keep.txt'), 'utf8'), 'kept\n', 'its entry is untouched');
+    assert.deepEqual(readJsonLines(bundleLog), [], 'nothing was built');
+  });
+
+  test('[AC-16][F-018] a run whose <outDir> another run claims during its --ref checks exits 2 and writes and removes nothing', BUILD_CASE, async () => {
+    const out = path.join(sandbox.parent, 'out-claimed');
+    const src = path.join(out, 'src');
+    const bundleLog = path.join(sandbox.folder('logs-claimed'), 'bundle.log');
+    assert.ok(!fs.existsSync(out), 'the folder is absent when the run starts, so its empty-folder check passes');
+    const result = await runBuilder([out, '--ref', BASE, '--fixtures-only'], {
+      bin: installClaimingGit('bin-git-claims'),
+      bundleLog,
+      env: { FAKE_CLAIM_DIR: out },
+    });
+    expectRefused(result, `${out} is already in use by another run (${src} exists); give each run an empty folder of its own`);
+    assert.ok(!result.stdout.includes('staging'), `nothing was staged:\n${result.stdout}`);
+    assert.deepEqual(fs.readdirSync(out), ['src'], 'no archive or other entry was written beside the other run\'s src/');
+    assert.deepEqual(fs.readdirSync(src), ['competitor-marker'], 'nothing was written into the other run\'s src/');
+    assert.equal(fs.readFileSync(path.join(src, 'competitor-marker'), 'utf8'), 'competitor\n', 'and nothing in it was changed');
+    assert.deepEqual(readJsonLines(bundleLog), [], 'nothing was built');
+  });
+
+  // `--ref` runs, because their git checks keep all four past the empty-folder check before any claims the
+  // folder; a working-tree run claims it within a millisecond of that check, so most overlaps would not race.
+  test('[AC-16][F-018] of four simultaneous --ref runs into one absent <outDir>, exactly one builds a complete stage and the others exit 2', BUILD_CASE, async () => {
+    const out = path.join(sandbox.parent, 'out-concurrent');
+    const src = path.join(out, 'src');
+    const bundleLog = path.join(sandbox.folder('logs-concurrent'), 'bundle.log');
+    const runs = await Promise.all([0, 1, 2, 3].map(() => runBuilder([out, '--ref', BASE, '--fixtures-only'], { bundleLog })));
+    const outputs = runs.map((run, i) => `--- run ${i} (exit ${run.status}):\n${run.out}`).join('\n');
+    assert.deepEqual(runs.map((run) => run.status).sort(), [0, 2, 2, 2], outputs);
+    const refusal = new RegExp(
+      `^build-fixture-site: (?:${escapeRegExp(`${out} is already in use by another run (${src} exists); give each run an empty folder of its own`)}|${escapeRegExp(`${out} exists and is not empty`)})$`,
+      'm',
+    );
+    for (const run of runs.filter(({ status }) => status === 2)) assert.match(run.stderr, refusal, outputs);
+
+    const files = listFiles(src);
+    for (const rel of [DRAFT_IMAGE, `_drafts/${DRAFT_SLUG}.md`, ...FIXTURE_POST_FILES.map((file) => `_posts/${file}`)]) {
+      assert.ok(files.includes(rel), `the winner's stage holds ${rel}: ${files.join(', ')}`);
+    }
+    assert.deepEqual(fs.readdirSync(out).sort(), ['empty', 'empty-src', 'preview', 'project', 'project-src', 'src'], 'only the winner wrote below the folder');
+    const builds = readJsonLines(bundleLog);
+    assert.deepEqual(
+      builds.map((build) => path.relative(out, build.destination)).sort(),
+      ['empty', 'preview', path.join('project', 'cabrillo-coast')],
+      'three builds, all the winner\'s',
+    );
+    const preview = builds.find((build) => build.destination === path.join(out, 'preview'));
+    assert.ok(preview.files.includes(DRAFT_IMAGE), 'the preview build saw the synthetic draft image');
   });
 });
 

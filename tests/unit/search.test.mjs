@@ -294,6 +294,15 @@ test('[AC-09][F-019] AND matching across fields', () => {
   assert.equal(none.length, 0, 'one unmatched term excludes every entry');
 });
 
+test('[AC-09][F-019] a term never matches across two tags', () => {
+  // Each tag is a value of its own: `ssr` occurs in the tags only if `ops`
+  // and `sre` are joined without a separator.
+  const tagged = entry('/blog/ops-sre/', { tags: ['ops', 'sre'] });
+  assert.deepEqual(search([tagged], 'ssr'), [], 'ssr spans the ops/sre boundary and must not match');
+  assert.deepEqual(search([tagged], 'ops'), [tagged.url], 'the first tag matches');
+  assert.deepEqual(search([tagged], 'sre'), [tagged.url], 'the second tag matches');
+});
+
 test('[AC-09][F-019] field weights order results title > tags > summary > body', () => {
   // Input order is the reverse of the expected order, so only the weights
   // can produce the expected result.

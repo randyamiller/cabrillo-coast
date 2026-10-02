@@ -164,8 +164,10 @@ export const messages = Object.freeze({
     ),
   /** A matcher that timed out while the screenshots still differed: a `Timeout:` line before the diff. */
   timedOutMismatch: (file) => matcherFailure(file, pixelSummary(10000, '0.01'), { timeout: true }),
-  /** A page that never rendered the same twice. */
-  unstable: (file) => matcherFailure(file, 'Failed to take two consecutive stable screenshots.'),
+  /** A page that never rendered the same twice: the matcher ran out of time, so a `Timeout:` line comes first. */
+  unstable: (file) => matcherFailure(file, 'Failed to take two consecutive stable screenshots.', { timeout: true }),
+  /** A `toHaveScreenshot` failure that did not time out, with `reason` (such as `The page has closed`) as its message. */
+  screenshotError: (file, reason) => matcherFailure(file, reason),
   /** A comparison run without the baseline file (`--update-snapshots=none`). */
   missingSnapshot: (absolutePath) => `Error: A snapshot doesn't exist at ${absolutePath}.\n\n${codeFrame(188, 30)}`,
   /** A page that could not be loaded. */
@@ -680,7 +682,9 @@ export function installFakeBundle(dir) {
  * (no actual image written or attached), `interrupted` (exit 130 after the
  * report), `killed` (SIGKILL itself after the actual images), `no-results`
  * (no JSON report), `run-error` (a run-level error), `timedout` (the second
- * case timed out), `baseline-short` (11 baseline files), `baseline-exit`
+ * case timed out), `unstable` (each differing article case fails as a page
+ * that never rendered the same twice, its actual image still written),
+ * `baseline-short` (11 baseline files), `baseline-exit`
  * (exit 1 after the baseline), `baseline-misnamed` (12 wrongly named
  * baseline files) and `baseline-one-misnamed` (the first file wrongly named).
  */
@@ -770,6 +774,8 @@ CASES.forEach((entry, index) => {
     message = messages.thrown(strictMismatchMessage(entry.file, {
       equal: false, differentPixels: 3, totalPixels: entry.width * 900, expectedSize: size, actualSize: size,
     }));
+  } else if (fault === 'unstable' && entry.page === 'article') {
+    message = messages.unstable(entry.file);
   } else {
     message = entry.page === 'listing' ? messages.pixelMismatch(entry.file) : messages.sizeMismatch(entry.file, entry.width);
   }

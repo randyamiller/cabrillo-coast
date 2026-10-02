@@ -2291,6 +2291,21 @@ const FM_BLANK_RE = /^[ \t]*$/;
 const FM_COMMENT_RE = /^[ \t]*#/;
 /** The `key:` that opens a `key: value` line (see `readKeyLine`). Group 1: the key. */
 const FM_KEY_RE = /^([a-z_][a-z0-9_]*):/;
+/** `FM_KEY_RE` in any letter case, to recognise a schema key written as `Title:` or `SUMMARY:`. */
+const FM_ANY_CASE_KEY_RE = /^([A-Za-z_][A-Za-z0-9_]*):/;
+/**
+ * The key an unsupported line was meant to set, read past indentation and
+ * blanks before the colon (`  title: "x"`, `title : "x"`). Group 1: the key.
+ */
+const FM_INTENDED_KEY_RE = /^[ \t]*([A-Za-z_][A-Za-z0-9_]*)[ \t]*:/;
+/**
+ * For each `data` object `parseArticle` returns, the keys it refused on their
+ * own line and so left out of `data`. `validateWithAnalysis` reads it so a
+ * required key whose line already has an error is not also reported missing.
+ * Kept outside `data`, so `data` holds only the parsed keys.
+ * @type {WeakMap<object, ReadonlySet<string>>}
+ */
+const REFUSED_KEYS = new WeakMap();
 /** The characters a front-matter value may not hold: JavaScript's line terminators. */
 const FM_LINE_TERMINATOR_RE = /[\n\r\u2028\u2029]/;
 const FM_TRAILER_RE = /^(?:[ \t]*|[ \t]+#.*)$/;
@@ -2481,24 +2496,29 @@ function readFlowList(s) {
 
 /**
  * Parses the value of a `key: value` line. Returns `{ value }` (a string or
- * an array of strings) or `{ error }`.
+ * an array of strings) or `{ error }`. Every error about the value of a
+ * display field (`title`, `summary`, `author`) names the field, as in
+ * `title must be a double-quoted string` or
+ * `title: a double-quoted string must close on the same line`.
  */
 function parseValue(key, raw) {
   if (raw === '' || raw.startsWith('#')) return { error: `${key} has no value` };
+  // The string reader's messages do not say which field they are about.
+  const refuse = (message) => ({ error: QUOTED_KEYS.has(key) ? `${key}: ${message}` : message });
   const c = raw[0];
   if (c === '"') {
     const q = readQuoted(raw, 0);
-    if (q.error) return q;
+    if (q.error) return refuse(q.error);
     if (!FM_TRAILER_RE.test(raw.slice(q.end))) {
-      return { error: 'only a comment ( # …) may follow the closing quote' };
+      return refuse('only a comment ( # …) may follow the closing quote');
     }
     return { value: q.value };
   }
-  if (c === '|' || c === '>') return { error: 'block scalars (| and >) are not supported' };
-  if (c === '&' || c === '*') return { error: 'anchors and aliases (& and *) are not supported' };
-  if (c === '!') return { error: 'YAML tags (!) are not supported' };
-  if (c === '{') return { error: 'flow mappings ({ … }) are not supported' };
-  if (c === "'") return { error: 'single-quoted strings are not supported; use double quotes' };
+  if (c === '|' || c === '>') return refuse('block scalars (| and >) are not supported');
+  if (c === '&' || c === '*') return refuse('anchors and aliases (& and *) are not supported');
+  if (c === '!') return refuse('YAML tags (!) are not supported');
+  if (c === '{') return refuse('flow mappings ({ … }) are not supported');
+  if (c === "'") return refuse('single-quoted strings are not supported; use double quotes');
   // Unquoted text is a YAML plain scalar whose type YAML infers (a date, a
   // number, `true`, `null`), so the display fields must always be quoted.
   if (QUOTED_KEYS.has(key)) return { error: `${key} must be a double-quoted string` };
@@ -2557,6 +2577,20 @@ function withoutPlainComment(raw) {
  * article schema are kept in `data` so `validateArticle` can reject them by
  * name. A duplicate key is an error and the first value is kept.
  *
+ * A key refused on its own line is left out of `data`, and its line error is
+ * the one finding about it: `validateArticle`, given this `data` object, does
+ * not also report that key as missing. That covers a value that does not
+ * parse (`title: Unquoted`), a line led by `key:` that is not a supported
+ * `key: value` form (`title:"x"`, a value holding U+2028), a schema key's
+ * line that is indented (`  title: "x"`) or has blanks before its colon
+ * (`title : "x"`), and a schema key in
+ * another letter case, reported as `key Title must be lowercase (title)`. Any
+ * other key in another case (`Published:`) is unsupported syntax. The refused
+ * keys are recorded in a private table keyed by this `data` object, not in
+ * `data` itself; a copy of `data` drops the record, and `validateArticle` then
+ * reports those keys as missing too. A key that is truly absent is always
+ * reported missing.
+ *
  * `body` is the exact, untrimmed remainder of `text` after the closing `---`
  * line and its line break (`''` when that line ends the file), so
  * `text.endsWith(body)` always holds and the body's first line is file line
@@ -2573,7 +2607,9 @@ function withoutPlainComment(raw) {
  *   1-based file line, as in
  *   `front matter line 3: title must be a double-quoted string`; an error
  *   about the whole file (missing or unclosed front matter) names no line.
- *   No error carries a path prefix; the caller adds it.
+ *   No error carries a path prefix; the caller adds it. A caller must report
+ *   `errors` whenever it reports `validateArticle` findings for `data`, since
+ *   a refused key's only finding is here.
  */
 export function parseArticle(text) {
   const src = asText(text, 'text');
@@ -2597,6 +2633,7 @@ export function parseArticle(text) {
   const data = {};
   const errors = [];
   const seen = new Set();
+  const refused = new Set();
   for (let i = 1; i < close; i += 1) {
     const line = stripCr(lines[i].text);
     const n = i + 1;
@@ -2610,16 +2647,34 @@ export function parseArticle(text) {
       }
       seen.add(key);
       const parsed = parseValue(key, m.value);
-      if (parsed.error) errors.push(`front matter line ${n}: ${parsed.error}`);
-      else setOwn(data, key, parsed.value);
-    } else if (/^[ \t]/.test(line)) {
-      errors.push(`front matter line ${n}: indentation is not supported`);
-    } else if (line.startsWith('-')) {
-      errors.push(`front matter line ${n}: block lists are not supported; use tags: [a, b]`);
+      if (parsed.error) {
+        errors.push(`front matter line ${n}: ${parsed.error}`);
+        refused.add(key);
+      } else {
+        setOwn(data, key, parsed.value);
+      }
     } else {
-      errors.push(`front matter line ${n}: unsupported syntax`);
+      // A line meant to set a schema key names that key even when its form is unsupported, so the
+      // line's error is the key's one finding: indented, with blanks before the colon, or in capitals.
+      const intended = FM_INTENDED_KEY_RE.exec(line)?.[1].toLowerCase();
+      if (intended !== undefined && ALLOWED_KEYS.includes(intended)) refused.add(intended);
+      if (/^[ \t]/.test(line)) {
+        errors.push(`front matter line ${n}: indentation is not supported`);
+      } else if (line.startsWith('-')) {
+        errors.push(`front matter line ${n}: block lists are not supported; use tags: [a, b]`);
+      } else {
+        const named = FM_ANY_CASE_KEY_RE.exec(line)?.[1];
+        const lower = named?.toLowerCase();
+        if (named !== undefined && named !== lower && ALLOWED_KEYS.includes(lower)) {
+          // Only schema keys get the hint: `Published:` stays unsupported syntax, as `published:` is refused too.
+          errors.push(`front matter line ${n}: key ${named} must be lowercase (${lower})`);
+        } else {
+          errors.push(`front matter line ${n}: unsupported syntax`);
+        }
+      }
     }
   }
+  REFUSED_KEYS.set(data, refused);
   return { data, body: src.slice(lines[close].next), errors };
 }
 
@@ -3497,7 +3552,13 @@ function futureDateMessage(path, date, today) {
  *   - `title` 1–100 and `summary` 1–200 characters (counted by code point;
  *     blank counts as missing); `tags` a list of 1–5 lowercase kebab-case
  *     tags; `updated` optional, a real date not earlier than a post's date;
- *     `author` optional and non-empty; the body non-empty;
+ *     `author` optional and non-empty; the body non-empty. When `data` is
+ *     the object `parseArticle` returned, a `title`, `summary` or `tags` it
+ *     refused on its own line (a value that does not parse, an unsupported
+ *     line led by the key, an indented line or blanks before its colon, the
+ *     key in another letter case) is not reported
+ *     missing: that line error, which the caller reports from
+ *     `parseArticle`'s `errors`, is the one finding about it;
  *   - no `TODO:` left in any front-matter value or in the body outside code;
  *   - images (outside code) have alt text and load a local file in the
  *     article's own folder, `/assets/drafts/<slug>/` for a draft or
@@ -3616,8 +3677,11 @@ function validateWithAnalysis({ path, data, body, kind, todayUtc, imageExists, b
     fileError(Object.hasOwn(REJECTED_KEY_REASONS, key) ? REJECTED_KEY_REASONS[key] : `unknown front-matter key ${key}`);
   }
 
-  // Field rules.
+  // Field rules. A key `parseArticle` refused on its line already has its finding there.
+  const refused = REFUSED_KEYS.get(fields);
+  const isRefused = (key) => refused !== undefined && !Object.hasOwn(fields, key) && refused.has(key);
   for (const [key, max] of [['title', TITLE_MAX], ['summary', SUMMARY_MAX]]) {
+    if (isRefused(key)) continue;
     const value = fields[key];
     if (!Object.hasOwn(fields, key) || (typeof value === 'string' && value.trim() === '')) {
       fileError(`${key} is required`);
@@ -3628,7 +3692,7 @@ function validateWithAnalysis({ path, data, body, kind, todayUtc, imageExists, b
     }
   }
   if (!Object.hasOwn(fields, 'tags')) {
-    fileError(`tags must list ${TAGS_MIN} to ${TAGS_MAX} tags (tags is missing)`);
+    if (!isRefused('tags')) fileError(`tags must list ${TAGS_MIN} to ${TAGS_MAX} tags (tags is missing)`);
   } else if (!Array.isArray(fields.tags)) {
     fileError('tags must be a flow list such as [a, b]');
   } else {

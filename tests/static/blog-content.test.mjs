@@ -27,7 +27,7 @@
  *     `process.env`: synthetic roots and temporary git repositories, run with
  *     no system, global or environment git configuration and an empty
  *     template (`TEMP_GIT_ENV`), live in one `os.tmpdir()` folder removed
- *     after the run.
+ *     after the run, including a run stopped by a signal (`PARENT_REMOVER`).
  *
  * Run: node --test tests/static/blog-content.test.mjs (Node 22 or later).
  */
@@ -35,9 +35,11 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  closeSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   readdirSync,
   realpathSync,
@@ -49,7 +51,7 @@ import {
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 
 import {
   ARTICLE_PATH_RE,
@@ -209,7 +211,47 @@ for (const name of GIT_REDIRECT_VARS) delete GIT_ENV[name];
  * link (macOS `/var`).
  */
 const PARENT = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'blog-content-')));
-after(() => rmSync(PARENT, { recursive: true, force: true }));
+const removeParent = () => rmSync(PARENT, { recursive: true, force: true });
+after(removeParent);
+process.on('exit', removeParent);
+
+/**
+ * Removes `PARENT` after an interrupted run too. A signal ends this process
+ * at once, before `after()` or the `exit` handler can run: Ctrl-C reaches
+ * every process in the terminal's group, and `node --test`, interrupted
+ * itself, sends this file's process SIGTERM and exits. A signal handler here
+ * would not help, because Node runs one only when the event loop turns,
+ * which these synchronous cases do not do until the file ends: the run
+ * would go on after Ctrl-C and then die writing to the runner's closed
+ * output, removing nothing. Instead a small process in its own session, out
+ * of reach of the terminal's signals and holding none of this process's
+ * output, reads a pipe that only this process holds open. End of file there
+ * comes however this process ends, SIGKILL included. If `PARENT` is still
+ * there, the remover deletes it, again two seconds later in case a git or
+ * hook run this process started was still writing to it, and exits. The
+ * signal still ends this process as it would anyway, so the exit status
+ * still reports it.
+ */
+const PARENT_REMOVER = [
+  "const { existsSync, rmSync } = require('node:fs');",
+  'const dir = process.argv[1];',
+  'const remove = () => rmSync(dir, { recursive: true, force: true, maxRetries: 10 });',
+  "process.stdin.on('error', remove).on('end', () => {",
+  '  if (!existsSync(dir)) return;',
+  '  remove();',
+  '  setTimeout(remove, 2000);',
+  '}).resume();',
+].join('\n');
+const parentRemover = spawn(process.execPath, ['-e', PARENT_REMOVER, PARENT], {
+  detached: true,
+  stdio: ['pipe', 'ignore', 'ignore'],
+});
+parentRemover.on('error', (error) => {
+  process.stderr.write(`warning: cannot start the process that removes ${PARENT} after an interrupted run: `
+    + `${error.message}\n`);
+});
+parentRemover.stdin?.unref();
+parentRemover.unref();
 
 const TEMP_GIT_CONFIG = path.join(PARENT, 'gitconfig');
 writeFileSync(TEMP_GIT_CONFIG, '');
@@ -259,6 +301,38 @@ function abs(rel) {
 /** Reads a repository file as UTF-8. */
 function read(rel) {
   return readFileSync(abs(rel), 'utf8');
+}
+
+/** Decodes UTF-8 exactly, as `scripts/article.mjs` does: an invalid byte is an error, a leading byte-order mark is kept. */
+const STRICT_UTF8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+
+/**
+ * An article's text decoded as `check`, `publish` and `guard` decode it, or
+ * `null` when the bytes are not valid UTF-8. The Pages build cannot read such
+ * an article: it leaves it out of the site and still succeeds, so a lossy
+ * read here would pass a post that never goes live.
+ *
+ * @param {Uint8Array} bytes The article's complete content.
+ * @returns {string | null}
+ */
+function decodeArticle(bytes) {
+  try {
+    return STRICT_UTF8.decode(bytes);
+  } catch (err) {
+    if (err?.code === 'ERR_ENCODING_INVALID_ENCODED_DATA') return null;
+    throw err;
+  }
+}
+
+/** A repository article read with `decodeArticle`. */
+function readArticle(rel) {
+  return decodeArticle(readFileSync(abs(rel)));
+}
+
+/** The finding for an article `decodeArticle` cannot decode. */
+function notUtf8Finding(rel) {
+  return `${rel}: not valid UTF-8; save the file as UTF-8 (the Pages build silently leaves out a file in any `
+    + 'other encoding)';
 }
 
 function exists(rel) {
@@ -621,11 +695,13 @@ const GUARD_STAND_IN = [
  * temporary repository whose `scripts/article.mjs` is the stand-in guard
  * `GUARD_STAND_IN`, and run from the subfolder `sub/folder` with
  * `TEMP_GIT_ENV`, this Node first on `PATH` and `hook.stdin` on standard
- * input, once with the stand-in exiting 1 and once exiting 0. Guard must be
- * reached both times with `hook.args`, the repository's real top level as its
- * working folder (the hook must find the root itself) and `hook.stdin`
- * unchanged, and the hook must exit with the stand-in's status. Nothing
- * touches this repository.
+ * input, once with the stand-in exiting 1 and once exiting 0. Standard input
+ * is a file holding `hook.stdin`, opened afresh for each run, never a pipe, so
+ * no write can race a hook that exits without reading it and abort the check
+ * before the hook's behaviour is judged. Guard must be reached both times with
+ * `hook.args`, the repository's real top level as its working folder (the hook
+ * must find the root itself) and `hook.stdin` unchanged, and the hook must
+ * exit with the stand-in's status. Nothing touches this repository.
  *
  * @returns {string[]} Problems; `[]` when the hook hands guard everything.
  */
@@ -636,22 +712,31 @@ function hookBehaviourProblems(text, hook) {
   tempGit(repo, ['init', '-q']);
   writeFiles(repo, { [hook.file]: text, 'scripts/article.mjs': GUARD_STAND_IN, 'sub/folder/.keep': '' });
   const top = realpathSync(repo);
+  const stdinFile = path.join(caseDir, 'stdin.txt');
+  writeFileSync(stdinFile, hook.stdin);
 
   const problems = [];
   for (const code of [1, 0]) {
     const record = path.join(caseDir, `guard-exit-${code}.json`);
-    const result = spawnSync('sh', [path.join(repo, ...hook.file.split('/'))], {
-      cwd: path.join(repo, 'sub', 'folder'),
-      env: {
-        ...TEMP_GIT_ENV,
-        PATH: `${path.dirname(process.execPath)}${path.delimiter}${TEMP_GIT_ENV.PATH ?? ''}`,
-        BLOG_CONTENT_GUARD_RECORD: record,
-        BLOG_CONTENT_GUARD_EXIT: String(code),
-      },
-      input: hook.stdin,
-      encoding: 'utf8',
-      timeout: 30000,
-    });
+    // A new descriptor per run, so each run reads hook.stdin from its start.
+    const stdin = openSync(stdinFile, 'r');
+    let result;
+    try {
+      result = spawnSync('sh', [path.join(repo, ...hook.file.split('/'))], {
+        cwd: path.join(repo, 'sub', 'folder'),
+        env: {
+          ...TEMP_GIT_ENV,
+          PATH: `${path.dirname(process.execPath)}${path.delimiter}${TEMP_GIT_ENV.PATH ?? ''}`,
+          BLOG_CONTENT_GUARD_RECORD: record,
+          BLOG_CONTENT_GUARD_EXIT: String(code),
+        },
+        stdio: [stdin, 'pipe', 'pipe'],
+        encoding: 'utf8',
+        timeout: 30000,
+      });
+    } finally {
+      closeSync(stdin);
+    }
     if (result.error) throw result.error;
     const run = `with guard exiting ${code}`;
     if (result.status !== code) {
@@ -1450,16 +1535,22 @@ test('[AC-01][F-017] the working tree passes the tracked-content rules guard app
   const paths = workingTreePaths();
   assert.ok(paths.includes('_config.yml'), 'git ls-files did not list _config.yml; the path listing is not this repository');
 
-  const articles = paths
-    .filter((p) => ARTICLE_PATH_RE.test(p) && isFile(p))
-    .map((p) => ({ path: p, text: read(p) }));
-  const checked = new Set(articles.map((article) => article.path));
+  // An article that is not valid UTF-8 is refused, as guard refuses it, rather than checked as replacement characters.
+  const articlePaths = paths.filter((p) => ARTICLE_PATH_RE.test(p) && isFile(p));
+  const articles = [];
+  const undecodable = [];
+  for (const p of articlePaths) {
+    const text = readArticle(p);
+    if (text === null) undecodable.push(notUtf8Finding(p));
+    else articles.push({ path: p, text });
+  }
+  const checked = new Set(articlePaths);
   for (const fixture of REQUIRED_FIXTURES) {
     assert.ok(checked.has(fixture), `${fixture} must be present and not git-ignored, so its rules are checked`);
   }
-  t.diagnostic(`checked ${paths.length} paths and ${articles.length} articles against ${TODAY_UTC} (UTC)`);
+  t.diagnostic(`checked ${paths.length} paths and ${articlePaths.length} articles against ${TODAY_UTC} (UTC)`);
 
-  const findings = checkTrackedContent({ paths, articles, todayUtc: TODAY_UTC });
+  const findings = [...undecodable, ...checkTrackedContent({ paths, articles, todayUtc: TODAY_UTC })];
   assert.deepEqual(findings, [], `tracked content breaks the publishing rules:\n${findings.join('\n')}`);
 });
 
@@ -1657,10 +1748,7 @@ const TREE_CASES = Object.freeze([
   {
     name: 'an article whose front matter does not parse is refused',
     change: (tree) => setArticle(tree, ALPHA_PATH, alphaSource({ frontMatter: ['title: Unquoted', ...VALID_FRONT_MATTER.slice(1)] })),
-    expect: [
-      /^_posts\/2026-03-01-alpha\.md: front matter line 2: title must be a double-quoted string$/,
-      /^_posts\/2026-03-01-alpha\.md: title is required$/,
-    ],
+    expect: [/^_posts\/2026-03-01-alpha\.md: front matter line 2: title must be a double-quoted string$/],
   },
   {
     name: 'a <script> tag in an article is refused',
@@ -1865,15 +1953,49 @@ const DEFAULTS_BLOCK = [
   '',
 ].join('\n');
 
+/** The `CNAME` host the configuration controls assume unless a control names its own. */
+const CONTROL_CNAME_HOST = 'www.cabrillocoast.com';
+
+/**
+ * A fixed, valid custom-domain `_config.yml` for `CONTROL_CNAME_HOST`, holding
+ * every line the controls change exactly once. The controls change this text,
+ * never the repository's, so they neither depend on the deployment mode, the
+ * `url` spelling or the defaults the owner has chosen, nor repeat a problem in
+ * the real files, which only the `_config.yml` and `_config.preview.yml` tests
+ * judge.
+ */
+const CONTROL_CONFIG = [
+  '# A known-good custom-domain configuration for the controls.',
+  'title: Cabrillo Coast',
+  'description: Technical articles on software architecture, technical leadership and agentic AI from Cabrillo Coast.',
+  `url: "https://${CONTROL_CNAME_HOST}"`,
+  'timezone: Etc/UTC',
+  'theme: null',
+  'permalink: /blog/:title/',
+  'future: false',
+  EXCLUDE_BLOCK,
+  DEFAULTS_BLOCK,
+].join('\n');
+
+/**
+ * A fixed, valid `_config.preview.yml` for `CONTROL_CONFIG`: its `exclude`
+ * list without `PREVIEW_ONLY_INCLUDED`. The preview controls change this text,
+ * never the repository's, for the same reason as `CONTROL_CONFIG`.
+ */
+const CONTROL_PREVIEW = `# A known-good preview overlay for the controls.\n${EXCLUDE_BLOCK.replace('  - assets/drafts\n', '')}`;
+
 /** A refusal by `readTopLevelYaml`, reported by `configProblems` or `previewProblems`. */
 const UNSUPPORTED = /^_config(?:\.preview)?\.yml: unsupported YAML at line \d+: /;
 
 /**
- * Controls for `configProblems`, each a change to the real `_config.yml`
- * text and the problems it must produce, in order (`[]`: still valid). They
- * pin the reading SafeYAML gives: quoted values are strings, plain booleans
- * and nulls ignore letter case, quoted and spaced keys are keys, and what the
- * reader cannot read is refused instead of guessed.
+ * Controls for `configProblems`, each a change to `CONTROL_CONFIG`, checked
+ * with `CONTROL_CNAME_HOST` as the `CNAME` host unless the control sets its own
+ * `cnameHost` (`null`: `CNAME` absent), and the problems it must produce, in
+ * order (`[]`: still valid). They pin the reading SafeYAML gives: quoted values
+ * are strings, plain booleans and nulls ignore letter case, quoted and spaced
+ * keys are keys, and what the reader cannot read is refused instead of
+ * guessed. They also pin the two accepted `CNAME`/`url` states, whatever the
+ * `url` quoting, and the refusal of the two inconsistent ones.
  */
 const CONFIG_CONTROLS = Object.freeze([
   {
@@ -1958,6 +2080,40 @@ const CONFIG_CONTROLS = Object.freeze([
     change: (text) => replaceOnce(text, '\nurl: "https://www.cabrillocoast.com"\n', '\nurl: "https://elsewhere.example"\n'),
     expect: [/^url must be the string "https:\/\/www\.cabrillocoast\.com" while CNAME is present \(got quoted string "https:\/\/elsewhere\.example"\)$/],
   },
+  {
+    name: 'project mode: CNAME absent and the github.io url',
+    change: (text) => replaceOnce(text, '\nurl: "https://www.cabrillocoast.com"\n', `\nurl: "${PROJECT_URL}"\n`),
+    cnameHost: null,
+    expect: [],
+  },
+  {
+    name: 'CNAME absent with the custom-domain url',
+    change: (text) => text,
+    cnameHost: null,
+    expect: [/^url must be the string "https:\/\/randyamiller\.github\.io" while CNAME is absent \(got quoted string "https:\/\/www\.cabrillocoast\.com"\)$/],
+  },
+  {
+    name: 'CNAME present with the github.io url',
+    change: (text) => replaceOnce(text, '\nurl: "https://www.cabrillocoast.com"\n', `\nurl: "${PROJECT_URL}"\n`),
+    expect: [/^url must be the string "https:\/\/www\.cabrillocoast\.com" while CNAME is present \(got quoted string "https:\/\/randyamiller\.github\.io"\)$/],
+  },
+  {
+    name: 'an unquoted custom-domain url',
+    change: (text) => replaceOnce(text, '\nurl: "https://www.cabrillocoast.com"\n', '\nurl: https://www.cabrillocoast.com\n'),
+    expect: [],
+  },
+  {
+    name: 'a single-quoted github.io url while CNAME is absent',
+    change: (text) => replaceOnce(text, '\nurl: "https://www.cabrillocoast.com"\n', `\nurl: '${PROJECT_URL}'\n`),
+    cnameHost: null,
+    expect: [],
+  },
+  {
+    name: 'an empty CNAME',
+    change: (text) => text,
+    cnameHost: '',
+    expect: [/^CNAME must name the custom-domain host$/],
+  },
   // Constructs the reader refuses: each must surface as unsupported, never pass as a reading.
   ...[
     ['a complex key', (text) => `${text}? future\n: true\n`],
@@ -1995,7 +2151,7 @@ const CONFIG_CONTROLS = Object.freeze([
   ].map(([name, change]) => ({ name: `${name} is refused`, change, unsupported: true })),
 ]);
 
-/** Controls for `previewProblems`, each a change to the real `_config.preview.yml` text. */
+/** Controls for `previewProblems`, each a change to `CONTROL_PREVIEW`, judged against `CONTROL_CONFIG`. */
 const PREVIEW_CONTROLS = Object.freeze([
   {
     name: 'an extra quoted "future": true key',
@@ -2045,18 +2201,24 @@ const PREVIEW_CONTROLS = Object.freeze([
 ]);
 
 test('[AC-01][F-017] the configuration checks read YAML types and keys as Jekyll does and refuse what they cannot read', async (t) => {
-  const base = read('_config.yml');
-  const preview = read('_config.preview.yml');
+  // Each control's expectation is a change from these valid texts, so they must pass unchanged.
+  await t.test('[AC-01][F-017] the control _config.yml is valid for its CNAME host', () => {
+    assertFindings(configProblems(CONTROL_CONFIG, { cnameHost: CONTROL_CNAME_HOST }), [], 'CONTROL_CONFIG');
+  });
+  await t.test('[AC-01][F-017] the control _config.preview.yml is valid for the control _config.yml', () => {
+    assertFindings(previewProblems(CONTROL_CONFIG, CONTROL_PREVIEW), [], 'CONTROL_PREVIEW');
+  });
   for (const control of CONFIG_CONTROLS) {
     await t.test(`[AC-01][F-017] _config.yml control: ${control.name}`, () => {
-      const problems = configProblems(control.change(base), { cnameHost: cnameHost() });
+      const host = 'cnameHost' in control ? control.cnameHost : CONTROL_CNAME_HOST;
+      const problems = configProblems(control.change(CONTROL_CONFIG), { cnameHost: host });
       if (control.unsupported) assertReports(problems, UNSUPPORTED, control.name);
       else assertFindings(problems, control.expect, control.name);
     });
   }
   for (const control of PREVIEW_CONTROLS) {
     await t.test(`[AC-01][F-017] _config.preview.yml control: ${control.name}`, () => {
-      const problems = previewProblems(base, control.change(preview));
+      const problems = previewProblems(CONTROL_CONFIG, control.change(CONTROL_PREVIEW));
       if (control.unsupported) assertReports(problems, UNSUPPORTED, control.name);
       else assertFindings(problems, control.expect, control.name);
     });
@@ -2071,22 +2233,22 @@ function plainYaml(value) {
 }
 
 test('[AC-01][F-017] the YAML reader reads the nested defaults: block to the structure SafeYAML loads', async (t) => {
-  const base = read('_config.yml');
+  // The variants change CONTROL_CONFIG, so an owner's own default author never fails this reader check.
   // The values SafeYAML 1.0.5 loads for each variant.
   const variants = [
     {
-      name: 'as _config.yml writes it',
-      text: base,
+      name: 'as the control configuration writes it',
+      text: CONTROL_CONFIG,
       expect: [{ scope: { path: '', type: 'posts' }, values: { layout: 'post', author: 'Randy Miller' } }],
     },
     {
       name: 'with its list at column 0',
-      text: replaceOnce(base, DEFAULTS_BLOCK, DEFAULTS_BLOCK.replace(/\n {2}/g, '\n')),
+      text: replaceOnce(CONTROL_CONFIG, DEFAULTS_BLOCK, DEFAULTS_BLOCK.replace(/\n {2}/g, '\n')),
       expect: [{ scope: { path: '', type: 'posts' }, values: { layout: 'post', author: 'Randy Miller' } }],
     },
     {
       name: 'with a nested list at its key\'s own indentation',
-      text: replaceOnce(base, '      author: "Randy Miller"\n', '      tags:\n      - a\n      - b\n'),
+      text: replaceOnce(CONTROL_CONFIG, '      author: "Randy Miller"\n', '      tags:\n      - a\n      - b\n'),
       expect: [{ scope: { path: '', type: 'posts' }, values: { layout: 'post', tags: ['a', 'b'] } }],
     },
   ];
@@ -2264,7 +2426,8 @@ test('[AC-04][F-017] every article in _posts/ and tests/fixtures/posts/ passes t
       assert.match(slug, SLUG_RE, `${rel}: slug "${slug}" must be lowercase letters, digits and single hyphens`);
       assert.ok(slug.length <= SLUG_LIMIT, `${rel}: slug must be at most ${SLUG_LIMIT} characters (got ${slug.length})`);
 
-      const text = read(rel);
+      const text = readArticle(rel);
+      assert.notEqual(text, null, notUtf8Finding(rel));
       const { data, body, errors } = parseArticle(text);
       assert.deepEqual(errors, [], `${rel}: front matter does not parse:\n${errors.join('\n')}`);
 
@@ -2280,6 +2443,26 @@ test('[AC-04][F-017] every article in _posts/ and tests/fixtures/posts/ passes t
       assert.deepEqual(findings, [], `${rel} breaks the article schema:\n${findings.join('\n')}`);
     });
   }
+});
+
+test('[AC-04][F-017] articles are read as exact UTF-8, so a file the Pages build cannot read fails these checks', async (t) => {
+  const frontMatter = (title) => Buffer.concat([Buffer.from('---\ntitle: "'), title, Buffer.from('"\n---\n\nBody.\n')]);
+  for (const [name, bytes] of [
+    ['Latin-1 é', frontMatter(Buffer.from([0x63, 0x61, 0x66, 0xe9]))],
+    ['Windows-1252 curly quotes', frontMatter(Buffer.from([0x93, 0x51, 0x94]))],
+    ['a UTF-16 byte-order mark', Buffer.from([0xff, 0xfe, 0x2d, 0x00, 0x2d, 0x00, 0x2d, 0x00])],
+    ['a truncated two-byte sequence', frontMatter(Buffer.from([0x41, 0xc3, 0x28]))],
+    ['an overlong form', frontMatter(Buffer.from([0xc0, 0xaf]))],
+    ['a surrogate', frontMatter(Buffer.from([0xed, 0xa0, 0x80]))],
+  ]) {
+    await t.test(`[AC-04][F-017] ${name} is not read as an article`, () => {
+      assert.equal(decodeArticle(bytes), null, `${name} must not decode`);
+    });
+  }
+  await t.test('[AC-04][F-017] valid UTF-8 with a byte-order mark and CRLF lines is read exactly', () => {
+    const text = '\uFEFF---\r\ntitle: "Café"\r\n---\r\n\r\nR&D café.\r\n';
+    assert.equal(decodeArticle(Buffer.from(text, 'utf8')), text);
+  });
 });
 
 /** The post most schema cases validate, dated before `FIXED_TODAY`. */
@@ -2382,12 +2565,12 @@ const PARSE_CASES = Object.freeze([
   {
     name: 'a single-quoted summary',
     lines: [VALID_FRONT_MATTER[0], "summary: 'Single quoted.'", VALID_FRONT_MATTER[2]],
-    error: /^front matter line 3: single-quoted strings are not supported; use double quotes$/,
+    error: /^front matter line 3: summary: single-quoted strings are not supported; use double quotes$/,
   },
   { name: 'a duplicate key', lines: [...VALID_FRONT_MATTER, 'tags: [other]'], error: /^front matter line 5: duplicate key tags$/ },
   { name: 'an indented line', lines: [...VALID_FRONT_MATTER, '  author: "Jane Doe"'], error: /^front matter line 5: indentation is not supported$/ },
   { name: 'a block list', lines: [...VALID_FRONT_MATTER.slice(0, 2), 'tags:', '- testing'], error: /^front matter line 5: block lists are not supported; use tags: \[a, b\]$/ },
-  { name: 'a block scalar', lines: [VALID_FRONT_MATTER[0], 'summary: |', VALID_FRONT_MATTER[2]], error: /^front matter line 3: block scalars \(\| and >\) are not supported$/ },
+  { name: 'a block scalar', lines: [VALID_FRONT_MATTER[0], 'summary: |', VALID_FRONT_MATTER[2]], error: /^front matter line 3: summary: block scalars \(\| and >\) are not supported$/ },
   { name: 'an anchor', lines: [...VALID_FRONT_MATTER.slice(0, 2), 'tags: &tags [testing]'], error: /^front matter line 4: anchors and aliases \(& and \*\) are not supported$/ },
   { name: 'a YAML tag', lines: [...VALID_FRONT_MATTER, 'updated: !!str 2026-03-01'], error: /^front matter line 5: YAML tags \(!\) are not supported$/ },
   { name: 'a flow mapping', lines: [...VALID_FRONT_MATTER.slice(0, 2), 'tags: {a: 1}'], error: /^front matter line 4: flow mappings \(\{ … \}\) are not supported$/ },
@@ -2404,7 +2587,7 @@ const PARSE_CASES = Object.freeze([
   {
     name: 'an unclosed quote',
     lines: ['title: "Never closed', ...VALID_FRONT_MATTER.slice(1)],
-    error: /^front matter line 2: a double-quoted string must close on the same line$/,
+    error: /^front matter line 2: title: a double-quoted string must close on the same line$/,
   },
 ]);
 
@@ -2433,6 +2616,102 @@ test('[AC-04][F-017] parseArticle and validateArticle accept the schema boundari
     });
   }
 });
+
+/** `VALID_FRONT_MATTER` with its line `index` (0 for title, 1 for summary, 2 for tags) replaced by `text`. */
+const replaceLine = (index, text) => VALID_FRONT_MATTER.map((line, i) => (i === index ? text : line));
+
+/** A pattern matching exactly the finding `${SCHEMA_POST}: ${message}`. */
+const schemaFinding = (message) => new RegExp(`^${regExpLiteral(`${SCHEMA_POST}: ${message}`)}$`);
+
+/**
+ * Front matter in which `parseArticle` refuses a title, summary or tags line,
+ * or lacks the line, with every finding `check` reports for it: the parse
+ * errors, then the `validateArticle` findings. A refused line's error names
+ * its key and is the key's only finding, never followed by "is required";
+ * a truly missing key is still reported, and a disguised `published` key is
+ * still refused.
+ */
+const REFUSED_KEY_CASES = Object.freeze([
+  { name: 'an unquoted title', lines: replaceLine(0, 'title: Unquoted title'), expect: ['front matter line 2: title must be a double-quoted string'] },
+  {
+    name: 'a single-quoted title',
+    lines: replaceLine(0, "title: 'Single quoted'"),
+    expect: ['front matter line 2: title: single-quoted strings are not supported; use double quotes'],
+  },
+  {
+    name: 'an unterminated title',
+    lines: replaceLine(0, 'title: "Never closed'),
+    expect: ['front matter line 2: title: a double-quoted string must close on the same line'],
+  },
+  {
+    name: 'a title with text after its closing quote',
+    lines: replaceLine(0, 'title: "Closed" junk'),
+    expect: ['front matter line 2: title: only a comment ( # …) may follow the closing quote'],
+  },
+  {
+    name: 'a title with a \\n escape',
+    lines: replaceLine(0, 'title: "Line\\nbreak"'),
+    expect: ['front matter line 2: title: unsupported escape \\n in a double-quoted string; only \\" and \\\\ are allowed'],
+  },
+  { name: 'an empty title', lines: replaceLine(0, 'title:'), expect: ['front matter line 2: title has no value'] },
+  { name: 'a title holding U+2028', lines: replaceLine(0, 'title: "a\u2028b"'), expect: ['front matter line 2: unsupported syntax'] },
+  { name: 'a title with no space after its colon', lines: replaceLine(0, 'title:"No space"'), expect: ['front matter line 2: unsupported syntax'] },
+  { name: 'an indented title', lines: replaceLine(0, '  title: "Present title"'), expect: ['front matter line 2: indentation is not supported'] },
+  { name: 'a tab-indented title', lines: replaceLine(0, '\ttitle: "Present title"'), expect: ['front matter line 2: indentation is not supported'] },
+  { name: 'a title with a space before its colon', lines: replaceLine(0, 'title : "Present title"'), expect: ['front matter line 2: unsupported syntax'] },
+  { name: 'Title in capitals with a space before its colon', lines: replaceLine(0, 'Title : "Present"'), expect: ['front matter line 2: unsupported syntax'] },
+  { name: 'an indented summary', lines: replaceLine(1, '  summary: "Present summary."'), expect: ['front matter line 3: indentation is not supported'] },
+  { name: 'a summary with a tab before its colon', lines: replaceLine(1, 'summary\t: "Present summary."'), expect: ['front matter line 3: unsupported syntax'] },
+  { name: 'an indented tags list', lines: replaceLine(2, '  tags: [testing]'), expect: ['front matter line 4: indentation is not supported'] },
+  { name: 'Title: in capitals', lines: replaceLine(0, 'Title: "Capital key"'), expect: ['front matter line 2: key Title must be lowercase (title)'] },
+  { name: 'an unquoted summary', lines: replaceLine(1, 'summary: Unquoted summary'), expect: ['front matter line 3: summary must be a double-quoted string'] },
+  { name: 'SUMMARY: in capitals', lines: replaceLine(1, 'SUMMARY: "Upper case"'), expect: ['front matter line 3: key SUMMARY must be lowercase (summary)'] },
+  {
+    name: 'a tags list holding a bare null',
+    lines: replaceLine(2, 'tags: [testing, null]'),
+    expect: ['front matter line 4: bare null in a flow list is read by YAML as null, not text; write "null"'],
+  },
+  { name: 'Tags: in capitals', lines: replaceLine(2, 'Tags: [testing]'), expect: ['front matter line 4: key Tags must be lowercase (tags)'] },
+  {
+    name: 'Author: and Updated: in capitals',
+    lines: [...VALID_FRONT_MATTER, 'Author: "Jane Doe"', 'Updated: 2026-03-01'],
+    expect: ['front matter line 5: key Author must be lowercase (author)', 'front matter line 6: key Updated must be lowercase (updated)'],
+  },
+  { name: 'a missing title', lines: VALID_FRONT_MATTER.slice(1), expect: ['title is required'] },
+  {
+    name: 'a refused title beside a missing summary',
+    lines: ['title: Unquoted title', VALID_FRONT_MATTER[2]],
+    expect: ['front matter line 2: title must be a double-quoted string', 'summary is required'],
+  },
+  ...['Published: false', 'PUBLISHED: true', '"published": false', 'published : false', '? published', 'published:false'].map((line) => ({
+    name: `the disguised published key ${JSON.stringify(line)}`,
+    lines: [...VALID_FRONT_MATTER, line],
+    expect: ['front matter line 5: unsupported syntax'],
+  })),
+]);
+
+test('[AC-04][F-017] a front-matter line parseArticle refuses is its key\'s one finding, never also reported as missing', async (t) => {
+  for (const { name, lines, expect } of REFUSED_KEY_CASES) {
+    await t.test(`[AC-04][F-017] refused key: ${name}`, () => {
+      const text = articleSource(lines, 'Body.\n');
+      const { data, body, errors } = parseArticle(text);
+      const findings = [
+        ...errors.map((error) => `${SCHEMA_POST}: ${error}`),
+        ...validateArticle({ path: SCHEMA_POST, data, body, kind: 'post', todayUtc: FIXED_TODAY, bodyStartLine: bodyStartLine(text, body) }),
+      ];
+      assertFindings(findings, expect.map(schemaFinding), name);
+    });
+  }
+  await t.test('[AC-04][F-017] refused key: the record stays outside data, so a copy of data reports the key missing again', () => {
+    const text = articleSource(replaceLine(0, 'title: Unquoted title'), 'Body.\n');
+    const { data, body } = parseArticle(text);
+    assert.deepEqual(Reflect.ownKeys(data), ['summary', 'tags'], 'data holds only the parsed keys');
+    const args = { path: SCHEMA_POST, body, kind: 'post', todayUtc: FIXED_TODAY, bodyStartLine: bodyStartLine(text, body) };
+    assert.deepEqual(validateArticle({ ...args, data }), []);
+    assertFindings(validateArticle({ ...args, data: { ...data } }), [schemaFinding('title is required')], 'a copy of data');
+  });
+});
+
 
 /** Bytes of a stand-in image; the rules only check that the file exists. */
 const PNG = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');

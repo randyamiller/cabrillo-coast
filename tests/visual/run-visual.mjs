@@ -75,6 +75,17 @@ const PLAYWRIGHT_INTERRUPTED = 130;
 const ANSI_SEQUENCE = /\u001b\[[0-9;]*m/g;
 
 /*
+ * The first line of every Playwright matcher failure once its colour
+ * sequences are stripped:
+ * `Error: expect(<receiver>)[.<promise>][.not].<matcher>(<expectation>) failed`.
+ * It names the matcher but not why it failed. The reason follows in the next
+ * paragraph: `Locator:`, `Expected:`, `Received:` or `Timeout: <n>ms` lines,
+ * then the matcher's own message (a pixel count, "Failed to take two
+ * consecutive stable screenshots.").
+ */
+const MATCHER_HEADER = /^Error: expect\([^()\n]*\)(?:\.\w+)*\.\w+\([^()\n]*\) failed$/;
+
+/*
  * A `toHaveScreenshot` failure that is solely a screenshot difference: the
  * matcher header followed directly by the size difference, the pixel-count
  * difference, or both, ending the line. A timed-out matcher puts a
@@ -840,10 +851,37 @@ function runPlaywright(mode, port, baselineDir, resultsFile) {
 /* Comparison results                                                        */
 /* ------------------------------------------------------------------------ */
 
-/** First line of an error message, without colour sequences. */
-function firstLine(message) {
+/**
+ * One line summing up an error message, without colour sequences: its first
+ * line, or "(no message)" when there is none. When that line is only a
+ * Playwright matcher header (MATCHER_HEADER), the first paragraph after it
+ * follows: its non-blank lines up to the next blank line or `Call log:`, each
+ * trimmed, joined with "; ". A header with nothing after it stands alone.
+ *
+ * @example
+ *   errorSummary("Error: expect(page).toHaveScreenshot(expected) failed\n\nTimeout: 5000ms\n" +
+ *     "  Failed to take two consecutive stable screenshots.\n\nCall log:\n…");
+ *   // "Error: expect(page).toHaveScreenshot(expected) failed — Timeout: 5000ms; Failed to take two consecutive stable screenshots."
+ *
+ * @param {unknown} message An error's `message` from Playwright's JSON report.
+ * @returns {string}
+ */
+function errorSummary(message) {
   const text = typeof message === "string" ? message.replace(ANSI_SEQUENCE, "").trim() : "";
-  return text === "" ? "(no message)" : text.split("\n")[0];
+  if (text === "") return "(no message)";
+  const [header, ...rest] = text.split("\n");
+  if (!MATCHER_HEADER.test(header)) return header;
+  const reason = [];
+  for (const line of rest) {
+    const trimmed = line.trim();
+    if (trimmed === "") {
+      if (reason.length > 0) break;
+      continue;
+    }
+    if (trimmed.startsWith("Call log:")) break;
+    reason.push(trimmed);
+  }
+  return reason.length === 0 ? header : `${header} — ${reason.join("; ")}`;
 }
 
 /**
@@ -902,8 +940,10 @@ function collectCases(suites, cases = []) {
  *
  * @param {unknown} report Parsed Playwright JSON report of the comparison run.
  * @returns {{ mismatched: string[], problems: string[] }} the titles of the
- *   mismatched cases, and one line per problem naming the case and the first
- *   line of its message.
+ *   mismatched cases, and one line per problem naming the case and summing up
+ *   its message (`errorSummary`): the first line, followed for a Playwright
+ *   matcher failure by the reason after its header, such as
+ *   `Error: expect(page).toHaveScreenshot(expected) failed — Timeout: 5000ms; Failed to take two consecutive stable screenshots.`
  */
 export function classifyComparison(report) {
   const mismatched = [];
@@ -912,7 +952,7 @@ export function classifyComparison(report) {
     problems.push("the results are not a Playwright JSON report");
     return { mismatched, problems };
   }
-  for (const error of report.errors) problems.push(`the run reported an error: ${firstLine(error?.message)}`);
+  for (const error of report.errors) problems.push(`the run reported an error: ${errorSummary(error?.message)}`);
 
   const cases = collectCases(report.suites);
   if (cases.length < EXPECTED_SCREENSHOTS) {
@@ -929,13 +969,13 @@ export function classifyComparison(report) {
       if (status === "passed") continue;
       const errors = Array.isArray(result?.errors) ? result.errors : [];
       if (status !== "failed") {
-        const detail = errors.length > 0 ? `: ${firstLine(errors[0]?.message)}` : "";
+        const detail = errors.length > 0 ? `: ${errorSummary(errors[0]?.message)}` : "";
         problems.push(`${title}: ${typeof status === "string" ? status : "no status"}${detail}`);
         continue;
       }
       const other = errors.find((error) => !isScreenshotMismatch(error?.message));
       if (errors.length === 0) problems.push(`${title}: failed without an error message`);
-      else if (other !== undefined) problems.push(`${title}: ${firstLine(other?.message)}`);
+      else if (other !== undefined) problems.push(`${title}: ${errorSummary(other?.message)}`);
       else if (!hasActualImage(result)) problems.push(`${title}: failed without an actual screenshot (*-actual.png)`);
       else if (!mismatched.includes(title)) mismatched.push(title);
     }

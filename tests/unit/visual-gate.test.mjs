@@ -220,8 +220,21 @@ describe('[AC-16][F-018] classifyComparison sorts real Playwright 1.63 reports',
     const matcherLine = `${entry.title}: Error: expect(page).toHaveScreenshot(expected) failed`;
     const url = 'http://127.0.0.1:41234/cabrillo-coast/blog/';
     const cases = [
-      ['a matcher that timed out (a Timeout line before the diff)', messages.timedOutMismatch(entry.file), matcherLine],
-      ['a page that never rendered the same twice', messages.unstable(entry.file), matcherLine],
+      [
+        'a matcher that timed out (a Timeout line before the diff)',
+        messages.timedOutMismatch(entry.file),
+        `${matcherLine} — Timeout: 5000ms; 10000 pixels (ratio 0.01 of all image pixels) are different.`,
+      ],
+      [
+        'a page that never rendered the same twice',
+        messages.unstable(entry.file),
+        `${matcherLine} — Timeout: 5000ms; Failed to take two consecutive stable screenshots.`,
+      ],
+      [
+        'a screenshot matcher that failed without timing out (no Timeout line)',
+        messages.screenshotError(entry.file, 'The page has closed'),
+        `${matcherLine} — The page has closed`,
+      ],
       [
         'a missing baseline',
         messages.missingSnapshot(`${BASELINE_DIR}/${entry.file}`),
@@ -247,6 +260,62 @@ describe('[AC-16][F-018] classifyComparison sorts real Playwright 1.63 reports',
     for (const [label, message, line] of cases) {
       assert.deepEqual(classifyOne(entry, [failedWithImages(entry, [message])]), { mismatched: [], problems: [line] }, label);
     }
+  });
+
+  test('[AC-16][F-018] a Playwright matcher failure is summed up with the reason after its header, on one line without colour sequences', () => {
+    const entry = specCase('article', 800, 'light');
+    const header = 'Error: expect(page).toHaveScreenshot(expected) failed';
+    const coloured =
+      'Error: \u001b[2mexpect(\u001b[22m\u001b[31mpage\u001b[39m\u001b[2m).\u001b[22mtoHaveScreenshot' +
+      '\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m)\u001b[22m failed';
+    const unstableReason = `${header} — Timeout: 5000ms; Failed to take two consecutive stable screenshots.`;
+    const cases = [
+      // The reason is every line of the first paragraph after the header, joined with "; ".
+      ['the real unstable-screenshot message', messages.unstable(entry.file), unstableReason],
+      [
+        'another matcher with Locator, Expected and Timeout lines',
+        'Error: expect(locator).toBeVisible() failed\n\nLocator: locator(\'#year\')\nExpected: visible\nTimeout: 5000ms\n' +
+          'Error: element(s) not found\n\nCall log:\n  - Expect "toBeVisible" with timeout 5000ms\n  - waiting for locator(\'#year\')',
+        'Error: expect(locator).toBeVisible() failed — Locator: locator(\'#year\'); Expected: visible; Timeout: 5000ms; Error: element(s) not found',
+      ],
+      [
+        'a negated matcher',
+        'Error: expect(page).not.toHaveScreenshot(expected) failed\n\n  The page has closed\n',
+        'Error: expect(page).not.toHaveScreenshot(expected) failed — The page has closed',
+      ],
+      // A header with nothing after it stands alone.
+      ['the header alone', header, header],
+      ['the header and blank lines', `${coloured}\n\n\n`, header],
+      ['the header followed by its call log', `${coloured}\n\nCall log:\n\u001b[2m  - taking page screenshot\u001b[22m`, header],
+      // Colour sequences in the reason are stripped as well.
+      [
+        'a coloured reason',
+        `${coloured}\n\n\u001b[2mTimeout: 5000ms\u001b[22m\n  \u001b[31mFailed to take two consecutive stable screenshots.\u001b[39m\n\n  Snapshot: ${entry.file}`,
+        unstableReason,
+      ],
+      // A first line that is not exactly a matcher header keeps the first-line output.
+      [
+        'a generic expect failure',
+        'Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: 200\nReceived: 404',
+        'Error: expect(received).toBe(expected) // Object.is equality',
+      ],
+      ['a header with more text after it', `${header} twice\n\nTimeout: 5000ms`, `${header} twice`],
+      ['a header inside another message', `Error: the spec saw ${header.slice('Error: '.length)}\n\nTimeout: 5000ms`, `Error: the spec saw ${header.slice('Error: '.length)}`],
+    ];
+    for (const [label, message, line] of cases) {
+      const { mismatched, problems } = classifyOne(entry, [failedWithImages(entry, [message])]);
+      assert.deepEqual({ mismatched, problems }, { mismatched: [], problems: [`${entry.title}: ${line}`] }, label);
+      assert.doesNotMatch(problems[0], /[\u001b\n]/, `${label}: one line without colour sequences`);
+    }
+
+    // A run-level error and a case that did not end "failed" are summed up the same way.
+    const unstable = messages.unstable(entry.file);
+    assert.deepEqual(classifyComparison(buildReport({}, { errors: [{ message: unstable }] })).problems, [
+      `the run reported an error: ${unstableReason}`,
+    ]);
+    assert.deepEqual(classifyOne(entry, [failed([unstable], evidence(entry.stem, caseDir(entry)), { status: 'timedOut' })]).problems, [
+      `${entry.title}: timedOut: ${unstableReason}`,
+    ]);
   });
 
   test('[AC-16][F-018] a case that timed out, was interrupted, was skipped or has no status is a problem', () => {
@@ -747,6 +816,21 @@ describe('[AC-16][F-018] run-visual.mjs gate outcomes in temporary git repositor
     const result = await runGate(site, ['--base', site.base], { env: DECLARED, fault: 'timedout' });
     expectExit(result, 1);
     expectLine(result.stderr, `  ${CASES[1].title}: timedOut: Test timeout of 30000ms exceeded.`);
+    expectNoWorkspace(result);
+  });
+
+  test('[AC-16][F-018] a declared change fails on unstable screenshots, and each problem line says why', GATE_CASE, async () => {
+    const site = siteCase('unstable-declared');
+    const result = await runGate(site, ['--base', site.base], { env: DECLARED, fault: 'unstable' });
+    expectExit(result, 1);
+    expectLine(result.stderr, 'Visual comparison failed: the working-tree run failed for reasons other than a screenshot difference');
+    const reason = 'Error: expect(page).toHaveScreenshot(expected) failed — Timeout: 5000ms; Failed to take two consecutive stable screenshots.';
+    const unstable = CASES.filter((entry) => entry.page === 'article').map((entry) => `  ${entry.title}: ${reason}`);
+    for (const line of unstable) expectLine(result.stderr, line);
+    // The listing cases differed only in pixels, so the article cases are the only problems.
+    assert.deepEqual(result.stderr.split('\n').filter((line) => line.startsWith('  [AC-16]')), unstable);
+    expectLine(result.stderr, 'The declared intent (VISUAL_CHANGE_INTENDED=1) covers screenshot differences only.');
+    assert.doesNotMatch(result.stdout, /accepted as intended/);
     expectNoWorkspace(result);
   });
 

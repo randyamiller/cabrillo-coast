@@ -1,44 +1,53 @@
-/* Cabrillo Coast blog: listing, search, article prose and code. Colours come only from the styles.css tokens. */
+/* Cabrillo Coast blog. Colours: tokens. */
 
-/* ---------- Listing ---------- */
+/* Page */
+:root:has(.blog-page) { color-scheme: light dark; }
+.blog-page { min-height: 100vh; min-height: 100dvh; display: flex; flex-direction: column; }
+.blog-page > main { flex: 1 0 auto; }
+
+/* Listing */
 .blog-index .section-head h1 { font-size: clamp(2rem, 4vw, 2.8rem); margin-block-end: 18px; }
-/* minmax(0, 1fr) rather than 1fr, so one long unbreakable word cannot widen the column past the viewport. */
+/* minmax(0, 1fr): long words cannot widen it. */
 .post-list { list-style: none; margin: 0 auto; padding: 0; max-width: 760px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 22px; }
 .post-card, .post { overflow-wrap: break-word; }
-.post-card h2 { font-size: clamp(1.3rem, 2.4vw, 1.6rem); margin-block-end: 8px; }
-/* The second selector outranks .card p in styles.css, which would otherwise set .98rem inside listing cards. */
+.post-card h2 { font-size: clamp(1.3rem, 2.4vw, 1.6rem); margin-block-end: 10px; }
+/* The title link covers the card. */
+.post-card h2 a::after { content: ""; position: absolute; inset: 0; }
+.post-card .tag-link { z-index: 1; }
+/* The 2nd selector beats .card p. */
 .post-meta, .post-card .post-meta { color: var(--muted); font-size: .92rem; margin-block-end: 10px; }
-/* Clipped to two lines; screen readers still read the whole summary. */
 .post-summary { color: var(--muted); margin-block-end: 14px; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
 .tag-list { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px; }
-/* A long unbroken tag shrinks to the column and wraps inside its pill. 1.2em rounds one line fully, like 999px, and keeps wrapped lines inside the tint. */
 .tag-list > li { min-inline-size: 0; max-inline-size: 100%; }
-/* --sea-ink on this 12% mix measures about 4.53:1. A darker mix drops below 4.5:1, so hover changes decoration only. */
+/* 4.53:1: hover only decorates. Border: forced colours. */
 .tag-link {
-  display: inline-block; padding: 3px 12px; border-radius: 1.2em; max-inline-size: 100%; overflow-wrap: anywhere;
+  display: inline-block; padding: 2px 11px; border: 1px solid transparent; border-radius: 1.2em; max-inline-size: 100%; overflow-wrap: anywhere;
   font-size: .82rem; font-weight: 600;
   background: color-mix(in srgb, var(--sea) 12%, var(--surface)); color: var(--sea-ink);
 }
+/* .post-card hosts the overlay; 44px-tall hit areas. */
+.post-card, .tag-link, .post-back a { position: relative; }
+.tag-link::after, .post-back a::after { content: ""; position: absolute; inset: calc(50% - 22px) -4px; }
 .post-empty { text-align: center; color: var(--muted); font-size: 1.05rem; }
 
-/* ---------- Search: token-based variant of the shared field styling ---------- */
-.blog-search { max-width: 640px; margin-inline: auto; margin-block: 0 36px; display: grid; gap: 8px; }
+/* Search */
+.blog-search { max-width: 640px; margin-inline: auto; margin-block: 0 36px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; }
 .blog-search label { font-size: .9rem; font-weight: 600; }
 .blog-search input {
   font-family: var(--font-body); font-size: 1rem; color: var(--ink);
   background: var(--bg); border: 1.5px solid var(--line); border-radius: var(--radius-sm);
   padding: 12px 14px; width: 100%;
 }
-/* The browser's default placeholder grey falls below 4.5:1 on --bg; --muted keeps it at AA. */
 .blog-search input::placeholder { color: var(--muted); opacity: 1; }
-.blog-search input:focus-visible { outline: none; border-color: var(--sea); box-shadow: 0 0 0 4px color-mix(in srgb, var(--sea) 16%, transparent); }
+/* Forced colours paint the outline. */
+.blog-search input:focus-visible { outline: 2px solid transparent; outline-offset: 2px; border-color: var(--sea); box-shadow: 0 0 0 4px color-mix(in srgb, var(--sea) 16%, transparent); }
 @media (prefers-reduced-motion: no-preference) {
   .blog-search input { transition: border-color .18s ease, box-shadow .18s ease; }
 }
-.blog-search-status { color: var(--muted); font-size: .94rem; min-height: 1.2em; }
+.blog-search-status { color: var(--muted); font-size: .94rem; min-height: 1.65em; margin-block-start: 2px; overflow-wrap: anywhere; }
 
-/* ---------- Article ---------- */
-/* A 760px reading column plus the 24px side padding of .container. */
+/* Article */
+/* 760px + .container padding. */
 .post > .container { max-width: 808px; }
 .post-back { font-size: .95rem; margin-block-end: 28px; }
 .post-back a { color: var(--sea-ink); font-weight: 600; }
@@ -47,19 +56,17 @@
 .post .tag-list { margin-block-end: 8px; }
 .post .prose { margin-block-start: 36px; }
 
-/* ---------- Prose ---------- */
-/* The styles.css reset zeroes paragraph margins and link underlines; prose restores both. */
+/* Prose */
 .prose { font-size: 1.06rem; }
-/* div.highlighter-rouge is a fenced block; inline code carries the same class and keeps no margin. */
+/* div: inline code shares the class. */
 .prose p, .prose ul, .prose ol, .prose blockquote, .prose pre, .prose table, .prose div.highlighter-rouge, .prose hr { margin-block: 0 1.2em; margin-inline: 0; }
 .prose .highlighter-rouge pre { margin: 0; }
-/* Trim the outer margins so the 36px and 48px gaps around the prose hold exactly. */
 .prose > :first-child { margin-block-start: 0; }
 .prose > :last-child, .prose li > :last-child, .prose blockquote > :last-child { margin-block-end: 0; }
 .prose h2 { font-size: 1.7rem; margin-block: 1.8em .6em; }
 .prose h3 { font-size: 1.3rem; margin-block: 1.6em .5em; }
 .prose h4 { font-family: var(--font-body); font-weight: 600; font-size: 1.05rem; margin-block: 1.4em .4em; }
-/* Fragment links land clear of the 72px sticky header. */
+/* Clears the 72px sticky header. */
 .prose h2, .prose h3, .prose h4 { scroll-margin-block-start: 88px; }
 .prose ul, .prose ol { padding-inline-start: 1.4em; }
 .prose li + li { margin-block-start: .35em; }
@@ -67,44 +74,51 @@
 .prose blockquote { padding-block: 4px; padding-inline: 18px 0; border-inline-start: 3px solid var(--sea); color: var(--muted); }
 .prose img { height: auto; border-radius: var(--radius-sm); }
 .prose hr { border: 0; border-block-start: 1px solid var(--line); }
-/* Wide tables scroll inside their own box. kramdown's inline text-align still wins on aligned columns. */
 .prose table { display: block; overflow-x: auto; max-width: 100%; border-collapse: collapse; font-size: .95rem; }
 .prose th, .prose td { border: 1px solid var(--line); padding: 8px 12px; }
 .prose th { text-align: start; background: var(--surface-2); font-weight: 600; }
 
-/* ---------- Code: kramdown and Rouge output ---------- */
+/* Code */
 .prose code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .9em; }
 .prose :not(pre) > code { background: var(--surface-2); color: var(--ink); padding: .12em .4em; border-radius: 6px; }
-/* pre is the only box, so div.highlight gets no border. --surface keeps --sea-ink near 5.2:1; --surface-2 gives only 4.5:1. */
+/* --sea-ink: 5.2:1 here, 4.5:1 on --surface-2. */
 .prose pre {
   background: var(--surface); color: var(--ink); border: 1px solid var(--line); border-radius: var(--radius-sm);
   padding: 16px 18px; overflow-x: auto; line-height: 1.55;
 }
 .prose pre code { background: transparent; padding: 0; font-size: .92rem; }
+/* Rounds native scrollbar corners; the clipped ring moves here. */
+.prose div.highlight { border-radius: var(--radius-sm); overflow: hidden; }
+.prose div.highlight:has(pre:focus-visible) { outline: 2.5px solid var(--sea); outline-offset: 2px; }
 .prose .highlight .c, .prose .highlight .c1, .prose .highlight .cm, .prose .highlight .cs { color: var(--muted); font-style: italic; }
 .prose .highlight .k, .prose .highlight .kd, .prose .highlight .kn, .prose .highlight .kr, .prose .highlight .kt { color: var(--deep); }
 .prose .highlight .s, .prose .highlight .s1, .prose .highlight .s2, .prose .highlight .sb,
 .prose .highlight .m, .prose .highlight .mi, .prose .highlight .mf { color: var(--sea-ink); }
 
-/* ---------- Current section in the header (only blog pages set aria-current) ---------- */
-/* Colour only on the desktop row: it has about 21px to spare at 901px. */
-.nav-links > a[aria-current] { color: var(--ink); }
-.mobile-menu a[aria-current] { color: var(--ink); font-weight: 600; }
+/* Current section: --ink only; forced colours underline. */
+.nav-links > a[aria-current], .mobile-menu a[aria-current] { color: var(--ink); }
+@media (forced-colors: active) {
+  .nav-links > a[aria-current], .mobile-menu a[aria-current] { text-decoration: underline; }
+}
+/* Open header = 72 nav + 28 pad + 8 rules + 7(24 + 1.65rem); +8 ring. */
+@media (max-width: 900px) {
+  :root:has(#mobile-menu[data-open="true"]) { scroll-padding-top: calc(284px + 11.55rem); }
+}
 
-/* ---------- Hover, on devices that can hover ---------- */
+/* Hover and press */
 @media (hover: hover) {
   .post-card h2 a:hover { color: var(--sea-ink); }
-  .post-back a:hover, .tag-link:hover { text-decoration: underline; }
+  .post-back a:hover, .tag-link:hover, .nav-links > a[aria-current]:hover { text-decoration: underline; }
   .prose a:hover { text-decoration-thickness: 2px; }
 }
-/* Pressed links, touch included: decoration only, so colours and contrast hold. */
-.post-back a:active, .post-card h2 a:active, .tag-link:active, .prose a:active { text-decoration: underline; text-decoration-thickness: 2px; }
+.post-back a:active, .post-card h2 a:active, .tag-link:active, .prose a:active, .nav-links > a[aria-current]:active { text-decoration: underline; text-decoration-thickness: 2px; }
+.prose a:active { color: var(--ink); }
 
 @media (max-width: 720px) {
   .post-card { padding: 24px 20px; }
 }
 
-/* ---------- Dark mode: --sea-ink and --deep keep their light values, so swap them ---------- */
+/* Dark: --sea-ink, --deep stay light */
 @media (prefers-color-scheme: dark) {
   .prose a, .post-back a, .tag-link { color: var(--sea); }
   .prose .highlight .k, .prose .highlight .kd, .prose .highlight .kn, .prose .highlight .kr, .prose .highlight .kt { color: var(--sea); }
@@ -115,5 +129,10 @@
   }
 }
 
-/* ---------- [hidden] beats the display rules above: no-JS form, search filtering ---------- */
+/* [hidden] beats the rules above */
 .blog-search[hidden], .post-list[hidden], .post-card[hidden] { display: none; }
+/* JS: form box kept, footer below the fold, no shift. */
+@media (scripting: enabled) {
+  .blog-search[hidden] { display: grid; visibility: hidden; }
+  .blog-index:has(.post-list) { min-height: calc(100vh - 72px); }
+}

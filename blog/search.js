@@ -1,8 +1,7 @@
-/* Cabrillo Coast blog search: ES5, no deps, text-only output. */
+/* Cabrillo Coast blog search: ES5, text-only output. */
 (function (window, document) {
   "use strict";
 
-  // Pure, exported before DOM use.
   function normalize(text) {
     var s = String(text == null ? "" : text).toLowerCase();
     return typeof s.normalize === "function" ? s.normalize("NFD").replace(/[\u0300-\u036f]/g, "") : s;
@@ -32,7 +31,6 @@
   // Literal match; no RegExp from input.
   function hit(f, t, w) { return (f || "").indexOf(t) !== -1 ? w : 0; }
 
-  // AND match, field-weighted.
   function rank(prepared, query) {
     var terms = tokenize(query), hits = [], i, j, n, s, t, w;
     if (!terms.length) return null;
@@ -46,7 +44,7 @@
       }
       if (j === terms.length) hits.push({ e: prepared[i], s: s });
     }
-    hits.sort(function (a, b) { return b.s - a.s || a.e.order - b.e.order; }); // ES5 may be unstable
+    hits.sort(function (a, b) { return b.s - a.s || a.e.order - b.e.order; });
     for (i = 0; i < hits.length; i++) hits[i] = hits[i].e;
     return hits;
   }
@@ -55,61 +53,62 @@
 
   function $(id) { return document.getElementById(id); }
   var form = $("blog-search"), input = $("blog-search-input"), status = $("blog-search-status"), list = $("post-list");
-  if (!form || !input || !status || !list || typeof window.fetch !== "function") return;
+  if (!form || !input || !status || !list || !window.fetch) return;
 
-  var nodes = list.querySelectorAll("li[data-url]"), items = [], byUrl = Object.create(null), i;
-  for (i = 0; i < nodes.length; i++) {
-    items.push(nodes[i]);
-    byUrl[nodes[i].getAttribute("data-url")] = nodes[i];
-  }
+  var items = list.querySelectorAll("li[data-url]"), byUrl = Object.create(null), i;
+  for (i = 0; i < items.length; i++) byUrl[items[i].getAttribute("data-url")] = items[i];
   var indexUrl = form.getAttribute("data-index");
   if (!items.length || !indexUrl) return;
   form.hidden = false;
 
   var entries = null, started = false, failed = false, moved, timer;
 
-  function apply(raw) {
-    var q = String(raw).trim(), res, n = 0, j, li, quoted = "\u201c" + q + "\u201d", f = document.activeElement;
-    if (!failed && !entries) { load(); return; } // load applies it when done
-    res = failed ? null : rank(entries, q);
+  function apply(late, f) {
+    var q = input.value.trim(), res = entries && rank(entries, q), n = 0, j, li, raf = window.requestAnimationFrame;
+    f = f || document.activeElement;
+    if (!failed && !entries) return load();
+    if (late === 1 && (res || failed)) { // load ended: redraw 2 frames on (no CLS)
+      list.hidden = true;
+      return raf(function () { raf(function () { apply(2, f); }); });
+    }
     for (j = 0; j < items.length; j++) {
       items[j].hidden = !!res;
-      if (!res && moved) list.appendChild(items[j]); // original order
+      if (!res && moved) list.appendChild(items[j]);
     }
     moved = !!res;
     for (j = 0; res && j < res.length; j++) {
       li = byUrl[res[j].url];
       if (li) { li.hidden = false; list.appendChild(li); n++; }
     }
-    if (f && f !== document.activeElement) f.focus();
     list.hidden = !!res && !n;
-    status.textContent = failed ? "Search is unavailable right now; all articles are listed below." :
-      !res ? "" : n === 1 ? "1 article matches " + quoted + "." : n ? n + " articles match " + quoted + "." :
-      "No articles match " + quoted + ". Try fewer or different words.";
+    if (f && f !== document.activeElement) f.focus();
+    status.textContent = !entries ? "Search is unavailable right now; all articles are listed below." : !res ? "" :
+      (n ? n + (n > 1 ? " articles match " : " article matches ") : "No articles match ") + "\u201c" + q + "\u201d" +
+      (n ? "." : ". Try fewer or different words.");
   }
 
-  function load() { // once; no retry
+  function fail() { if (!entries && !failed) { failed = true; apply(1); } }
+
+  function load() { // once; fails at 15 s
     if (started) return;
     started = true;
+    window.setTimeout(fail, 15000);
     window.fetch(indexUrl).then(function (r) {
       if (!r.ok) throw new Error("index");
       return r.text();
     }).then(function (text) {
       entries = prepare(JSON.parse(text));
-      apply(input.value);
-    }).catch(function () {
-      failed = true;
-      apply("");
-    });
+      apply(1);
+    }).catch(fail);
   }
 
-  function now() { // apply, sync ?q=
+  function now() {
     var q = input.value.trim(), h = window.history, l = window.location;
     window.clearTimeout(timer);
-    apply(q);
+    apply();
     try {
       if (h && h.replaceState) h.replaceState(null, "", l.pathname + (q ? "?q=" + encodeURIComponent(q) : "") + l.hash);
-    } catch (err) { /* optional; URL kept */ }
+    } catch (err) { /* URL kept */ }
   }
 
   input.addEventListener("focus", load);

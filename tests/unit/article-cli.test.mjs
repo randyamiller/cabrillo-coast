@@ -7,7 +7,8 @@
  * new, check, publish and unpublish run in temporary roots holding a copy of
  * `_templates/article.md`, addressed with `--root`. guard runs in temporary
  * git repositories, and --pre-push pushes to a local bare repository. All of
- * it is written below one folder in `os.tmpdir()`, removed after the run.
+ * it is written below one folder in `os.tmpdir()`, removed after the run,
+ * including a run stopped by a signal (`PARENT_REMOVER`).
  *
  * Every git call and every tool run is isolated from the developer's git
  * configuration, hooks and template, and from the variables a running git
@@ -27,7 +28,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 
 /* Paths and isolation                                                       */
 
@@ -41,7 +42,47 @@ const TEMPLATE = path.join(ROOT, '_templates/article.md');
  * matches even where `os.tmpdir()` is a symbolic link (macOS `/var`).
  */
 const PARENT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'article-cli-')));
-after(() => fs.rmSync(PARENT, { recursive: true, force: true }));
+const removeParent = () => fs.rmSync(PARENT, { recursive: true, force: true });
+after(removeParent);
+process.on('exit', removeParent);
+
+/**
+ * Removes `PARENT` after an interrupted run too. A signal ends this process
+ * at once, before `after()` or the `exit` handler can run: Ctrl-C reaches
+ * every process in the terminal's group, and `node --test`, interrupted
+ * itself, sends this file's process SIGTERM and exits. A signal handler here
+ * would not help, because Node runs one only when the event loop turns,
+ * which these synchronous cases do not do until the file ends: the run
+ * would go on after Ctrl-C and then die writing to the runner's closed
+ * output, removing nothing. Instead a small process in its own session, out
+ * of reach of the terminal's signals and holding none of this process's
+ * output, reads a pipe that only this process holds open. End of file there
+ * comes however this process ends, SIGKILL included. If `PARENT` is still
+ * there, the remover deletes it, again two seconds later in case a git or
+ * tool run this process started was still writing to it, and exits. The
+ * signal still ends this process as it would anyway, so the exit status
+ * still reports it.
+ */
+const PARENT_REMOVER = [
+  "const { existsSync, rmSync } = require('node:fs');",
+  'const dir = process.argv[1];',
+  'const remove = () => rmSync(dir, { recursive: true, force: true, maxRetries: 10 });',
+  "process.stdin.on('error', remove).on('end', () => {",
+  '  if (!existsSync(dir)) return;',
+  '  remove();',
+  '  setTimeout(remove, 2000);',
+  '}).resume();',
+].join('\n');
+const parentRemover = spawn(process.execPath, ['-e', PARENT_REMOVER, PARENT], {
+  detached: true,
+  stdio: ['pipe', 'ignore', 'ignore'],
+});
+parentRemover.on('error', (error) => {
+  process.stderr.write(`warning: cannot start the process that removes ${PARENT} after an interrupted run: `
+    + `${error.message}\n`);
+});
+parentRemover.stdin?.unref();
+parentRemover.unref();
 
 const GIT_CONFIG_FILE = path.join(PARENT, 'gitconfig');
 fs.writeFileSync(GIT_CONFIG_FILE, '');
@@ -298,10 +339,20 @@ const FAULT_PRELOAD_URL = pathToFileURL(FAULT_PRELOAD).href;
  * preload and the rules `faults` active.
  */
 function cliWithFaults(root, faults, ...args) {
+  return cliWith(root, { faults }, ...args);
+}
+
+/**
+ * Runs a tool command in a temporary root as `cli` does, with the extra
+ * variables `env`, such as the `TZ` of `offUtcZone()`, and, when `faults` is
+ * given, the fault-injection preload with those rules active. A `run-tool`
+ * run started by a rule inherits `env` too.
+ */
+function cliWith(root, { env = {}, faults } = {}, ...args) {
   return run([...args, '--root', root], {
     cwd: root,
-    nodeArgs: ['--import', FAULT_PRELOAD_URL],
-    env: { ARTICLE_FAULTS: JSON.stringify(faults) },
+    nodeArgs: faults === undefined ? [] : ['--import', FAULT_PRELOAD_URL],
+    env: faults === undefined ? env : { ...env, ARTICLE_FAULTS: JSON.stringify(faults) },
   });
 }
 
@@ -315,6 +366,35 @@ function todayUtc() {
 /** The UTC date `days` days from now (negative for the past) as `YYYY-MM-DD`. */
 function addDaysUtc(days) {
   return new Date(Date.now() + days * 86400000).toISOString().slice(0, 10);
+}
+
+/** The calendar date in the time zone `timeZone` at the instant `when`, as `YYYY-MM-DD`. */
+function dateIn(timeZone, when) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(when).map(({ type, value }) => [type, value]));
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+/**
+ * The variables for a tool run whose outcome depends on today's date: a `TZ`
+ * whose local calendar date is not the UTC date, so a tool that dated by its
+ * local clock instead of UTC fails the case on every host, a UTC CI runner
+ * included. UTC-12 (`Etc/GMT+12`) is on the previous day until 12:00 UTC and
+ * UTC+14 (`Etc/GMT-14`) on the next from 10:00 UTC; switching at 11:00 UTC
+ * leaves the run an hour either way. Fails unless the zone's date differs
+ * from the UTC date (an unknown zone throws), so a case cannot lose that
+ * sensitivity unnoticed. Only crossing UTC midnight, which each case
+ * already tolerates, can bring the two dates together during a run.
+ *
+ * @returns {{ TZ: string }}
+ */
+function offUtcZone() {
+  const now = new Date();
+  const TZ = now.getUTCHours() < 11 ? 'Etc/GMT+12' : 'Etc/GMT-14';
+  const utc = now.toISOString().slice(0, 10);
+  assert.notEqual(dateIn(TZ, now), utc, `the local date in ${TZ} must differ from the UTC date ${utc}`);
+  return { TZ };
 }
 
 const PAST = addDaysUtc(-30);
@@ -389,9 +469,13 @@ function caseDir(label) {
   return dir;
 }
 
-/** A temporary root (not a git repository) holding a copy of the repository's article template. */
+/** The `_config.yml` of a temporary site root: the tool refuses a root without one. */
+const SITE_CONFIG = '# A temporary site root for tests/unit/article-cli.test.mjs\n';
+
+/** A temporary site root (not a git repository) holding `_config.yml` and a copy of the repository's article template. */
 function makeRoot() {
   const root = caseDir('root');
+  write(root, '_config.yml', SITE_CONFIG);
   write(root, '_templates/article.md', fs.readFileSync(TEMPLATE));
   return root;
 }
@@ -694,7 +778,7 @@ test('[AC-03][F-017] usage errors exit 2: no command, an unknown command, publis
     expectExit(result, 2);
     assert.match(result.stderr, /Usage:/, `usage block for ${JSON.stringify(args)}`);
   }
-  assert.deepEqual(list(root, '.'), ['_templates'], 'a usage error writes nothing');
+  assert.deepEqual(list(root, '.'), ['_config.yml', '_templates'], 'a usage error writes nothing');
 });
 
 /* new <slug>                                                                */
@@ -713,6 +797,7 @@ test('[AC-03][F-017] new copies the template to _drafts/<slug>.md, creates asset
 test('[AC-03][F-017] new does not warn in a clone whose core.hooksPath is .githooks', GIT_CASE, () => {
   const repo = makeRepo();
   git(repo, 'config', 'core.hooksPath', '.githooks');
+  write(repo, '_config.yml', SITE_CONFIG);
   write(repo, '_templates/article.md', fs.readFileSync(TEMPLATE));
   const result = cli(repo, 'new', 'hooked');
   expectExit(result, 0);
@@ -1143,8 +1228,9 @@ test('[AC-03][F-017] publish moves the draft to _posts/<UTC date>-<slug>.md, mov
   write(root, 'assets/drafts/my-slug/figure.png', PNG);
 
   // Read the UTC date on both sides of the run: a run that crosses midnight may use either.
+  const zone = offUtcZone();
   const dateBefore = todayUtc();
-  const result = cli(root, 'publish', 'my-slug');
+  const result = cliWith(root, { env: zone }, 'publish', 'my-slug');
   const dateAfter = todayUtc();
   expectExit(result, 0);
 
@@ -1165,7 +1251,7 @@ test('[AC-03][F-017] publish moves the draft to _posts/<UTC date>-<slug>.md, mov
   assert.ok(!postText.includes('/assets/drafts/my-slug/'), 'no image path still points at assets/drafts/');
   assert.equal(postText, draftText.split('/assets/drafts/my-slug/').join('/assets/blog/my-slug/'),
     'the image path is the only change');
-  expectExit(cli(root, 'check', postRel), 0);
+  expectExit(cliWith(root, { env: offUtcZone() }, 'check', postRel), 0);
 });
 
 test('[AC-03][F-017] publish of an article without images creates no image folder', async (t) => {
@@ -1213,16 +1299,21 @@ test('[AC-03][F-017] publish checks the post it would write, so an updated date 
 
   await t.test('[AC-03][F-017] publish refuses a draft whose updated date is yesterday (UTC) and moves nothing', () => {
     const root = makeRoot();
-    const draftText = draftWithImage('stale', addDaysUtc(-1));
+    const yesterday = addDaysUtc(-1);
+    const draftText = draftWithImage('stale', yesterday);
     write(root, '_drafts/stale.md', draftText);
     write(root, 'assets/drafts/stale/figure.png', PNG);
     expectExit(cli(root, 'check', '_drafts/stale.md'), 0);
 
-    const result = cli(root, 'publish', 'stale');
+    // The prospective post carries the UTC date of the run, on either side of midnight.
+    const zone = offUtcZone();
+    const dateBefore = todayUtc();
+    const result = cliWith(root, { env: zone }, 'publish', 'stale');
+    const runDates = [...new Set([dateBefore, todayUtc()])].map(escapeRegExp).join('|');
     expectExit(result, 1);
     assert.match(result.stderr,
-      /_posts\/\d{4}-\d{2}-\d{2}-stale\.md: updated \d{4}-\d{2}-\d{2} is earlier than the post date/,
-      'the prospective post is reported by its path');
+      new RegExp(`_posts/(${runDates})-stale\\.md: updated ${escapeRegExp(yesterday)} is earlier than the post date \\1`),
+      'the prospective post is reported by its path, dated by the UTC date of the run');
     assert.match(result.stderr, /nothing was moved/);
     assert.deepEqual(fs.readFileSync(abs(root, '_drafts/stale.md')), Buffer.from(draftText),
       'the draft is unchanged');
@@ -1234,10 +1325,11 @@ test('[AC-03][F-017] publish checks the post it would write, so an updated date 
 
   await t.test('[AC-03][F-017] publish accepts a draft whose updated date is today (UTC)', (st) => {
     const root = makeRoot();
+    const zone = offUtcZone();
     const dateBefore = todayUtc();
     write(root, '_drafts/fresh.md', draftWithImage('fresh', dateBefore));
     write(root, 'assets/drafts/fresh/figure.png', PNG);
-    const result = cli(root, 'publish', 'fresh');
+    const result = cliWith(root, { env: zone }, 'publish', 'fresh');
     if (todayUtc() !== dateBefore) {
       st.skip('the run crossed midnight UTC, so "today" changed under it');
       return;
@@ -1245,7 +1337,7 @@ test('[AC-03][F-017] publish checks the post it would write, so an updated date 
     expectExit(result, 0);
     assert.deepEqual(postsFor(root, 'fresh'), [`${dateBefore}-fresh.md`]);
     assert.deepEqual(fs.readFileSync(abs(root, 'assets/blog/fresh/figure.png')), PNG);
-    expectExit(cli(root, 'check', `_posts/${dateBefore}-fresh.md`), 0);
+    expectExit(cliWith(root, { env: zone }, 'check', `_posts/${dateBefore}-fresh.md`), 0);
   });
 });
 
@@ -1417,8 +1509,9 @@ test('[AC-03][F-017] unpublish refuses while another article links to the post i
 test('[AC-03][F-017] unpublish of an image-free post in a fresh clone moves only the post and changes no git state', GIT_CASE, () => {
   const repo = makeRepo();
   const postRel = `_posts/${PAST}-plain.md`;
+  write(repo, '_config.yml', SITE_CONFIG);
   write(repo, postRel, validArticle({ title: 'Plain article' }));
-  git(repo, 'add', postRel);
+  git(repo, 'add', '_config.yml', postRel);
   commit(repo, 'Publish: Plain article');
 
   const clone = caseDir('clone');
@@ -1997,7 +2090,10 @@ test('[AC-03][F-017] a per-slug lock serializes new, publish and unpublish, and 
     const out = path.join(root, '..', `${path.basename(root)}-competitor.json`);
     const tomorrow = new Date(Date.now() + 86400000).toISOString();
     const competitorArgv = [ARTICLE_MJS, 'publish', 'race', '--root', root];
-    const first = cliWithFaults(root, [{
+    // Both runs use the zone (the competitor inherits it), so only the competitor's clock differs: a UTC day ahead.
+    const zone = offUtcZone();
+    const dateBefore = todayUtc();
+    const first = cliWith(root, { env: zone, faults: [{
       fn: 'openSync',
       path: '_posts/',
       action: 'run-tool',
@@ -2005,7 +2101,8 @@ test('[AC-03][F-017] a per-slug lock serializes new, publish and unpublish, and 
       cwd: root,
       env: { ARTICLE_FAKE_NOW: tomorrow },
       out,
-    }], 'publish', 'race');
+    }] }, 'publish', 'race');
+    const dateAfter = todayUtc();
     assert.ok(fs.existsSync(out), `the competing run was started while the first one ran:\n${first.out}`);
     const competitor = JSON.parse(fs.readFileSync(out, 'utf8'));
     assert.deepEqual(
@@ -2017,10 +2114,13 @@ test('[AC-03][F-017] a per-slug lock serializes new, publish and unpublish, and 
     assert.match(competitor.stderr,
       new RegExp(`another article\\.mjs run \\(process \\d+ on ${escapeRegExp(os.hostname())}\\) is changing slug race`));
     expectExit(first, 0);
-    assert.equal(postsFor(root, 'race').length, 1, 'exactly one post, so the slug is published once');
+    const posts = postsFor(root, 'race');
+    assert.equal(posts.length, 1, 'exactly one post, so the slug is published once');
+    assert.ok([dateBefore, dateAfter].includes(posts[0].slice(0, 10)),
+      `the first run's post ${posts[0]} carries the UTC date of the run (${dateBefore}/${dateAfter})`);
     assert.equal(exists(root, '_drafts/race.md'), false);
     assert.equal(exists(root, lockRel('race')), false, 'the lock is released');
-    expectExit(cli(root, 'check'), 0);
+    expectExit(cliWith(root, { env: zone }, 'check'), 0);
   });
 
   await t.test('[AC-03][F-017] a lock left by a process that no longer runs is replaced', () => {
@@ -2070,6 +2170,7 @@ test('[AC-03][F-017] a per-slug lock serializes new, publish and unpublish, and 
 test('[AC-03][F-017] the next steps start with a quoted cd to --root when the tool runs from another folder, and only then', () => {
   const base = caseDir('elsewhere');
   const root = path.join(base, "it's a $root");
+  write(root, '_config.yml', SITE_CONFIG);
   write(root, '_templates/article.md', fs.readFileSync(TEMPLATE));
   const fromBase = (...args) => run([...args, '--root', root], { cwd: base });
   const cdLines = (result) => result.stdout.split('\n').filter((line) => line.startsWith('  cd '));
@@ -2109,16 +2210,16 @@ test('[AC-03][F-017] the next steps start with a quoted cd to --root when the to
   assert.deepEqual(cdLines(unpublishedHere), []);
 });
 
-test('[AC-03][F-017] the printed git add commands pass each path as one argument and run nothing, even for a post folder named with quotes and $(…)', () => {
+test('[AC-03][F-017] the printed git add and git rm commands pass each path as one argument and run nothing, even for a post folder named with quotes and $(…)', () => {
   const root = makeRoot();
   const stubDir = caseDir('git-argv');
   const argvFile = path.join(stubDir, 'argv');
   fs.writeFileSync(path.join(stubDir, 'git'), ['#!/bin/sh', `printf '%s\\0' "$@" > ${shQuote(argvFile)}`, ''].join('\n'),
     { mode: 0o755 });
-  /** The arguments `git` receives when the one printed `git add` line of `result` is pasted into a POSIX shell. */
+  /** The arguments `git` receives when the one printed staging line (`git add` or `git rm`) of `result` is pasted into a POSIX shell. */
   const pastedArgv = (result) => {
-    const lines = result.stdout.split('\n').filter((line) => line.startsWith('  git add '));
-    assert.equal(lines.length, 1, `one git add line:\n${result.stdout}`);
+    const lines = result.stdout.split('\n').filter((line) => /^ {2}git (?:add|rm) /.test(line));
+    assert.equal(lines.length, 1, `one git add or git rm line:\n${result.stdout}`);
     fs.rmSync(argvFile, { force: true });
     spawnOk('sh', ['-c', lines[0]], { cwd: root, env: { ...ENV, PATH: `${stubDir}${path.delimiter}${ENV.PATH ?? ''}` } });
     return fs.readFileSync(argvFile, 'utf8').split('\0').slice(0, -1);
@@ -2140,8 +2241,8 @@ test('[AC-03][F-017] the printed git add commands pass each path as one argument
   fs.renameSync(abs(root, `_posts/${postFile}`), abs(root, nestedRel));
   const unpublished = cli(root, 'unpublish', 'odd');
   expectExit(unpublished, 0);
-  assert.deepEqual(pastedArgv(unpublished), ['add', '-A', '--', nestedRel, 'assets/blog/odd'],
-    'the nested post path reaches git as one argument, byte for byte');
+  assert.deepEqual(pastedArgv(unpublished), ['rm', '-r', '-q', '--cached', '--ignore-unmatch', '--', nestedRel,
+    'assets/blog/odd'], 'the nested post path reaches git as one argument, byte for byte');
   assert.equal(exists(root, 'marker'), false, 'no $(…) in the path ran');
   assert.equal(exists(root, 'tick'), false, 'no backtick command in the path ran');
 });
@@ -2769,6 +2870,26 @@ test('[AC-03][F-017] guard --pre-push refuses a pushed commit holding a future-d
     + 'the root _posts/ folder; ', 'm'));
 });
 
+test('[AC-03][F-017] guard --pre-push refuses a pushed commit holding a future-dated post in the root _posts/ folder', GIT_CASE, () => {
+  const { repo, remote } = makeRemoteRepo();
+  const remoteSha = git(repo, 'rev-parse', 'HEAD');
+  // A valid post, image-free, whose only fault is its date: a month ahead, so it is future on either side of midnight.
+  const futureDate = addDaysUtc(30);
+  const futureRel = `_posts/${futureDate}-later.md`;
+  write(repo, futureRel, validArticle());
+  git(repo, 'add', futureRel);
+  commit(repo, 'Add a future-dated post');
+  const futureCommit = git(repo, 'rev-parse', 'HEAD').slice(0, 7);
+
+  const dateBefore = todayUtc();
+  const result = prePushUnchanged({ repo, remote }, 'refs/heads/main', 'refs/heads/main', remoteSha);
+  const runDates = [...new Set([dateBefore, todayUtc()])].map(escapeRegExp).join('|');
+  expectExit(result, 1);
+  assert.match(result.stderr, new RegExp(`^error: ${futureCommit}: ${escapeRegExp(futureRel)}: dated ${futureDate}, `
+    + `after today \\(UTC (${runDates})\\); future-dated posts are not allowed$`, 'm'));
+  assert.match(result.stderr, /guard: push refused \(1 problem in 1 commit\)/, 'the date is the only problem');
+});
+
 test('[AC-03][F-017] guard --pre-push refuses a commit that deletes a post but leaves its image folder', GIT_CASE, async (t) => {
   const postRel = `_posts/${PAST}-gone.md`;
   /** A pushed post with an image, then a local commit that deletes only the post. */
@@ -3282,4 +3403,356 @@ test('[AC-03][F-017] guard --pre-push refuses (fail closed) when the probe for t
   assert.ok(calls.some((call) => call.startsWith('cat-file -e')), `the probe ran:\n${calls.join('\n')}`);
   assert.equal(calls.some((call) => call.startsWith('rev-list')), false,
     `a killed probe is not read as an unknown remote tip, so no range is listed:\n${calls.join('\n')}`);
+});
+
+/* Articles that are not valid UTF-8                                         */
+
+/**
+ * A valid article (`validArticle(fields)`) with the bytes `bad` in place of
+ * its one `@`, and where `bad` starts: the byte offset and file line the
+ * tool reports.
+ *
+ * @returns {{ bytes: Buffer, offset: number, line: number }}
+ */
+function articleWithBytes(fields, bad) {
+  const text = validArticle(fields);
+  const at = text.indexOf('@');
+  assert.ok(at !== -1 && text.indexOf('@', at + 1) === -1, 'one @ marks where the bytes go');
+  const before = Buffer.from(text.slice(0, at), 'utf8');
+  return {
+    bytes: Buffer.concat([before, bad, Buffer.from(text.slice(at + 1), 'utf8')]),
+    offset: before.length,
+    line: text.slice(0, at).split('\n').length,
+  };
+}
+
+/** Articles saved in another encoding than UTF-8, which the Pages build silently leaves out of the site. */
+const NOT_UTF8_ARTICLES = [
+  ['Latin-1 (\\xe9)', () => articleWithBytes({ title: 'Notes from the caf@' }, Buffer.from([0xe9]))],
+  ['Windows-1252 quotes (\\x93, \\x94)',
+    () => articleWithBytes({ summary: 'A @ summary.' }, Buffer.concat([Buffer.from([0x93]), Buffer.from('quoted'), Buffer.from([0x94])]))],
+  ['UTF-16 (\\xff\\xfe)',
+    () => ({ bytes: Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(validArticle(), 'utf16le')]), offset: 0, line: 1 })],
+  ['a cut-short sequence (\\xc3\\x28)', () => articleWithBytes({ body: 'Broken @ sequence.' }, Buffer.from([0xc3, 0x28]))],
+];
+
+/** The error the tool reports for `rel` when its first invalid UTF-8 sequence starts at `offset`, on `line`. */
+function notUtf8Error(rel, { offset, line }) {
+  return `${rel}: not valid UTF-8 (byte offset ${offset}, line ${line}); save the file as UTF-8`;
+}
+
+test('[AC-03][F-017] check and publish refuse an article that is not valid UTF-8, naming its first invalid byte, and move nothing', async (t) => {
+  for (const [what, make] of NOT_UTF8_ARTICLES) {
+    await t.test(`[AC-03][F-017] check and publish refuse ${what}`, () => {
+      const root = makeRoot();
+      const article = make();
+      const draftRel = '_drafts/encoded.md';
+      write(root, draftRel, article.bytes);
+      write(root, 'assets/drafts/encoded/figure.png', PNG);
+      const error = notUtf8Error(draftRel, article);
+
+      for (const files of [[draftRel], []]) {
+        const checked = checkRoot(root, ...files);
+        expectExit(checked, 1);
+        assert.ok(checked.stderr.includes(`error: ${error}\n`), `check ${files.join(' ')} names the byte:\n${checked.out}`);
+        assert.doesNotMatch(checked.stdout, /^ok /m, 'the draft is not reported ok');
+      }
+
+      const published = unchangedBy(() => treeSnapshot(root), () => cli(root, 'publish', 'encoded'), `the root ${root}`);
+      expectExit(published, 1);
+      assert.ok(published.stderr.includes(`error: ${error}\n`), `publish names the byte:\n${published.out}`);
+      assert.match(published.stderr, /publish refused \(1 problem\); nothing was moved/);
+      assert.deepEqual(postsFor(root, 'encoded'), [], 'nothing is published');
+    });
+  }
+
+  await t.test('[AC-03][F-017] check refuses a post that is not valid UTF-8', () => {
+    const root = makeRoot();
+    const [, make] = NOT_UTF8_ARTICLES[1];
+    const article = make();
+    const postRel = `_posts/${PAST}-cp1252.md`;
+    write(root, postRel, article.bytes);
+    const checked = checkRoot(root);
+    expectExit(checked, 1);
+    assert.ok(checked.stderr.includes(`error: ${notUtf8Error(postRel, article)}\n`), checked.out);
+  });
+});
+
+test('[AC-03][F-017] a UTF-8 article with a byte-order mark, CRLF line ends and a NUL byte still passes check and publish', () => {
+  const root = makeRoot();
+  const text = validArticle({ title: 'Café notes', summary: 'A “quoted” summary.', body: 'Body with a NUL \u0000 byte.' });
+  const bytes = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(text.replace(/\n/g, '\r\n'), 'utf8')]);
+  write(root, '_drafts/bom-crlf.md', bytes);
+  expectExit(checkRoot(root, '_drafts/bom-crlf.md'), 0);
+  expectExit(cli(root, 'publish', 'bom-crlf'), 0);
+  const [postFile] = postsFor(root, 'bom-crlf');
+  assert.deepEqual(fs.readFileSync(abs(root, `_posts/${postFile}`)), bytes, 'the post holds the draft\'s exact bytes');
+  expectExit(checkRoot(root, `_posts/${postFile}`), 0);
+});
+
+test('[AC-03][F-017] guard --staged and guard --pre-push refuse an article that is not valid UTF-8, naming its path', GIT_CASE, async (t) => {
+  const postRel = `_posts/${PAST}-encoded.md`;
+  for (const [what, make] of NOT_UTF8_ARTICLES) {
+    await t.test(`[AC-03][F-017] guard --staged refuses a staged post in ${what}`, () => {
+      const repo = makeRepo();
+      const article = make();
+      write(repo, postRel, article.bytes);
+      git(repo, 'add', postRel);
+      const result = guardStagedUnchanged(repo);
+      expectExit(result, 1);
+      assert.deepEqual(guardErrors(result), [notUtf8Error(postRel, article)], result.out);
+      assert.match(result.stderr, /guard: commit refused \(1 problem\)/);
+      assert.doesNotMatch(result.stderr, /could not complete/, 'an ordinary refusal, not a git failure');
+    });
+  }
+
+  await t.test('[AC-03][F-017] guard --pre-push refuses a commit that adds a post that is not valid UTF-8', () => {
+    const repos = makeRemoteRepo();
+    const remoteSha = git(repos.repo, 'rev-parse', 'HEAD');
+    const [, make] = NOT_UTF8_ARTICLES[0];
+    const article = make();
+    write(repos.repo, postRel, article.bytes);
+    git(repos.repo, 'add', postRel);
+    commit(repos.repo, 'Publish: encoded');
+    const short = git(repos.repo, 'rev-parse', 'HEAD').slice(0, 7);
+    // A later commit that fixes the encoding does not clear the commit that holds the bad bytes.
+    write(repos.repo, postRel, validArticle());
+    git(repos.repo, 'add', postRel);
+    commit(repos.repo, 'Fix encoding');
+    const result = prePushUnchanged(repos, 'refs/heads/main', 'refs/heads/main', remoteSha);
+    expectExit(result, 1);
+    assert.ok(result.stderr.includes(`error: ${short}: ${notUtf8Error(postRel, article)}\n`), result.out);
+    assert.match(result.stderr, /guard: push refused \(1 problem in 1 commit\)/);
+    assert.doesNotMatch(result.stderr, /could not complete/, 'an ordinary refusal, not a git failure');
+  });
+});
+
+/* Repeat publish                                                            */
+
+test('[AC-03][F-017] publish run again for a published slug names the post, the update procedure and unpublish, not new', () => {
+  const root = makeRoot();
+  writeDraftWithImage(root, 'repeat');
+  expectExit(cli(root, 'publish', 'repeat'), 0);
+  const [postFile] = postsFor(root, 'repeat');
+  const postRel = `_posts/${postFile}`;
+
+  const again = unchangedBy(() => treeSnapshot(root), () => cli(root, 'publish', 'repeat'), `the root ${root}`);
+  expectExit(again, 1);
+  assert.ok(again.stderr.includes(`error: slug repeat is already published as ${postRel} and _drafts/repeat.md does `
+    + 'not exist; to update the article, edit the post, set updated: YYYY-MM-DD'), again.out);
+  assert.ok(again.stderr.includes('to take it down, run: node scripts/article.mjs unpublish repeat\n'), again.out);
+  assert.doesNotMatch(again.out, /article\.mjs new/, 'no pointer to new, which refuses a published slug');
+
+  expectExit(cli(root, 'unpublish', 'repeat'), 0);
+  assert.ok(exists(root, '_drafts/repeat.md'), 'the unpublish it names succeeds');
+
+  const unwritten = cli(root, 'publish', 'never-written');
+  expectExit(unwritten, 1);
+  assert.ok(unwritten.stderr.includes('error: _drafts/never-written.md does not exist; start a draft with: '
+    + 'node scripts/article.mjs new never-written\n'), `with no post either, the hint to start a draft stays:\n${unwritten.out}`);
+});
+
+/* The staging line unpublish prints                                         */
+
+/** `makeRepo()` with a committed `_config.yml`, so it is a site root for new, check, publish and unpublish. */
+function makeSiteRepo() {
+  const repo = makeRepo();
+  write(repo, '_config.yml', SITE_CONFIG);
+  git(repo, 'add', '_config.yml');
+  commit(repo, 'Site configuration');
+  return repo;
+}
+
+test('[AC-03][F-017] the git rm line unpublish prints succeeds whether or not the post was ever committed', GIT_CASE, async (t) => {
+  /** Pastes the one printed `git rm` line of `result` into a POSIX shell in `repo`; it must succeed. */
+  const pasteGitRm = (repo, result) => {
+    const lines = result.stdout.split('\n').filter((line) => line.startsWith('  git rm '));
+    assert.equal(lines.length, 1, `one git rm line:\n${result.stdout}`);
+    spawnOk('sh', ['-c', lines[0]], { cwd: repo, env: ENV });
+  };
+
+  await t.test('[AC-03][F-017] a post published but never committed: the line succeeds and stages nothing', () => {
+    const repo = makeSiteRepo();
+    writeDraftWithImage(repo, 'uncommitted');
+    expectExit(cli(repo, 'publish', 'uncommitted'), 0);
+    const unpublished = cli(repo, 'unpublish', 'uncommitted');
+    expectExit(unpublished, 0);
+    assert.ok(unpublished.stdout.includes('If the post was never committed, there is nothing to commit: skip the commit '
+      + 'and the push.\n'), unpublished.stdout);
+    pasteGitRm(repo, unpublished);
+    assert.equal(git(repo, 'diff', '--cached', '--name-only'), '', 'nothing is staged');
+    assert.equal(git(repo, 'status', '--porcelain', '--untracked-files=all'), '',
+      'nothing to commit: the draft and its images are git-ignored');
+  });
+
+  await t.test('[AC-03][F-017] a committed post with images: the line stages exactly their deletion', () => {
+    const repo = makeSiteRepo();
+    const post = writePostWithImage(repo, 'committed');
+    git(repo, 'add', post.rel, 'assets/blog/committed');
+    commit(repo, 'Publish: committed');
+    const unpublished = cli(repo, 'unpublish', 'committed');
+    expectExit(unpublished, 0);
+    pasteGitRm(repo, unpublished);
+    assert.deepEqual(git(repo, 'diff', '--cached', '--name-status').split('\n').sort(),
+      [`D\t${post.rel}`, 'D\tassets/blog/committed/figure.png'].sort(), 'the post and its image are staged as deleted');
+    commit(repo, 'Unpublish: committed');
+    assert.equal(git(repo, 'ls-files', '--', '_posts', 'assets/blog'), '', 'once committed, nothing of the article is tracked');
+    assert.equal(git(repo, 'status', '--porcelain', '--untracked-files=all'), '', 'nothing is left to commit');
+  });
+});
+
+/* Output streams that fail                                                  */
+
+/**
+ * Runs a tool command in a temporary root as `cli` does, with its stdout a
+ * pipe whose reading end this process closes at once, as `| head -1` does
+ * after its line, so every write the tool makes to stdout fails with EPIPE.
+ *
+ * @returns {Promise<{ status: number | null, signal: string | null, stderr: string }>}
+ */
+function cliStdoutClosed(root, ...args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [ARTICLE_MJS, ...args, '--root', root], {
+      cwd: root,
+      env: ENV,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    child.stdout.destroy();
+    let stderr = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+    const timer = setTimeout(() => child.kill('SIGKILL'), 30000);
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on('close', (status, signal) => {
+      clearTimeout(timer);
+      resolve({ status, signal, stderr });
+    });
+  });
+}
+
+test('[AC-03][F-017] publish and unpublish exit 0 without a stack trace when stdout is a closed pipe, and check keeps its own exit code', async () => {
+  const root = makeRoot();
+  writeDraftWithImage(root, 'piped');
+  const noCrash = (result, what) => {
+    assert.equal(result.signal, null, `${what} ended by itself:\n${result.stderr}`);
+    assert.doesNotMatch(result.stderr, /EPIPE|Unhandled 'error' event|^\s+at /m, `${what} printed no stack trace`);
+  };
+
+  const published = await cliStdoutClosed(root, 'publish', 'piped');
+  noCrash(published, 'publish');
+  assert.equal(published.status, 0, `publish completed, so it exits 0:\n${published.stderr}`);
+  assert.equal(postsFor(root, 'piped').length, 1, 'the post was written');
+  assert.deepEqual(fs.readFileSync(abs(root, 'assets/blog/piped/figure.png')), PNG, 'the image was moved');
+
+  const unpublished = await cliStdoutClosed(root, 'unpublish', 'piped');
+  noCrash(unpublished, 'unpublish');
+  assert.equal(unpublished.status, 0, `unpublish completed, so it exits 0:\n${unpublished.stderr}`);
+  assert.ok(exists(root, '_drafts/piped.md'), 'the post is a draft again');
+  assert.deepEqual(postsFor(root, 'piped'), [], 'the post is gone');
+
+  write(root, '_drafts/untitled.md', validArticle({ title: '' }));
+  const checked = await cliStdoutClosed(root, 'check', '_drafts/untitled.md');
+  noCrash(checked, 'check');
+  assert.equal(checked.status, 1, `a failed check still exits 1:\n${checked.stderr}`);
+});
+
+test('[AC-03][F-017] a write failure other than a closed pipe fails the command with a message naming the stream', { skip: fs.existsSync('/dev/full') ? false : 'needs /dev/full' }, () => {
+  const root = makeRoot();
+  write(root, '_drafts/full.md', validArticle());
+  const fd = fs.openSync('/dev/full', 'w');
+  try {
+    const result = spawnSync(process.execPath, [ARTICLE_MJS, 'check', '--root', root], {
+      cwd: root,
+      env: ENV,
+      stdio: ['ignore', fd, 'pipe'],
+      encoding: 'utf8',
+      timeout: 30000,
+    });
+    assert.equal(result.status, 1, `output that could not be written fails the command:\n${result.stderr}`);
+    assert.match(result.stderr, /^error: cannot write to standard output \(ENOSPC[^)]*\); output was lost$/m);
+    assert.doesNotMatch(result.stderr, /^\s+at /m, 'no stack trace');
+  } finally {
+    fs.closeSync(fd);
+  }
+});
+
+/* The site root                                                             */
+
+test('[AC-03][F-017] new, check, publish and unpublish refuse a root without _config.yml with exit 2 and change nothing; guard still runs from a subfolder', GIT_CASE, async (t) => {
+  /** A site repository with a draft and its image, a committed post with its image, and a blog/ subfolder. */
+  const siteWithBlogFolder = () => {
+    const repo = makeSiteRepo();
+    write(repo, '_templates/article.md', fs.readFileSync(TEMPLATE));
+    writeDraftWithImage(repo, 'waiting');
+    const post = writePostWithImage(repo, 'live');
+    write(repo, 'blog/index.html', '<p>Blog</p>\n');
+    git(repo, 'add', post.rel, 'assets/blog/live', 'blog/index.html');
+    commit(repo, 'Publish: live');
+    return { repo, sub: path.join(repo, 'blog') };
+  };
+  /** Asserts that every command in `runs` was refused as a usage error with `error`, leaving `repo` as it was. */
+  const refusedEverywhere = (repo, runs, error) => {
+    for (const [args, options] of runs) {
+      const result = unchangedBy(() => repoSnapshot(repo), () => run(args, options), 'the repository');
+      expectExit(result, 2);
+      assert.ok(result.stderr.startsWith(`error: ${error}\n`), `${args.join(' ')}:\n${result.out}`);
+      assert.match(result.stderr, /Usage:/, 'the usage block follows');
+      assert.equal(result.stdout, '', `${args.join(' ')} reports nothing as created, checked or moved`);
+    }
+  };
+
+  await t.test('[AC-03][F-017] from a subfolder without --root, naming the folder above that holds _config.yml', () => {
+    const { repo, sub } = siteWithBlogFolder();
+    refusedEverywhere(repo, [
+      [['new', 'subfolder-test'], { cwd: sub }],
+      [['check'], { cwd: sub }],
+      [['check', '../_drafts/waiting.md'], { cwd: sub }],
+      [['publish', 'waiting'], { cwd: sub }],
+      [['unpublish', 'live'], { cwd: sub }],
+    ], `${sub} is not the site root (it has no _config.yml); run the command from the repository root (${repo} holds `
+      + '_config.yml) or pass --root <dir>');
+  });
+
+  await t.test('[AC-03][F-017] with --root naming a folder without _config.yml', () => {
+    const { repo, sub } = siteWithBlogFolder();
+    refusedEverywhere(repo, [
+      [['new', 'subfolder-test', '--root', sub], { cwd: repo }],
+      [['check', '--root', sub], { cwd: repo }],
+      [['check', '_drafts/waiting.md', '--root', sub], { cwd: repo }],
+      [['publish', 'waiting', '--root', sub], { cwd: repo }],
+      [['unpublish', 'live', '--root', sub], { cwd: repo }],
+    ], `--root ${sub} is not the site root (it has no _config.yml); pass the repository root (${repo} holds _config.yml)`);
+  });
+
+  await t.test('[AC-03][F-017] in a folder with no site root above it, without a hint', () => {
+    const dir = caseDir('no-site');
+    const ancestors = [];
+    for (let up = path.dirname(dir); up !== path.dirname(up); up = path.dirname(up)) ancestors.push(up);
+    const above = [...ancestors, path.parse(dir).root].find((up) => fs.existsSync(path.join(up, '_config.yml')));
+    const hint = above === undefined ? '' : ` (${above} holds _config.yml)`;
+    for (const args of [['check'], ['new', 'nowhere']]) {
+      const result = unchangedBy(() => treeSnapshot(dir), () => run(args, { cwd: dir }), `the folder ${dir}`);
+      expectExit(result, 2);
+      assert.ok(result.stderr.startsWith(`error: ${dir} is not the site root (it has no _config.yml); run the command `
+        + `from the repository root${hint} or pass --root <dir>\n`), result.out);
+    }
+  });
+
+  await t.test('[AC-03][F-017] guard --staged run from the subfolder checks the whole repository', () => {
+    const { repo, sub } = siteWithBlogFolder();
+    const postRel = `_posts/${PAST}-staged.md`;
+    write(repo, postRel, validArticle({ title: 'Staged from a subfolder' }));
+    git(repo, 'add', postRel);
+    const accepted = unchangedBy(() => repoSnapshot(repo), () => run(['guard', '--staged'], { cwd: sub }), 'the repository');
+    expectExit(accepted, 0);
+    git(repo, 'add', '-f', '_drafts/waiting.md');
+    const refused = unchangedBy(() => repoSnapshot(repo), () => run(['guard', '--staged'], { cwd: sub }), 'the repository');
+    expectExit(refused, 1);
+    assert.match(refused.stderr, /_drafts\/waiting\.md/, 'a draft staged outside the subfolder is refused');
+  });
 });
