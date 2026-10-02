@@ -4,15 +4,19 @@
  * configuration) and AC-04 (article schema). Article content (the
  * tracked-content rules, the front-matter schema, images and unsafe markup)
  * is judged by `scripts/lib/articles.mjs`, the module `guard` uses, so commit
- * time and test time judge it identically. The `.gitignore`, hook,
- * configuration and gem checks encode their requirements in this suite.
+ * time and test time judge it identically. So are the configuration settings
+ * that would keep a tracked post off the site (`checkSiteConfig`), by
+ * `scripts/lib/site-config.mjs`. The `.gitignore`, hook, configuration and
+ * gem checks encode their requirements in this suite.
  *
  * Standing constraints:
  *   - `_config.yml` and `_config.preview.yml` are read with the types
- *     Jekyll's YAML loader gives them, so a value that only looks right, such
- *     as `future: "false"`, fails. The preview restates the `exclude` list
- *     without `assets/drafts` and sets nothing else, so the overlay's only
- *     effect is that draft images render in the preview.
+ *     Jekyll's YAML loader gives them, by the fail-closed reader
+ *     `readJekyllConfig` in `scripts/lib/site-config.mjs`, so a value that
+ *     only looks right, such as `future: "false"`, fails. The preview
+ *     restates the `exclude` list without `assets/drafts` and sets nothing
+ *     else, so the overlay's only effect is that draft images render in the
+ *     preview.
  *   - A hook must be executable, with index mode `100755` once tracked and
  *     tracked at all under `CI=true`, because a clone receives the mode the
  *     index records.
@@ -62,6 +66,14 @@ import {
   scanUnsafeMarkup,
   validateArticle,
 } from '../../scripts/lib/articles.mjs';
+import {
+  SITE_CONFIG_FILES,
+  checkSiteConfig,
+  describeYamlValue,
+  excludeEntryMatches,
+  readJekyllConfig,
+  siteConfigFile,
+} from '../../scripts/lib/site-config.mjs';
 
 /* Constants                                                                 */
 
@@ -120,23 +132,31 @@ const CONFIG_EXCLUDES = Object.freeze([
 /** The one entry `_config.preview.yml` leaves out, so draft images render in the preview. */
 const PREVIEW_ONLY_INCLUDED = 'assets/drafts';
 
+/** The remote name and URL a behavioural run passes the pre-push hook, as git does; the space shows any word splitting. */
+const PRE_PUSH_ARGV = Object.freeze(['origin', '/srv/git/cabrillo coast.git']);
+
 /**
  * The hooks and the guard command each must end with (AAP 0.6.2): `command`
- * is the exact last line, `args` what guard must receive, and `stdin` what a
- * behavioural run feeds the hook (for pre-push, the ref line git passes),
- * which guard must receive unchanged.
+ * is the exact last line, `argv` the arguments git passes the hook, which a
+ * behavioural run passes it too, `args` what guard must receive, and `stdin`
+ * what a behavioural run feeds the hook (for pre-push, the ref line git
+ * passes), which guard must receive unchanged. The pre-push hook hands guard
+ * git's remote name and URL after `--`, so guard can limit what it skips to
+ * commits that remote already holds.
  */
 const HOOKS = Object.freeze([
   Object.freeze({
     file: '.githooks/pre-commit',
     command: 'exec node scripts/article.mjs guard --staged',
+    argv: Object.freeze([]),
     args: Object.freeze(['guard', '--staged']),
     stdin: '',
   }),
   Object.freeze({
     file: '.githooks/pre-push',
-    command: 'exec node scripts/article.mjs guard --pre-push',
-    args: Object.freeze(['guard', '--pre-push']),
+    command: 'exec node scripts/article.mjs guard --pre-push -- "$@"',
+    argv: PRE_PUSH_ARGV,
+    args: Object.freeze(['guard', '--pre-push', '--', ...PRE_PUSH_ARGV]),
     stdin: `refs/heads/feature ${'1'.repeat(40)} refs/heads/feature ${'0'.repeat(40)}\n`,
   }),
 ]);
@@ -512,20 +532,22 @@ const VALID_FRONT_MATTER = Object.freeze(['title: "A valid title"', 'summary: "A
 /* .gitignore probes                                                         */
 
 /**
- * Problems with how the repository at `cwd` ignores each `IGNORE_PROBES`
- * path, from one `git check-ignore --no-index -v -n` call: a probe counts as
- * ignored only when its deciding pattern comes from the root `.gitignore`
- * and is not a `!` negation. A later negation such as `!node_modules/`, a
- * missing entry and a pattern only in `.git/info/exclude` or a global
- * excludes file (which other clones lack) are all reported.
+ * The deciding ignore pattern of each of `probes` in the repository at `cwd`,
+ * from one `git check-ignore --no-index -v -n` call, keyed by probe: its
+ * `source` file, `line` and `pattern`, with `source` empty when no pattern
+ * matches. A probe without a trailing `/` is judged as a file, which is how
+ * git sees a symbolic link. `config` is passed before `check-ignore`, such
+ * as `['-c', 'core.ignorecase=false']`.
  *
  * @param {string} cwd Top level of the work tree to ask.
  * @param {Record<string, string>} env Environment for git.
- * @returns {string[]} One problem per probe that is not ignored by `.gitignore`.
+ * @param {string[]} probes Repository-relative paths.
+ * @param {string[]} [config] Leading git options.
+ * @returns {Map<string, { source: string, line: string, pattern: string }>}
  */
-function ignoreProbeProblems(cwd, env) {
-  const probes = GITIGNORE_ENTRIES.map((entry) => IGNORE_PROBES[entry]);
-  const result = spawnSync('git', ['check-ignore', '--no-index', '-v', '-n', '--', ...probes], { cwd, env, encoding: 'utf8', timeout: 30000 });
+function ignoreVerdicts(cwd, env, probes, config = []) {
+  const args = [...config, 'check-ignore', '--no-index', '-v', '-n', '--', ...probes];
+  const result = spawnSync('git', args, { cwd, env, encoding: 'utf8', timeout: 30000 });
   if (result.error) throw result.error;
   // Exit 0: some probe is ignored; 1: none is. Anything else is git failing.
   if (result.status !== 0 && result.status !== 1) {
@@ -539,6 +561,24 @@ function ignoreProbeProblems(cwd, env) {
     if (m === null) throw new Error(`unexpected git check-ignore output in ${cwd}: ${line}`);
     verdicts.set(m[4], { source: m[1], line: m[2], pattern: m[3] });
   }
+  return verdicts;
+}
+
+/**
+ * Problems with how the repository at `cwd` ignores each `IGNORE_PROBES`
+ * path, from one `git check-ignore --no-index -v -n` call: a probe counts as
+ * ignored only when its deciding pattern comes from the root `.gitignore`
+ * and is not a `!` negation. A later negation such as `!node_modules/`, a
+ * missing entry and a pattern only in `.git/info/exclude` or a global
+ * excludes file (which other clones lack) are all reported.
+ *
+ * @param {string} cwd Top level of the work tree to ask.
+ * @param {Record<string, string>} env Environment for git.
+ * @returns {string[]} One problem per probe that is not ignored by `.gitignore`.
+ */
+function ignoreProbeProblems(cwd, env) {
+  const probes = GITIGNORE_ENTRIES.map((entry) => IGNORE_PROBES[entry]);
+  const verdicts = ignoreVerdicts(cwd, env, probes);
   const problems = [];
   GITIGNORE_ENTRIES.forEach((entry, index) => {
     const probe = probes[index];
@@ -551,6 +591,53 @@ function ignoreProbeProblems(cwd, env) {
       problems.push(`${probe} (${entry}) is re-included by .gitignore:${verdict.line} (${verdict.pattern})`);
     }
   });
+  return problems;
+}
+
+/**
+ * Draft and draft-image paths `.gitignore` itself must ignore in every letter
+ * case and as an entry that is not a folder (a file or a symbolic link, as
+ * `_drafts` linked to another folder is), so `git add -A` skips each one.
+ */
+const IGNORED_DRAFT_SHAPES = Object.freeze([
+  '_drafts',
+  'blog/_drafts',
+  '_Drafts/x.md',
+  'blog/_DRAFTS/x.md',
+  'assets/drafts',
+  'assets/Drafts/x/y.png',
+  'ASSETS/drafts/x/y.png',
+]);
+
+/** Paths `.gitignore` must never ignore, because `git add -A` must stage them: a post, an article image and a name that only contains `_drafts`. */
+const UNIGNORED_PUBLIC_PATHS = Object.freeze(['_posts/2026-01-01-x.md', 'assets/blog/x/y.png', 'docs/_drafts.md']);
+
+/**
+ * Problems with how the `.gitignore` of the repository at `cwd` treats
+ * `IGNORED_DRAFT_SHAPES` and `UNIGNORED_PUBLIC_PATHS`, judged with
+ * `core.ignorecase=false`, as on the Linux file systems of CI and Pages: each
+ * shape must be ignored by a pattern of `.gitignore` that is not a `!`
+ * negation, and no non-negated `.gitignore` pattern may decide a public path.
+ *
+ * @param {string} cwd Top level of the work tree to ask.
+ * @param {Record<string, string>} env Environment for git.
+ * @returns {string[]} One problem per path `.gitignore` treats wrongly.
+ */
+function draftShapeIgnoreProblems(cwd, env) {
+  const verdicts = ignoreVerdicts(cwd, env, [...IGNORED_DRAFT_SHAPES, ...UNIGNORED_PUBLIC_PATHS], ['-c', 'core.ignorecase=false']);
+  const decides = (verdict) => verdict.source === '.gitignore' && !verdict.pattern.startsWith('!');
+  const problems = [];
+  for (const probe of [...IGNORED_DRAFT_SHAPES, ...UNIGNORED_PUBLIC_PATHS]) {
+    const verdict = verdicts.get(probe);
+    if (verdict === undefined) {
+      problems.push(`${probe}: git check-ignore reported nothing for it`);
+    } else if (IGNORED_DRAFT_SHAPES.includes(probe) && !decides(verdict)) {
+      const by = verdict.source === '' ? 'no pattern' : `${verdict.source}:${verdict.line} (${verdict.pattern})`;
+      problems.push(`${probe} must be ignored by .gitignore itself, but is decided by ${by}`);
+    } else if (UNIGNORED_PUBLIC_PATHS.includes(probe) && decides(verdict)) {
+      problems.push(`${probe} must not be ignored, but .gitignore:${verdict.line} (${verdict.pattern}) ignores it`);
+    }
+  }
   return problems;
 }
 
@@ -694,11 +781,12 @@ const GUARD_STAND_IN = [
  * environment it gives a hook: the hook is written to `hook.file` in a new
  * temporary repository whose `scripts/article.mjs` is the stand-in guard
  * `GUARD_STAND_IN`, and run from the subfolder `sub/folder` with
- * `TEMP_GIT_ENV`, this Node first on `PATH` and `hook.stdin` on standard
- * input, once with the stand-in exiting 1 and once exiting 0. Standard input
- * is a file holding `hook.stdin`, opened afresh for each run, never a pipe, so
- * no write can race a hook that exits without reading it and abort the check
- * before the hook's behaviour is judged. Guard must be reached both times with
+ * `TEMP_GIT_ENV`, this Node first on `PATH`, `hook.argv` as its arguments
+ * and `hook.stdin` on standard input, once with the stand-in exiting 1 and
+ * once exiting 0. Standard input is a file holding `hook.stdin`, opened
+ * afresh for each run, never a pipe, so no write can race a hook that exits
+ * without reading it and abort the check before the hook's behaviour is
+ * judged. Guard must be reached both times with
  * `hook.args`, the repository's real top level as its working folder (the hook
  * must find the root itself) and `hook.stdin` unchanged, and the hook must
  * exit with the stand-in's status. Nothing touches this repository.
@@ -722,7 +810,7 @@ function hookBehaviourProblems(text, hook) {
     const stdin = openSync(stdinFile, 'r');
     let result;
     try {
-      result = spawnSync('sh', [path.join(repo, ...hook.file.split('/'))], {
+      result = spawnSync('sh', [path.join(repo, ...hook.file.split('/')), ...hook.argv], {
         cwd: path.join(repo, 'sub', 'folder'),
         env: {
           ...TEMP_GIT_ENV,
@@ -790,8 +878,22 @@ const HOOK_CONTROLS = Object.freeze([
     name: 'the wrong guard mode',
     hook: HOOKS[0],
     change: (text) => replaceOnce(text, `${HOOKS[0].command}\n`, `${HOOKS[1].command}\n`),
-    wrapper: /^the last command must be exactly exec node scripts\/article\.mjs guard --staged \(got line \d+: exec node scripts\/article\.mjs guard --pre-push\)$/,
-    behaviour: [/^with guard exiting 1: guard received arguments \["guard","--pre-push"\], not \["guard","--staged"\]$/],
+    wrapper: /^the last command must be exactly exec node scripts\/article\.mjs guard --staged \(got line \d+: exec node scripts\/article\.mjs guard --pre-push -- "\$@"\)$/,
+    behaviour: [/^with guard exiting 1: guard received arguments \["guard","--pre-push","--"\], not \["guard","--staged"\]$/],
+  },
+  {
+    name: 'the pre-push exec without git\'s remote name and URL',
+    hook: HOOKS[1],
+    change: (text) => replaceOnce(text, `${HOOKS[1].command}\n`, 'exec node scripts/article.mjs guard --pre-push\n'),
+    wrapper: /^the last command must be exactly exec node scripts\/article\.mjs guard --pre-push -- "\$@" \(got line \d+: exec node scripts\/article\.mjs guard --pre-push\)$/,
+    behaviour: [/^with guard exiting 1: guard received arguments \["guard","--pre-push"\], not \["guard","--pre-push","--","origin","\/srv\/git\/cabrillo coast\.git"\]$/],
+  },
+  {
+    name: 'the remote name and URL passed unquoted',
+    hook: HOOKS[1],
+    change: (text) => replaceOnce(text, `${HOOKS[1].command}\n`, 'exec node scripts/article.mjs guard --pre-push -- $@\n'),
+    wrapper: /^the last command must be exactly exec node scripts\/article\.mjs guard --pre-push -- "\$@" \(got line \d+: .* -- \$@\)$/,
+    behaviour: [/^with guard exiting 1: guard received arguments \["guard","--pre-push","--","origin","\/srv\/git\/cabrillo","coast\.git"\], not /],
   },
   {
     name: 'no cd to the repository root',
@@ -804,7 +906,7 @@ const HOOK_CONTROLS = Object.freeze([
     name: 'standard input replaced by /dev/null on the pre-push exec',
     hook: HOOKS[1],
     change: (text) => replaceOnce(text, `${HOOKS[1].command}\n`, `${HOOKS[1].command} < /dev/null\n`),
-    wrapper: /^the last command must be exactly exec node scripts\/article\.mjs guard --pre-push \(got line \d+: .* < \/dev\/null\)$/,
+    wrapper: /^the last command must be exactly exec node scripts\/article\.mjs guard --pre-push -- "\$@" \(got line \d+: .* < \/dev\/null\)$/,
     behaviour: [/^with guard exiting 1: guard read standard input "", not "refs\/heads\/feature /],
   },
   {
@@ -842,381 +944,16 @@ const HOOK_CONTROLS = Object.freeze([
   },
 ]);
 
-/* Typed, fail-closed YAML reader for the Jekyll configuration files         */
+/* Publishing configuration checks                                           */
 
-/**
- * Plain scalars that SafeYAML 1.0.5, which Jekyll 3.10 loads its
- * configuration with, reads as numbers, dates or times instead of text: its
- * integer, float, date and time patterns.
- */
-const YAML_TYPED_PLAIN_RES = Object.freeze([
-  /^[-+]?(?:0|[1-9][0-9_,]*)$/,
-  /^0[0-7_]+$/,
-  /^[-+]?0x[0-9a-fA-F_]+$/,
-  /^0b[01_]+$/,
-  /^[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+(?:\.[0-9_]*)?$/,
-  /^[-+]?(?:[0-9][0-9_]*)?\.[0-9_]+(?:[eE][-+][0-9]+)?$/,
-  /^[-+]?\.(?:inf|Inf|INF)$|^\.(?:nan|NaN|NAN)$/,
-  /^\d{4}-\d{1,2}-\d{1,2}(?:(?:[Tt]| +)\d{1,2}:\d{2}:\d{2}(?:\.\d*)?(?: *(?:Z|[-+]\d{1,2}(?::?\d{2})?))?)?$/,
-]);
-
-/**
- * The key forms the reader accepts, each with its normalization: plain
- * (`baseurl`), double-quoted (`"baseurl"`, escapes `\"` and `\\` only) and
- * single-quoted (`'baseurl'`, `''` for a quote). Spaces may stand before the
- * `:`, and a space or the end of the line must follow it.
- */
-const YAML_KEY_FORMS = Object.freeze([
-  [/^([A-Za-z0-9_][A-Za-z0-9_./-]*) *:(?= |$)/, (m) => m[1]],
-  [/^"((?:[^"\\]|\\["\\])*)" *:(?= |$)/, (m) => m[1].replace(/\\(["\\])/g, '$1')],
-  [/^'((?:[^']|'')*)' *:(?= |$)/, (m) => m[1].replace(/''/g, "'")],
-]);
-
-/** What may follow a closing quote or bracket: nothing, or a ` # comment`. */
-const YAML_TRAILER_RE = /^(?: *| +#.*)$/;
-
-/** The value of an entry whose value could not be read; the reason is in `unsupported`. */
-const YAML_UNREADABLE = Object.freeze({ kind: 'other', value: null, quoted: false });
-
-/**
- * Reads the quoted scalar that starts at `text[start]` and closes on the same
- * line: double-quoted with the escapes `\"` and `\\` only, or single-quoted
- * with `''` for a quote. Returns `{ value, end }` (the index after the
- * closing quote) or `{ error }`.
- */
-function readYamlQuoted(text, start) {
-  const quote = text[start];
-  let value = '';
-  for (let i = start + 1; i < text.length; i += 1) {
-    const c = text[i];
-    if (c === quote) {
-      if (quote === "'" && text[i + 1] === "'") {
-        value += "'";
-        i += 1;
-        continue;
-      }
-      return { value, end: i + 1 };
-    }
-    if (quote === '"' && c === '\\' && i + 1 < text.length) {
-      const next = text[i + 1];
-      if (next !== '"' && next !== '\\') return { error: `the escape \\${next} is not supported in a double-quoted string` };
-      value += next;
-      i += 1;
-      continue;
-    }
-    value += c;
-  }
-  return { error: `a ${quote === '"' ? 'double' : 'single'}-quoted string must close on the same line` };
-}
-
-/**
- * The value SafeYAML 1.0.5 makes of the plain (unquoted) scalar `text`:
- * `''`, `~` and `null` in any letter case are null; `yes`, `on`, `true`,
- * `no`, `off` and `false` in any letter case are booleans; numbers, dates
- * and times are `other`; everything else is a string.
- */
-function plainYamlValue(text) {
-  if (text === '' || /^(?:~|null)$/i.test(text)) return { kind: 'null', value: null, quoted: false };
-  if (/^(?:yes|no|on|off|true|false)$/i.test(text)) return { kind: 'bool', value: /^(?:yes|on|true)$/i.test(text), quoted: false };
-  if (YAML_TYPED_PLAIN_RES.some((re) => re.test(text))) return { kind: 'other', value: text, quoted: false };
-  return { kind: 'string', value: text, quoted: false };
-}
-
-/** Why the plain scalar `text` cannot be read here, or `null`; `inFlow` adds the flow-list rules. */
-function plainYamlProblem(text, inFlow) {
-  if (/^[&*]/.test(text)) return 'anchors and aliases (& and *) are not supported';
-  if (text.startsWith('!')) return 'YAML tags (!) are not supported';
-  if (/^[|>]/.test(text)) return 'block scalars (| and >) are not supported';
-  if (text.startsWith('{')) return 'flow mappings ({ … }) are not supported';
-  if (/^[%@`,\]}]/.test(text)) return `a plain value must not start with ${text[0]}`;
-  if (/^[-?:](?: |$)/.test(text)) return `${text[0]} followed by a space cannot start a value here`;
-  if (/: |:$/.test(text)) return 'a plain value must not contain ": " or end with ":"';
-  if (inFlow && /[[{}]/.test(text)) return 'nested lists and mappings are not supported in a flow list';
-  return null;
-}
-
-/**
- * Reads the one-line flow list that starts at `text[0]`, such as
- * `[a, "b, c"]`: quoted items keep their commas, plain items are typed by
- * `plainYamlValue`, and empty items, a trailing comma, comments, nesting and
- * an unclosed list are errors. Returns `{ value, end }` or `{ error }`.
- */
-function readYamlFlowList(text) {
-  const items = [];
-  let i = 1;
-  const skipSpaces = () => {
-    while (text[i] === ' ') i += 1;
-  };
-  skipSpaces();
-  if (text[i] === ']') return { value: { kind: 'list', items }, end: i + 1 };
-  for (;;) {
-    skipSpaces();
-    const c = text[i];
-    if (c === undefined) return { error: 'a flow list must close with ] on the same line' };
-    if (c === ',' || c === ']') return { error: 'a flow list must not contain empty items' };
-    if (c === '"' || c === "'") {
-      const quoted = readYamlQuoted(text, i);
-      if (quoted.error) return quoted;
-      items.push({ kind: 'string', value: quoted.value, quoted: true });
-      i = quoted.end;
-    } else {
-      let end = i;
-      while (end < text.length && text[end] !== ',' && text[end] !== ']') end += 1;
-      const raw = text.slice(i, end).replace(/ +$/, '');
-      if (raw.startsWith('#') || raw.includes(' #')) return { error: 'a comment is not allowed inside a flow list' };
-      const problem = plainYamlProblem(raw, true);
-      if (problem !== null) return { error: problem };
-      items.push(plainYamlValue(raw));
-      i = end;
-    }
-    skipSpaces();
-    if (text[i] === ',') {
-      i += 1;
-      skipSpaces();
-      if (text[i] === ']') return { error: 'a flow list must not end with a comma' };
-      continue;
-    }
-    if (text[i] === ']') return { value: { kind: 'list', items }, end: i + 1 };
-    if (text[i] === undefined) return { error: 'a flow list must close with ] on the same line' };
-    return { error: `unexpected ${JSON.stringify(text[i])} after a flow list item` };
-  }
-}
-
-/**
- * Reads what follows `key:` or `- ` on one line: `{ empty: true }` when
- * nothing does (the node is null, or continues on the lines below), `{ value }`
- * for a quoted or plain scalar or a one-line flow list, and `{ error }` for
- * every other construct.
- */
-function readYamlValue(rest) {
-  const text = rest.replace(/^ +/, '');
-  if (text === '' || text.startsWith('#')) return { empty: true };
-  if (text[0] === '"' || text[0] === "'") {
-    const quoted = readYamlQuoted(text, 0);
-    if (quoted.error) return quoted;
-    if (!YAML_TRAILER_RE.test(text.slice(quoted.end))) return { error: 'only a comment ( # …) may follow the closing quote' };
-    return { value: { kind: 'string', value: quoted.value, quoted: true } };
-  }
-  if (text[0] === '[') {
-    const list = readYamlFlowList(text);
-    if (list.error) return list;
-    if (!YAML_TRAILER_RE.test(text.slice(list.end))) return { error: 'only a comment ( # …) may follow the closing ]' };
-    return { value: list.value };
-  }
-  const plain = text.replace(/ +#.*$/, '').replace(/ +$/, '');
-  const problem = plainYamlProblem(plain, false);
-  return problem === null ? { value: plainYamlValue(plain) } : { error: problem };
-}
-
-/** The key at the start of a line body, normalized (`YAML_KEY_FORMS`), and the text after its `:`; `null` when the line has no key. */
-function readYamlKey(body) {
-  for (const [form, normalize] of YAML_KEY_FORMS) {
-    const m = form.exec(body);
-    if (m !== null) return { key: normalize(m), rest: body.slice(m[0].length) };
-  }
-  return null;
-}
-
-/** Whether a line body is a block-list item: `-` followed by a space or the end of the line. */
-function isYamlItem(body) {
-  return /^-(?: |$)/.test(body);
-}
-
-/**
- * Reads a Jekyll configuration file with the types SafeYAML 1.0.5 gives it,
- * without a YAML library, and fails closed: whatever it cannot read for
- * certain is listed in `unsupported` instead of guessed.
- *
- * The whole document is parsed as block YAML, nested levels included, so a
- * line that SafeYAML would reject cannot hide below a key the checks never
- * read. Understood: blank and `#` comment lines; a first-line `---`; block
- * mappings whose keys are plain or quoted (normalized, so `"baseurl"` and
- * `baseurl :` both define `baseurl`) and line up at one indentation; block
- * lists whose `- ` items line up at one indentation, a list directly below a
- * key at the key's own indentation included; compact nodes on an item's line
- * (`- scope:`, `- - x`), which start at their own column; scalar values,
- * quoted (always strings) or plain (typed by `plainYamlValue`), with an
- * optional ` # comment`; and one-line flow lists.
- *
- * Refused, with the line number: any other column-0 construct (`? `, `<<`,
- * `---` or `...` after content, `%` directives); tabs; anchors and aliases;
- * tags; block scalars; flow mappings; plain values containing `: ` or ending
- * in `:`; unclosed quotes or lists; anything but a ` # comment` after a
- * closing quote or bracket; escapes other than `\"` and `\\`; at any depth, a
- * mapping line without a key, a line continuing a value already written on
- * the line above, and a line that lines up with neither its siblings nor the
- * level it closes.
- *
- * @param {string} text File contents.
- * @returns {{
- *   keys: string[],
- *   duplicates: string[],
- *   unsupported: string[],
- *   has(key: string): boolean,
- *   get(key: string): { kind: 'null' | 'bool' | 'string' | 'list' | 'mapping' | 'other', value?: unknown, quoted?: boolean, items?: object[], entries?: object[] } | undefined,
- * }} `keys` are the top-level keys in file order; a key written twice is in
- *   `duplicates`, and `get` returns its last value, the one Ruby's YAML parser
- *   keeps. A list's `items` and a mapping's `entries` (`{ key, line, value }`)
- *   hold values of the same shape.
- */
-function readTopLevelYaml(text) {
-  const unsupported = [];
-  const fail = (n, why) => unsupported.push(`line ${n}: ${why}`);
-
-  // Content lines as { n, indent, body }: blank and comment lines, refused markers and lines with tabs are left out.
-  const lines = [];
-  let content = false;
-  text.replace(/^\uFEFF/, '').split('\n').forEach((raw, index) => {
-    const n = index + 1;
-    const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw;
-    if (/^[ \t]*(?:#.*)?$/.test(line)) return;
-    if (line.includes('\t')) {
-      fail(n, 'tabs are not supported');
-      return;
-    }
-    const indent = line.length - line.trimStart().length;
-    const body = line.slice(indent);
-    if (indent === 0 && /^(?:---|\.\.\.)(?: |$)/.test(body)) {
-      if (!content && /^---(?: +#.*)?$/.test(body)) {
-        content = true;
-        return;
-      }
-      fail(n, `the document marker ${body.slice(0, 3)} is supported only as the first line, alone`);
-      return;
-    }
-    if (indent === 0 && body.startsWith('%')) {
-      fail(n, 'YAML directives (%) are not supported');
-      return;
-    }
-    content = true;
-    lines.push({ n, indent, body });
-  });
-
-  let pos = 0;
-  const NULL_VALUE = Object.freeze({ kind: 'null', value: null, quoted: false });
-
-  /** Passes over the lines indented deeper than `indent`, which belong to a node already refused. */
-  const skipDeeper = (indent) => {
-    while (pos < lines.length && lines[pos].indent > indent) pos += 1;
-  };
-
-  /** Refuses `lines[pos]`, indented deeper than the level `indent` it stands in, and passes over it. */
-  const misaligned = (indent) => {
-    fail(lines[pos].n, `this line is indented ${lines[pos].indent} spaces, deeper than the ${indent} its mapping or list uses`);
-    pos += 1;
-  };
-
-  const readNode = () => (isYamlItem(lines[pos].body) ? readList(lines[pos].indent) : readMapping(lines[pos].indent));
-
-  /**
-   * The value of the key (`keyed`) or item on line `line` at `indent`, whose
-   * text after `:` or `- ` is `rest`: that inline value, which no deeper line
-   * may continue, or, when the line ends there, the node on the deeper lines
-   * below (a list may also sit at a key's own indentation), or null.
-   */
-  const readValue = (line, rest, indent, keyed) => {
-    const value = readYamlValue(rest);
-    if (value.error) {
-      fail(line.n, value.error);
-      skipDeeper(indent);
-      return YAML_UNREADABLE;
-    }
-    const next = lines[pos];
-    if (!value.empty) {
-      if (next === undefined || next.indent <= indent) return value.value;
-      fail(next.n, `the value written on line ${line.n} cannot continue onto another line`);
-      skipDeeper(indent);
-      return YAML_UNREADABLE;
-    }
-    if (next !== undefined && next.indent > indent) return readNode();
-    if (keyed && next !== undefined && next.indent === indent && isYamlItem(next.body)) return readList(indent);
-    return NULL_VALUE;
-  };
-
-  /** The block mapping whose keys stand at `indent`, from `lines[pos]` to the first line that ends it. */
-  function readMapping(indent) {
-    const entries = [];
-    while (pos < lines.length && lines[pos].indent >= indent) {
-      const line = lines[pos];
-      if (line.indent > indent) {
-        misaligned(indent);
-        continue;
-      }
-      if (isYamlItem(line.body)) break;
-      const key = readYamlKey(line.body);
-      pos += 1;
-      if (key === null) {
-        fail(line.n, 'a line of a mapping must be key: value');
-        skipDeeper(indent);
-        continue;
-      }
-      entries.push({ key: key.key, line: line.n, value: readValue(line, key.rest, indent, true) });
-    }
-    return { kind: 'mapping', entries };
-  }
-
-  /** The block list whose `- ` items stand at `indent`, from `lines[pos]` to the first line that ends it. */
-  function readList(indent) {
-    const items = [];
-    while (pos < lines.length && lines[pos].indent >= indent) {
-      const line = lines[pos];
-      if (line.indent > indent) {
-        misaligned(indent);
-        continue;
-      }
-      if (!isYamlItem(line.body)) break;
-      const rest = line.body.replace(/^-(?: +|$)/, '');
-      if (isYamlItem(rest) || readYamlKey(rest) !== null) {
-        // A compact node on the item's line starts at its own column, where its later lines must line up.
-        lines[pos] = { n: line.n, indent: indent + line.body.length - rest.length, body: rest };
-        items.push(readNode());
-        continue;
-      }
-      pos += 1;
-      items.push(readValue(line, rest, indent, false));
-    }
-    return { kind: 'list', items };
-  }
-
-  const entries = [];
-  while (pos < lines.length) {
-    entries.push(...readMapping(0).entries);
-    if (pos < lines.length) {
-      // readMapping(0) stops only at a column-0 list item, which no top-level key owns.
-      fail(lines[pos].n, 'a top-level line must be key: value');
-      pos += 1;
-      skipDeeper(0);
-    }
-  }
-
-  const keys = entries.map((entry) => entry.key);
-  const duplicates = [...new Set(keys.filter((k, index) => keys.indexOf(k) !== index))];
-  const last = (k) => entries.findLast((entry) => entry.key === k);
-  return {
-    keys,
-    duplicates,
-    unsupported,
-    has: (k) => last(k) !== undefined,
-    get: (k) => last(k)?.value,
-  };
-}
-
-/** A typed value from `readTopLevelYaml`, described for a failure message. */
-function describeYaml(value) {
-  if (value === undefined) return 'no such key';
-  if (value.kind === 'null') return 'null';
-  if (value.kind === 'bool') return `boolean ${value.value}`;
-  if (value.kind === 'string') return `${value.quoted ? 'quoted ' : ''}string ${JSON.stringify(value.value)}`;
-  if (value.kind === 'list') return `a list of ${value.items.length}`;
-  if (value.kind === 'mapping') return 'a mapping';
-  return value.value === null ? 'a value this reader cannot read' : `the non-string value ${value.value}`;
-}
+// `_config.yml` and `_config.preview.yml` are read with `readJekyllConfig`, the typed, fail-closed
+// YAML reader in scripts/lib/site-config.mjs that guard also reads the configuration with.
 
 /** The items of a list of strings as `{ items }`, or `{ problem }` when `value` is anything else. */
 function stringListOf(value) {
-  if (value?.kind !== 'list') return { problem: `must be a list (got ${describeYaml(value)})` };
+  if (value?.kind !== 'list') return { problem: `must be a list (got ${describeYamlValue(value)})` };
   const other = value.items.findIndex((item) => item.kind !== 'string');
-  if (other !== -1) return { problem: `item ${other + 1} must be a string (got ${describeYaml(value.items[other])})` };
+  if (other !== -1) return { problem: `item ${other + 1} must be a string (got ${describeYamlValue(value.items[other])})` };
   return { items: value.items.map((item) => item.value) };
 }
 
@@ -1239,13 +976,13 @@ function readingProblems(config, label) {
  * @returns {string[]} Problems; `[]` for a valid configuration.
  */
 function configProblems(text, { cnameHost }) {
-  const config = readTopLevelYaml(text);
+  const config = readJekyllConfig(text);
   const problems = readingProblems(config, '_config.yml');
 
   const theme = config.get('theme');
-  if (theme?.kind !== 'null') problems.push(`theme must be null (got ${describeYaml(theme)})`);
+  if (theme?.kind !== 'null') problems.push(`theme must be null (got ${describeYamlValue(theme)})`);
   const future = config.get('future');
-  if (future?.kind !== 'bool' || future.value !== false) problems.push(`future must be boolean false (got ${describeYaml(future)})`);
+  if (future?.kind !== 'bool' || future.value !== false) problems.push(`future must be boolean false (got ${describeYamlValue(future)})`);
 
   const strings = [['title', 'Cabrillo Coast'], ['timezone', 'Etc/UTC'], ['permalink', '/blog/:title/']];
   if (cnameHost === '') problems.push('CNAME must name the custom-domain host');
@@ -1254,7 +991,7 @@ function configProblems(text, { cnameHost }) {
     const value = config.get(key);
     if (value?.kind !== 'string' || value.value !== wanted) {
       const mode = key === 'url' ? ` while CNAME is ${cnameHost === null ? 'absent' : 'present'}` : '';
-      problems.push(`${key} must be the string ${JSON.stringify(wanted)}${mode} (got ${describeYaml(value)})`);
+      problems.push(`${key} must be the string ${JSON.stringify(wanted)}${mode} (got ${describeYamlValue(value)})`);
     }
   }
 
@@ -1281,8 +1018,8 @@ function configProblems(text, { cnameHost }) {
  * @returns {string[]} Problems; `[]` for a valid overlay.
  */
 function previewProblems(baseText, previewText) {
-  const base = readTopLevelYaml(baseText);
-  const preview = readTopLevelYaml(previewText);
+  const base = readJekyllConfig(baseText);
+  const preview = readJekyllConfig(previewText);
   const problems = [...readingProblems(base, '_config.yml'), ...readingProblems(preview, '_config.preview.yml')];
   if (preview.keys.length !== 1 || preview.keys[0] !== 'exclude') {
     problems.push(`_config.preview.yml must set exclude and nothing else (got ${preview.keys.join(', ') || 'no keys'})`);
@@ -1519,15 +1256,90 @@ function dropLockSpec(lock, name) {
 
 /* AC-01: draft privacy and publishing configuration                         */
 
-test('[AC-01][F-017] nothing in a _drafts/ folder at any depth or under assets/drafts/ is tracked', () => {
+/**
+ * Pathspecs of every draft and draft-image path, in any letter case: a path
+ * at or below `assets/drafts`, and a `_drafts` entry or folder at any depth.
+ * Jekyll reads `<dir>/_drafts/` in every folder it builds, so a nested one
+ * such as `blog/_drafts/` counts; a case-insensitive file system (macOS)
+ * reads `_Drafts/` as `_drafts/`; and an entry named `_drafts` (a file,
+ * symbolic link or submodule) stands where the folder would.
+ */
+const DRAFT_PATHSPECS = Object.freeze([':(icase)assets/drafts', ':(icase,glob)**/_drafts', ':(icase,glob)**/_drafts/**']);
+
+/**
+ * Every index path `DRAFT_PATHSPECS` matches, listed by `runGit`, which runs
+ * git with the given arguments in the repository to ask and returns its
+ * standard output.
+ *
+ * @param {(args: string[]) => string} runGit
+ * @returns {string[]}
+ */
+function trackedDrafts(runGit) {
+  return runGit(['ls-files', '-z', '--', ...DRAFT_PATHSPECS]).split('\0').filter((p) => p !== '');
+}
+
+/**
+ * Stages each of `paths` in the temporary repository `repo` as an empty
+ * entry of `mode` without touching its work tree, so names that differ only
+ * in letter case can share one index on any file system.
+ */
+function stageEntries(repo, mode, paths) {
+  const blob = spawnSync('git', ['hash-object', '-w', '--stdin'], { cwd: repo, env: TEMP_GIT_ENV, input: '', encoding: 'utf8', timeout: 30000 });
+  if (blob.error) throw blob.error;
+  if (blob.status !== 0) throw new Error(`git hash-object failed in ${repo}: ${blob.stderr.trim()}`);
+  for (const rel of paths) tempGit(repo, ['update-index', '--add', '--cacheinfo', `${mode},${blob.stdout.trim()},${rel}`]);
+}
+
+test('[AC-01][F-017] nothing in a _drafts/ folder at any depth or under assets/drafts/ is tracked, in any letter case or as an entry', () => {
   assertRepositoryRoot();
-  // Jekyll reads `<dir>/_drafts/` in every folder it builds, so a nested one such as blog/_drafts/ counts too.
-  const tracked = git(['ls-files', '--', '_drafts', 'assets/drafts', ':(glob)**/_drafts/**']).trim();
-  assert.equal(
+  const tracked = trackedDrafts(git);
+  assert.deepEqual(
     tracked,
-    '',
-    `drafts and draft images must never be tracked; remove them from the index with git rm --cached:\n${tracked}`,
+    [],
+    `drafts and draft images must never be tracked; remove them from the index with git rm --cached:\n${tracked.join('\n')}`,
   );
+});
+
+test('[AC-01][F-017] the tracked-draft check finds draft paths in any letter case and entries at draft paths, and only those', () => {
+  const repo = tempRepository('tracked-drafts');
+  // Case-sensitive index names, so `_DRAFTS` and `_Drafts/x.md` coexist as on Linux, whatever this file system is.
+  tempGit(repo, ['config', 'core.ignorecase', 'false']);
+  const refused = ['ASSETS/Drafts', 'Assets/drafts/x.png', '_Drafts/x.md', 'a/b/_drafts', 'blog/_DRAFTS/x.md', 'blog/_drafts'];
+  const accepted = ['assets/draftsman.png', 'docs/_drafts.md', 'notes/my_drafts/x.md', '_drafts_x/a.md'];
+  stageEntries(repo, '100644', [...refused, ...accepted]);
+  stageEntries(repo, '120000', ['_DRAFTS']);
+  assert.deepEqual(trackedDrafts((args) => tempGit(repo, args)).sort(), [...refused, '_DRAFTS'].sort());
+});
+
+/**
+ * Every tracked submodule (index mode `160000`), from `git ls-files -s -z`
+ * run by `runGit` as for `trackedDrafts`. GitHub Pages builds a submodule's
+ * files into the site, where no check reads them, so CI reports one that
+ * reached the repository past the hooks (`--no-verify`).
+ *
+ * @param {(args: string[]) => string} runGit
+ * @returns {string[]}
+ */
+function trackedSubmodules(runGit) {
+  return runGit(['ls-files', '-s', '-z'])
+    .split('\0')
+    .filter((record) => record.startsWith('160000 '))
+    .map((record) => record.slice(record.indexOf('\t') + 1));
+}
+
+test('[AC-01][F-017] no submodule is tracked, since GitHub Pages builds its files into the site past every check', () => {
+  assertRepositoryRoot();
+  const submodules = trackedSubmodules(git);
+  assert.deepEqual(submodules, [], `submodules must not be tracked; remove each with git rm --cached:\n${submodules.join('\n')}`);
+});
+
+test('[AC-01][F-017] the submodule check finds every gitlink, at any path, and nothing else', () => {
+  const repo = tempRepository('tracked-submodules');
+  stageEntries(repo, '100644', ['notes/readme.md', '_posts/2026-01-01-x.md']);
+  stageEntries(repo, '120000', ['notes/link']);
+  stageEntries(repo, '100755', ['tools/run']);
+  stageEntries(repo, '160000', ['_posts/vendor', 'blog/_posts', 'notes/sub']);
+  assert.deepEqual(trackedSubmodules((args) => tempGit(repo, args)), ['_posts/vendor', 'blog/_posts', 'notes/sub']);
 });
 
 test('[AC-01][F-017] the working tree passes the tracked-content rules guard applies at commit and push', (t) => {
@@ -1601,6 +1413,18 @@ function nestedPostsRefusal(rel) {
     + '_posts/ folder as posts, but the article checks cover only the root one$');
 }
 
+/** The refusal of `rel` for its leading folder `folder`, a letter-case variant of `canonical` (`_posts` or `assets/blog`). */
+function caseVariantRefusal(rel, folder, canonical) {
+  return new RegExp(`^${regExpLiteral(rel)}: folder ${regExpLiteral(folder)}/ must be named exactly ${regExpLiteral(canonical)}/; `
+    + "a case-insensitive file system such as macOS's treats them as one folder, but the Pages build and these checks do not$");
+}
+
+/** The refusal of an entry at exactly `rel` (`_posts` or `assets/blog`), which must be a real folder. */
+function folderEntryRefusal(rel) {
+  return new RegExp(`^${regExpLiteral(rel)}: must be a real folder; a file, symbolic link or submodule here supplies `
+    + 'content the checks never read$');
+}
+
 /** The refusal of `rel` for its folder `folder` inside `_posts/`, a name Jekyll can skip. */
 function skippedFolderRefusal(rel, folder) {
   return new RegExp(`^${regExpLiteral(rel)}: folder ${regExpLiteral(folder)}/ is not allowed in _posts/; Jekyll can skip folders `
@@ -1629,6 +1453,39 @@ const TREE_CASES = Object.freeze([
     name: 'a tracked draft in a nested _drafts/ folder is refused',
     change: (tree) => tree.paths.push('blog/_drafts/secret.md'),
     expect: [draftRefusal('blog/_drafts/secret.md')],
+  },
+  {
+    name: 'drafts and draft images in another letter case are refused, as a case-insensitive file system reads them as drafts',
+    change: (tree) => tree.paths.push('_Drafts/secret.md', 'blog/_DRAFTS/x.md', 'assets/Drafts/s/fig.png', 'Assets/drafts/s/fig.png'),
+    expect: [
+      draftRefusal('_Drafts/secret.md'),
+      draftRefusal('blog/_DRAFTS/x.md'),
+      draftRefusal('assets/Drafts/s/fig.png'),
+      draftRefusal('Assets/drafts/s/fig.png'),
+    ],
+  },
+  {
+    name: 'an entry at a drafts path (a file, symbolic link or submodule rather than a folder) is refused',
+    change: (tree) => tree.paths.push('_drafts', 'blog/_drafts', 'assets/drafts'),
+    expect: [draftRefusal('_drafts'), draftRefusal('blog/_drafts'), draftRefusal('assets/drafts')],
+  },
+  {
+    name: '_posts/ and assets/blog/ in another letter case are refused, naming the exact folder name',
+    change: (tree) => tree.paths.push('_Posts/2026-03-02-beta.md', 'assets/Blog/alpha/fig.png'),
+    expect: [
+      caseVariantRefusal('_Posts/2026-03-02-beta.md', '_Posts', '_posts'),
+      caseVariantRefusal('assets/Blog/alpha/fig.png', 'assets/Blog', 'assets/blog'),
+    ],
+  },
+  {
+    name: 'an entry at exactly _posts or assets/blog, which must be real folders, is refused',
+    change: (tree) => tree.paths.push('_posts', 'assets/blog'),
+    expect: [folderEntryRefusal('_posts'), folderEntryRefusal('assets/blog')],
+  },
+  {
+    name: 'a nested _posts/ folder in another letter case, and an entry named _posts below the root, are refused',
+    change: (tree) => tree.paths.push('blog/_Posts/x.md', 'blog/_posts'),
+    expect: [nestedPostsRefusal('blog/_Posts/x.md'), nestedPostsRefusal('blog/_posts')],
   },
   {
     name: 'a draft folder inside _posts/ is refused as a draft and, being in _posts/, as a misnamed post',
@@ -1687,9 +1544,10 @@ const TREE_CASES = Object.freeze([
     ],
   },
   {
-    name: 'folder names are matched whole: my_drafts/, my_posts/, _postscript.md, _drafts.md, _posts/sub/ and _posts/sub~/ are accepted',
+    name: 'folder names are matched whole: my_drafts/, my_posts/, _postscript.md, _drafts.md, assets/blogroll/, _posts/sub/ and _posts/sub~/ are accepted',
     change: (tree) => {
       tree.paths.push('notes/my_drafts/x.md', 'docs/_postscript.md', 'docs/_drafts.md', 'blog/my_posts/x.md');
+      tree.paths.push('notes/My_Drafts/x.md', 'docs/_Drafts.md', 'assets/blogroll/x.png', 'assets/draftsman.png');
       tree.paths.push('_posts/sub~/2026-03-03-gamma.md');
       setArticle(tree, '_posts/sub/2026-03-02-beta.md', articleSource(VALID_FRONT_MATTER, 'Body.\n'));
     },
@@ -1818,6 +1676,36 @@ test('[AC-01][F-017] the ignore probes refuse a negated, missing or borrowed .gi
     await t.test(`[AC-01][F-017] ignore control: ${name}`, () => {
       const repo = tempRepository('ignore', files);
       assertFindings(ignoreProbeProblems(repo, TEMP_GIT_ENV), expect, name);
+    });
+  }
+});
+
+test('[AC-01][F-017] .gitignore ignores drafts and draft images in every letter case and as files or links, and never a post or article image', () => {
+  assertRepositoryRoot();
+  const problems = draftShapeIgnoreProblems(ROOT, GIT_ENV);
+  assert.deepEqual(problems, [], `.gitignore must ignore every draft shape and no public path:\n${problems.join('\n')}`);
+});
+
+test('[AC-01][F-017] the draft-shape ignore check refuses folder-only or case-sensitive entries and an entry hiding public paths', async (t) => {
+  const real = read('.gitignore');
+  const notIgnored = (probe) => new RegExp(`^${regExpLiteral(probe)} must be ignored by \\.gitignore itself, but is decided by no pattern$`);
+  const hidden = (probe, pattern) => new RegExp(`^${regExpLiteral(probe)} must not be ignored, but \\.gitignore:\\d+ \\(${regExpLiteral(pattern)}\\) ignores it$`);
+  const controls = [
+    { name: 'the repository .gitignore', files: { '.gitignore': real }, expect: [] },
+    {
+      name: 'only the folder entries _drafts/ and assets/drafts/',
+      files: { '.gitignore': '_drafts/\nassets/drafts/\n' },
+      // Every shape is a case variant or an entry that is not a folder, which neither entry matches.
+      expect: IGNORED_DRAFT_SHAPES.map(notIgnored),
+    },
+    { name: 'an added _posts/ entry', files: { '.gitignore': `${real}_posts/\n` }, expect: [hidden('_posts/2026-01-01-x.md', '_posts/')] },
+    { name: 'an added assets/blog entry', files: { '.gitignore': `${real}assets/blog\n` }, expect: [hidden('assets/blog/x/y.png', 'assets/blog')] },
+    { name: 'an added _drafts* entry', files: { '.gitignore': `${real}_drafts*\n` }, expect: [hidden('docs/_drafts.md', '_drafts*')] },
+  ];
+  for (const { name, files, expect } of controls) {
+    await t.test(`[AC-01][F-017] draft-shape ignore control: ${name}`, () => {
+      const repo = tempRepository('ignore-shapes', files);
+      assertFindings(draftShapeIgnoreProblems(repo, TEMP_GIT_ENV), expect, name);
     });
   }
 });
@@ -1984,7 +1872,7 @@ const CONTROL_CONFIG = [
  */
 const CONTROL_PREVIEW = `# A known-good preview overlay for the controls.\n${EXCLUDE_BLOCK.replace('  - assets/drafts\n', '')}`;
 
-/** A refusal by `readTopLevelYaml`, reported by `configProblems` or `previewProblems`. */
+/** A refusal by `readJekyllConfig`, reported by `configProblems` or `previewProblems`. */
 const UNSUPPORTED = /^_config(?:\.preview)?\.yml: unsupported YAML at line \d+: /;
 
 /**
@@ -2225,7 +2113,7 @@ test('[AC-01][F-017] the configuration checks read YAML types and keys as Jekyll
   }
 });
 
-/** A value from `readTopLevelYaml` as plain data: mappings as objects, lists as arrays, scalars as their values. */
+/** A value from `readJekyllConfig` as plain data: mappings as objects, lists as arrays, scalars as their values. */
 function plainYaml(value) {
   if (value.kind === 'mapping') return Object.fromEntries(value.entries.map((entry) => [entry.key, plainYaml(entry.value)]));
   if (value.kind === 'list') return value.items.map(plainYaml);
@@ -2254,11 +2142,240 @@ test('[AC-01][F-017] the YAML reader reads the nested defaults: block to the str
   ];
   for (const { name, text, expect } of variants) {
     await t.test(`[AC-01][F-017] defaults: ${name}`, () => {
-      const config = readTopLevelYaml(text);
+      const config = readJekyllConfig(text);
       assert.deepEqual(config.unsupported, [], `${name}: the reader refused valid YAML:\n${config.unsupported.join('\n')}`);
       assert.deepEqual(plainYaml(config.get('defaults')), expect, `${name}: defaults: was read wrongly`);
     });
   }
+});
+
+/* Configuration settings that would hide a tracked post                     */
+
+test('[AC-01][F-017] _config.yml holds no setting that would keep a tracked post off the site', () => {
+  assertRepositoryRoot();
+  const paths = workingTreePaths();
+  assert.equal(siteConfigFile(paths), '_config.yml', 'Jekyll must read _config.yml, the file this suite checks');
+  const problems = checkSiteConfig({ path: '_config.yml', text: read('_config.yml'), paths });
+  assert.deepEqual(problems, [], `_config.yml would hide tracked posts:\n${problems.join('\n')}`);
+});
+
+/** The two tracked posts of the `checkSiteConfig` controls; `HELD_POST` sorts first, so an entry hiding both names it. */
+const HELD_POST = '_posts/2026-01-01-held.md';
+const OTHER_POST = '_posts/2026-01-02-other.md';
+
+/** The tree the `checkSiteConfig` controls judge `CONTROL_CONFIG` against unless a control gives its own. */
+const CONTROL_SITE_PATHS = Object.freeze(['_config.yml', HELD_POST, OTHER_POST]);
+
+/** A change appending a `defaults` item scoped to `HELD_POST` whose `values` are `lines`, as the QA reproduction did. */
+const heldDefault = (...lines) => (text) => `${text}  - scope:\n      path: "${HELD_POST}"\n    values:\n${lines.map((line) => `      ${line}\n`).join('')}`;
+
+/** A change adding `entry`, YAML written as is (quoted where `*` or `[` would start an alias or a list), to the `exclude` list. */
+const excluding = (entry) => (text) => replaceOnce(text, '  - assets/drafts\n', `  - assets/drafts\n  - ${entry}\n`);
+
+/** The refusal of a `defaults` value set for the posts in a scope. */
+const refusedDefault = (key) => new RegExp(`^_config\\.yml: line \\d+: defaults set ${key} for the posts in their scope: `
+  + `.* while GitHub still shows them; remove ${key} from the defaults values$`);
+
+/** The refusal of an `exclude` entry that hides `post`. */
+const refusedExclude = (entry, post = HELD_POST) => new RegExp(`^_config\\.yml: line \\d+: exclude entry `
+  + `${regExpLiteral(JSON.stringify(entry))} keeps ${regExpLiteral(post)} off the site while GitHub still shows it; `);
+
+/** The refusal of `future`, `show_drafts` or `unpublished` holding the value described as `got`. */
+const refusedSwitch = (key, got) => new RegExp(`^_config\\.yml: line \\d+: ${key} must be boolean false or null `
+  + `\\(got ${regExpLiteral(got)}\\); Jekyll then builds `);
+
+/**
+ * Controls for `checkSiteConfig`, each a change to `CONTROL_CONFIG` judged
+ * against `CONTROL_SITE_PATHS` unless it gives its own `paths`, and the
+ * refusals it must produce, in order (`[]`: nothing hides a post). Every
+ * refused variant was built with Jekyll 3.10.0 and left a tracked post off
+ * the site; every accepted one built both posts. The exclude entries follow
+ * `EntryFilter#excluded?`: `_post[s]` and a bare file name match no file in
+ * `_posts/`, `./_posts` is not normalized, and `""` and `/` match every file.
+ */
+const SITE_CONFIG_CONTROLS = Object.freeze([
+  { name: 'a published: false default', change: heldDefault('published: false'), expect: [refusedDefault('published')] },
+  { name: 'a published: true default', change: heldDefault('published: true'), expect: [refusedDefault('published')] },
+  { name: 'a future date default', change: heldDefault('date: "2099-01-01 00:00:00 +0000"'), expect: [refusedDefault('date')] },
+  { name: 'a slug default', change: heldDefault('slug: other'), expect: [refusedDefault('slug')] },
+  { name: 'a permalink default', change: heldDefault('permalink: /blog/other/'), expect: [refusedDefault('permalink')] },
+  { name: 'a quoted "published" default key', change: heldDefault('"published": false'), expect: [refusedDefault('published')] },
+  {
+    name: 'a published default in the first of two defaults: keys',
+    change: (text) => `${replaceOnce(text, '      author: "Randy Miller"\n', '      author: "Randy Miller"\n      published: false\n')}${DEFAULTS_BLOCK}`,
+    expect: [refusedDefault('published')],
+  },
+  ...[1, 0].map((count) => ({
+    name: `limit_posts: ${count}`,
+    change: (text) => `${text}limit_posts: ${count}\n`,
+    expect: [/^_config\.yml: line \d+: limit_posts must not be set; Jekyll then builds only the newest posts /],
+  })),
+  {
+    name: 'collections_dir: content',
+    change: (text) => `${text}collections_dir: content\n`,
+    expect: [/^_config\.yml: line \d+: collections_dir must not be set; Jekyll then reads posts from that folder /],
+  },
+  {
+    name: 'collections configuring posts as a mapping',
+    change: (text) => `${text}collections:\n  posts:\n    permalink: /blog/x/\n`,
+    expect: [/^_config\.yml: line \d+: collections must not configure posts; /],
+  },
+  {
+    name: 'collections naming posts in a list',
+    change: (text) => `${text}collections: [talks, posts]\n`,
+    expect: [/^_config\.yml: line \d+: collections must not configure posts; /],
+  },
+  { name: 'future: true', change: (text) => replaceOnce(text, '\nfuture: false\n', '\nfuture: true\n'), expect: [refusedSwitch('future', 'boolean true')] },
+  {
+    name: 'future: "false", a string Ruby reads as true',
+    change: (text) => replaceOnce(text, '\nfuture: false\n', '\nfuture: "false"\n'),
+    expect: [refusedSwitch('future', 'quoted string "false"')],
+  },
+  { name: 'show_drafts: true', change: (text) => `${text}show_drafts: true\n`, expect: [refusedSwitch('show_drafts', 'boolean true')] },
+  { name: 'unpublished: true', change: (text) => `${text}unpublished: true\n`, expect: [refusedSwitch('unpublished', 'boolean true')] },
+  {
+    name: 'timezone: Etc/GMT+12, behind UTC',
+    change: (text) => replaceOnce(text, '\ntimezone: Etc/UTC\n', '\ntimezone: Etc/GMT+12\n'),
+    expect: [/^_config\.yml: line 5: timezone must be the string "Etc\/UTC" \(got string "Etc\/GMT\+12"\); /],
+  },
+  // Every template but the site's own is refused; /blog/ and /blog/:title/%2e%2e/ left a post off a Jekyll 3.10.0 build.
+  ...[
+    ['/blog/, one URL for every post', '/blog/', 'string "/blog/"'],
+    ['/blog/:title/%2e%2e/, :title undone by the decoded ..', '/blog/:title/%2e%2e/', 'string "/blog/:title/%2e%2e/"'],
+    ['pretty, a named style', 'pretty', 'string "pretty"'],
+    ['/blog/:slug/', '/blog/:slug/', 'string "/blog/:slug/"'],
+    ['2026, not a string', '2026', 'the non-string value 2026'],
+  ].map(([name, permalink, got]) => ({
+    name: `permalink: ${name}`,
+    change: (text) => replaceOnce(text, '\npermalink: /blog/:title/\n', `\npermalink: ${permalink}\n`),
+    expect: [new RegExp(`^_config\\.yml: line 7: permalink must be the string "/blog/:title/" \\(got ${regExpLiteral(got)}\\); `
+      + 'another template can give posts one URL, so all but one vanish from the site while GitHub still shows them; '
+      + 'set permalink: /blog/:title/$')],
+  })),
+  ...['_posts', '_p', HELD_POST, '*held*', '[!]posts*', '/', ''].map((entry) => ({
+    name: `exclude entry ${JSON.stringify(entry)}`,
+    change: excluding(JSON.stringify(entry)),
+    expect: [refusedExclude(entry)],
+  })),
+  {
+    name: 'exclude entry "_posts/2027*" once a 2027 post is tracked',
+    change: excluding('"_posts/2027*"'),
+    paths: [...CONTROL_SITE_PATHS, '_posts/2027-01-01-later.md'],
+    expect: [refusedExclude('_posts/2027*', '_posts/2027-01-01-later.md')],
+  },
+  {
+    name: 'exclude written as a string',
+    change: (text) => replaceOnce(text, EXCLUDE_BLOCK, 'exclude: _posts\n'),
+    expect: [/^_config\.yml: line 9: exclude must be a list of strings \(got string "_posts"\), or guard cannot tell /],
+  },
+  {
+    name: 'an exclude item that is null, which Jekyll reads as ""',
+    change: excluding('~'),
+    expect: [/^_config\.yml: line 9: exclude item 11 must be a string \(got null\); Jekyll turns it into text /],
+  },
+  {
+    name: 'an anchor on a key no rule reads',
+    change: (text) => replaceOnce(text, '\ntitle: Cabrillo Coast\n', '\ntitle: &t Cabrillo Coast\n'),
+    expect: [/^_config\.yml: unsupported YAML at line 2: anchors and aliases \(& and \*\) are not supported; guard cannot read this /],
+  },
+  {
+    name: 'a YAML tag on future',
+    change: (text) => replaceOnce(text, '\nfuture: false\n', '\nfuture: !!bool true\n'),
+    expect: [
+      /^_config\.yml: unsupported YAML at line 8: YAML tags \(!\) are not supported; /,
+      refusedSwitch('future', 'a value this reader cannot read'),
+    ],
+  },
+  // Accepted: each leaves both posts on the site.
+  { name: 'an author default', change: heldDefault('author: "Someone Else"'), expect: [] },
+  ...['./_posts', '//_posts', '_postsx', '_post[s]', '2026-01-01-held.md', '_posts/2027*'].map((entry) => ({
+    name: `exclude entry ${JSON.stringify(entry)}, which matches no tracked post`,
+    change: excluding(JSON.stringify(entry)),
+    expect: [],
+  })),
+  { name: 'exclude entry "_posts" while no post is tracked', change: excluding('"_posts"'), paths: ['_config.yml'], expect: [] },
+  { name: 'future: False', change: (text) => replaceOnce(text, '\nfuture: false\n', '\nfuture: False\n'), expect: [] },
+  { name: 'future: null', change: (text) => replaceOnce(text, '\nfuture: false\n', '\nfuture: null\n'), expect: [] },
+  { name: 'show_drafts: false and unpublished: ~', change: (text) => `${text}show_drafts: false\nunpublished: ~\n`, expect: [] },
+  { name: 'a quoted "Etc/UTC" timezone', change: (text) => replaceOnce(text, '\ntimezone: Etc/UTC\n', '\ntimezone: "Etc/UTC"\n'), expect: [] },
+  { name: 'a quoted "/blog/:title/" permalink', change: (text) => replaceOnce(text, '\npermalink: /blog/:title/\n', '\npermalink: "/blog/:title/"\n'), expect: [] },
+  { name: 'no permalink, so Jekyll\'s per-post date style applies', change: (text) => replaceOnce(text, '\npermalink: /blog/:title/\n', '\n'), expect: [] },
+  { name: 'a talks collection', change: (text) => `${text}collections:\n  talks:\n    output: true\n`, expect: [] },
+  { name: 'collections listing talks', change: (text) => `${text}collections: [talks]\n`, expect: [] },
+  { name: 'collections: null', change: (text) => `${text}collections: null\n`, expect: [] },
+]);
+
+test('[AC-01][F-017] checkSiteConfig refuses every configuration that keeps a tracked post off the site, and nothing else', async (t) => {
+  await t.test('[AC-01][F-017] the control _config.yml hides no post', () => {
+    assertFindings(checkSiteConfig({ path: '_config.yml', text: CONTROL_CONFIG, paths: [...CONTROL_SITE_PATHS] }), [], 'CONTROL_CONFIG');
+  });
+  for (const control of SITE_CONFIG_CONTROLS) {
+    await t.test(`[AC-01][F-017] site configuration control: ${control.name}`, () => {
+      const paths = [...(control.paths ?? CONTROL_SITE_PATHS)];
+      assertFindings(checkSiteConfig({ path: '_config.yml', text: control.change(CONTROL_CONFIG), paths }), control.expect, control.name);
+    });
+  }
+  await t.test('[AC-01][F-017] checkSiteConfig rejects malformed arguments', () => {
+    assert.throws(() => checkSiteConfig({ path: '', text: '', paths: [] }), TypeError);
+    assert.throws(() => checkSiteConfig({ path: '_config.yml', text: null, paths: [] }), TypeError);
+    assert.throws(() => checkSiteConfig({ path: '_config.yml', text: '', paths: '_posts/x.md' }), TypeError);
+    assert.throws(() => checkSiteConfig({ path: '_config.yml', text: '', paths: [1] }), TypeError);
+    assert.throws(() => siteConfigFile(undefined), TypeError);
+    assert.throws(() => excludeEntryMatches(null, HELD_POST), TypeError);
+  });
+});
+
+/**
+ * `excludeEntryMatches` cases, each `[entry, path, excluded]`, where
+ * `excluded` is what Jekyll 3.10.0's `EntryFilter#excluded?` (Ruby 3.3.4)
+ * answered for that entry and path below a source folder.
+ */
+const EXCLUDE_MATCH_CASES = Object.freeze([
+  ['', '_posts/2026-01-01-held.md', true],
+  ['/', '_posts/2026-01-01-held.md', true],
+  ['//_posts', '_posts/2026-01-01-held.md', false],
+  ['/_posts', '_posts/2026-01-01-held.md', true],
+  ['./_posts', '_posts/2026-01-01-held.md', false],
+  ['_p', '_posts/2026-01-01-held.md', true],
+  ['_posts/', '_posts/2026-01-01-held.md', true],
+  ['_postsx', '_posts/2026-01-01-held.md', false],
+  ['_post[s]', '_posts/2026-01-01-held.md', false],
+  ['_post[!s]', '_posts/2026-01-01-held.md', false],
+  ['[]*', '_posts/2026-01-01-held.md', false],
+  ['[!]posts*', '_posts/2026-01-01-held.md', true],
+  ['_posts/[9-0]*', '_posts/2026-01-01-held.md', false],
+  ['_posts/[9-0]*', '_posts/0026-01-01-held.md', true],
+  ['_posts/[0-9]*', '_posts/2026-01-01-held.md', true],
+  ['*held*', '_posts/2026-01-02-other.md', false],
+  ['2026-01-01-held.md', '_posts/2026-01-01-held.md', false],
+  ['*.MD', '_posts/2026-01-01-held.md', false],
+  ['\\_posts', '_posts/2026-01-01-held.md', false],
+  ['*\\', '_posts/2026-01-01-held.md', true],
+  ['_posts/[a-*', '_posts/2026-01-01-held.md', false],
+  ['[\\]]posts*', '_posts/2026-01-01-held.md', false],
+  ['[\\_]posts*', '_posts/2026-01-01-held.md', true],
+  ['_posts/*/x.md', '_posts/sub/x.md', true],
+  ['_posts/*-held.m', '_posts/2026-01-01-held.md', false],
+  ['_posts/*-held.m?', '_posts/2026-01-01-held.md', true],
+  ['_posts/?.md', '_posts/é.md', true],
+  ['[Z-a]posts*', '_posts/2026-01-01-held.md', true],
+  ['_posts/[2-]*', '_posts/2026-01-01-held.md', true],
+]);
+
+test('[AC-01][F-017] excludeEntryMatches answers as Jekyll\'s exclude matching does', () => {
+  for (const [entry, file, excluded] of EXCLUDE_MATCH_CASES) {
+    assert.equal(excludeEntryMatches(entry, file), excluded, `exclude entry ${JSON.stringify(entry)} for ${file}`);
+  }
+});
+
+test('[AC-01][F-017] siteConfigFile names the file Jekyll reads: _config.yml first, then _config.yaml', () => {
+  assert.deepEqual(SITE_CONFIG_FILES, ['_config.yml', '_config.yaml']);
+  assert.equal(siteConfigFile(['_config.yaml', '_config.yml', 'index.html']), '_config.yml');
+  assert.equal(siteConfigFile(['_config.yaml', 'index.html']), '_config.yaml');
+  // Jekyll tests the name with File.exist?, which a folder passes; it then reads no configuration at all.
+  assert.equal(siteConfigFile(['_config.yaml', '_config.yml/x']), '_config.yml');
+  assert.equal(siteConfigFile(['blog/_config.yml', '_config.toml', '_config.yml.bak', '_Config.yml']), null);
+  assert.equal(siteConfigFile([]), null);
 });
 
 
@@ -2719,6 +2836,12 @@ const PNG = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
 /** The post the image cases validate, dated before `FIXED_TODAY`. */
 const IMAGE_POST = '_posts/2026-03-01-img-case.md';
 
+/** The exact finding `message` of `IMAGE_POST` on file line `line`, by default the line of the image markup. */
+const imageFinding = (message, line = 8) => new RegExp(`^${regExpLiteral(`${IMAGE_POST}:${line}: ${message}`)}$`);
+
+/** The refusal of CSS that loads an image, as it follows the attribute holding it. */
+const CSS_IMAGE_REFUSAL = 'CSS images (url(), image-set()) are not allowed; use a Markdown image or an <img> with alt text';
+
 /**
  * Image cases for `validateArticle` with `makeImageExists` over a synthetic
  * root: the image markup (on file line 8), the findings it must produce and,
@@ -3051,6 +3174,281 @@ const IMAGE_CASES = Object.freeze([
     expect: [],
     calls: ['/assets/blog/img-case/fig.png'],
   },
+  // Images loaded through other attributes, CSS and attribute lists, which kramdown passes through
+  // or applies, are held to the same rules.
+  {
+    name: 'an external video poster is refused',
+    image: '<video poster="https://example.com/poster.png"></video>',
+    expect: [imageFinding('<video> poster: external images are not allowed (https://example.com/poster.png)')],
+    calls: [],
+  },
+  {
+    name: 'a data: video poster is refused',
+    image: '<video poster="data:image/png;base64,iVBORw0KGgo="></video>',
+    expect: [imageFinding('<video> poster: data: images are not allowed (data:image/png;base64,iVBORw0KGgo=)')],
+    calls: [],
+  },
+  {
+    name: "a video poster in another article's folder is refused",
+    image: '<video poster="/assets/blog/other-slug/fig.png"></video>',
+    expect: [imageFinding('<video> poster: image /assets/blog/other-slug/fig.png must be under /assets/blog/img-case/')],
+    calls: [],
+  },
+  {
+    name: 'a repeated video poster, whose last value kramdown renders, is refused',
+    image: '<video poster="/assets/blog/img-case/fig.png" poster="https://example.com/poster.png"></video>',
+    expect: [imageFinding('<video> repeats the poster attribute; write it once')],
+    calls: ['/assets/blog/img-case/fig.png'],
+  },
+  {
+    name: 'a <source> srcset in a <picture> is refused',
+    image: '<picture><source srcset="/assets/blog/img-case/fig.png"><img src="/assets/blog/img-case/fig.png" alt="A figure"></picture>',
+    expect: [imageFinding('<source> srcset is not supported; use a Markdown image or an <img> with a single src')],
+    calls: ['/assets/blog/img-case/fig.png'],
+  },
+  {
+    name: 'an external SVG <image> href is refused',
+    image: '<svg><image href="https://example.com/pixel.png"/></svg>',
+    expect: [imageFinding('<image> href: external images are not allowed (https://example.com/pixel.png)')],
+  },
+  {
+    name: 'an external SVG <image> xlink:href is refused',
+    image: '<svg><image xlink:href="https://example.com/pixel.png"/></svg>',
+    expect: [imageFinding('<image> xlink:href: external images are not allowed (https://example.com/pixel.png)')],
+  },
+  {
+    name: 'an external SVG <feImage> href is refused',
+    image: '<svg><filter id="f"><feImage href="https://example.com/pixel.png"/></filter></svg>',
+    expect: [imageFinding('<feimage> href: external images are not allowed (https://example.com/pixel.png)')],
+  },
+  {
+    name: 'an external <input type="image"> src is refused',
+    image: '<input type="image" src="https://example.com/pixel.png" alt="Go">',
+    expect: [imageFinding('<input> src: external images are not allowed (https://example.com/pixel.png)')],
+  },
+  {
+    name: 'an <image> with a src, which the HTML parser makes an <img>, and no alt text is refused',
+    image: '<image src="/assets/blog/img-case/fig.png">',
+    expect: [imageFinding('<image> has no alt text')],
+    calls: ['/assets/blog/img-case/fig.png'],
+  },
+  {
+    name: 'external table and cell backgrounds are refused',
+    image: '<table background="https://example.com/t.png"><tr><td background="https://example.com/c.png">x</td></tr></table>',
+    expect: [
+      imageFinding('<table> background: external images are not allowed (https://example.com/t.png)'),
+      imageFinding('<td> background: external images are not allowed (https://example.com/c.png)'),
+    ],
+  },
+  {
+    name: 'a style attribute with url() is refused',
+    image: '<p style="background:url(https://example.com/bg.png)">x</p>',
+    expect: [imageFinding(`<p> style: ${CSS_IMAGE_REFUSAL}`)],
+  },
+  {
+    name: 'a STYLE attribute with URL() in capitals is refused',
+    image: '<P STYLE="background:URL(https://example.com/bg.png)">x</P>',
+    expect: [imageFinding(`<p> style: ${CSS_IMAGE_REFUSAL}`)],
+  },
+  {
+    name: 'url( written with &lpar; is refused',
+    image: '<p style="background:url&lpar;https://example.com/bg.png)">x</p>',
+    expect: [imageFinding(`<p> style: ${CSS_IMAGE_REFUSAL}`)],
+  },
+  {
+    name: 'url( written as &bsol;75rl( is refused',
+    image: '<p style="background:&bsol;75rl(https://example.com/bg.png)">x</p>',
+    expect: [imageFinding(`<p> style: ${CSS_IMAGE_REFUSAL}`)],
+  },
+  {
+    name: 'url( written with a CSS escape is refused',
+    image: '<p style="background:\\75rl(https://example.com/bg.png)">x</p>',
+    expect: [imageFinding(`<p> style: ${CSS_IMAGE_REFUSAL}`)],
+  },
+  {
+    name: 'image-set() is refused',
+    image: '<p style="background:image-set(\'https://example.com/bg.png\' 1x)">x</p>',
+    expect: [imageFinding(`<p> style: ${CSS_IMAGE_REFUSAL}`)],
+  },
+  {
+    name: '-webkit-image-set() is refused',
+    image: '<p style="background:-webkit-image-set(\'https://example.com/bg.png\' 1x)">x</p>',
+    expect: [imageFinding(`<p> style: ${CSS_IMAGE_REFUSAL}`)],
+  },
+  {
+    name: 'a CSS image of a local file, which carries no alt text, is refused',
+    image: '<p style="background:url({{ \'/assets/blog/img-case/fig.png\' | relative_url }})">x</p>',
+    expect: [imageFinding(`<p> style: ${CSS_IMAGE_REFUSAL}`)],
+    calls: [],
+  },
+  {
+    name: 'a style attribute with url() on an <img> is refused beside its own checks',
+    image: '<img src="/assets/blog/img-case/fig.png" alt="A figure" style="background:url(https://example.com/bg.png)">',
+    expect: [imageFinding(`<img> style: ${CSS_IMAGE_REFUSAL}`)],
+    calls: ['/assets/blog/img-case/fig.png'],
+  },
+  {
+    name: 'an SVG fill naming an external paint server is refused',
+    image: '<svg><rect fill="url(https://example.com/paint.svg#g)" width="1" height="1"/></svg>',
+    expect: [imageFinding(`<rect> fill: ${CSS_IMAGE_REFUSAL}`)],
+  },
+  {
+    name: 'an attribute list setting a CSS image on a paragraph is refused',
+    image: 'A paragraph.\n{: style="background:url(https://example.com/bg.png)"}',
+    expect: [imageFinding(`attribute list: style: ${CSS_IMAGE_REFUSAL}`, 9)],
+  },
+  {
+    name: 'an ALD setting a CSS image, referenced by an attribute list, is refused',
+    image: '{:bg: style="background:url(https://example.com/bg.png)"}\n\nA paragraph.\n{: bg}',
+    expect: [imageFinding(`attribute list: style: ${CSS_IMAGE_REFUSAL}`)],
+  },
+  {
+    name: 'an attribute list setting an external poster is refused',
+    image: '<video></video>{: poster="https://example.com/poster.png"}',
+    expect: [imageFinding('attribute list: poster: external images are not allowed (https://example.com/poster.png)')],
+  },
+  {
+    name: 'an attribute list setting an external background on a Markdown table is refused',
+    image: '| a |\n|---|\n| b |\n{: background="https://example.com/t.png"}',
+    expect: [imageFinding('attribute list: background: external images are not allowed (https://example.com/t.png)', 11)],
+  },
+  {
+    name: 'an attribute list setting an external src on a raw <input> is refused',
+    image: 'Text <input type="image" alt="x">{: src="https://example.com/pixel.png"} end.',
+    expect: [imageFinding('<input> attribute list on the image: external images are not allowed (https://example.com/pixel.png)')],
+  },
+  {
+    name: 'an attribute list setting srcset on a raw <source> is refused',
+    image: 'Text <source>{: srcset="/assets/blog/img-case/fig.png 2x"} end.',
+    expect: [imageFinding('<source> attribute list on the image: srcset is not supported; use a single src')],
+  },
+  {
+    name: 'an attribute list setting an external src after a self-closing <image/> is refused',
+    image: 'Text <image src="/assets/blog/img-case/fig.png" alt="A figure"/>{: src="https://example.com/pixel.png"} end.',
+    expect: [imageFinding('<image> attribute list on the image: external images are not allowed (https://example.com/pixel.png)')],
+    calls: ['/assets/blog/img-case/fig.png'],
+  },
+  {
+    name: 'an attribute list after the </image> that closes the outer of two nested <image> elements is checked',
+    image: 'Text <image alt="Outer"><image alt="Inner"></image></image>{: src="https://example.com/pixel.png"} end.',
+    expect: [imageFinding('<image> attribute list on the image: external images are not allowed (https://example.com/pixel.png)')],
+  },
+  {
+    name: 'an <image> given its src by an attribute list and no alt text is refused',
+    image: 'Text <image/>{: src="/assets/blog/img-case/fig.png"} end.',
+    expect: [imageFinding('<image> has no alt text')],
+    calls: ['/assets/blog/img-case/fig.png'],
+  },
+  // kramdown reads `markdown="span"` content as running text, so a span attribute list there sets the
+  // `href` of an SVG `<image>` or `<feImage>` and the `src` of a MathML `<mglyph>` (verified).
+  {
+    name: 'an attribute list setting an external href after a self-closing <image/> in <svg markdown="span"> is refused',
+    image: '<svg markdown="span"><image width="40" height="40"/>{: href="https://example.com/p.png"}</svg>',
+    expect: [imageFinding('<image> attribute list on the image: external images are not allowed (https://example.com/p.png)')],
+    calls: [],
+  },
+  {
+    name: 'an attribute list setting a data: href after a self-closing <image/> in <svg markdown="span"> is refused',
+    image: '<svg markdown="span"><image width="40" height="40"/>{: href="data:image/png;base64,eA=="}</svg>',
+    expect: [imageFinding('<image> attribute list on the image: data: images are not allowed (data:image/png;base64,eA==)')],
+    calls: [],
+  },
+  {
+    name: 'an attribute list setting an external href after </image> in <svg markdown="span"> is refused',
+    image: '<svg markdown="span"><image></image>{: HREF="https://example.com/p.png"}</svg>',
+    expect: [imageFinding('<image> attribute list on the image: external images are not allowed (https://example.com/p.png)')],
+  },
+  {
+    name: 'an ALD giving an external href to an <image> in <svg markdown="span"> is refused on the image line',
+    image: '{:pic: href="https://example.com/p.png"}\n\n<svg markdown="span"><image/>{: pic}</svg>',
+    expect: [imageFinding('<image> attribute list on the image: external images are not allowed (https://example.com/p.png)', 10)],
+  },
+  {
+    name: 'an attribute list setting an external href after </feImage> in <svg markdown="span"> is refused',
+    image: '<svg markdown="span"><feImage></feImage>{: href="https://example.com/p.png"}</svg>',
+    expect: [imageFinding('<feimage> attribute list on the image: external images are not allowed (https://example.com/p.png)')],
+  },
+  {
+    name: 'an attribute list setting an external src after a self-closing <mglyph/> in <math markdown="span"> is refused',
+    image: '<math markdown="span"><mglyph/>{: src="https://example.com/p.png"}</math>',
+    expect: [imageFinding('<mglyph> attribute list on the image: external images are not allowed (https://example.com/p.png)')],
+  },
+  {
+    name: 'an external MathML <mglyph> src is refused',
+    image: '<math><mglyph src="https://example.com/glyph.png" alt="g"/></math>',
+    expect: [imageFinding('<mglyph> src: external images are not allowed (https://example.com/glyph.png)')],
+    calls: [],
+  },
+  {
+    name: 'external CSS images in the SVG mask, clip-path, marker-end and cursor attributes are each refused',
+    image: '<svg><rect mask="url(https://example.com/m.png)" clip-path="url(https://example.com/c.svg#c)" '
+      + 'marker-end="url(https://example.com/k.svg#k)" cursor="url(https://example.com/p.cur), auto"/></svg>',
+    expect: [
+      imageFinding(`<rect> mask: ${CSS_IMAGE_REFUSAL}`),
+      imageFinding(`<rect> clip-path: ${CSS_IMAGE_REFUSAL}`),
+      imageFinding(`<rect> marker-end: ${CSS_IMAGE_REFUSAL}`),
+      imageFinding(`<rect> cursor: ${CSS_IMAGE_REFUSAL}`),
+    ],
+  },
+  {
+    name: 'an attribute list setting an href in the own folder after <image/> is accepted',
+    image: '<svg markdown="span"><image/>{: href="/assets/blog/img-case/fig.png"}</svg>',
+    expect: [],
+    calls: ['/assets/blog/img-case/fig.png'],
+  },
+  {
+    name: 'an attribute list setting the href of a link is not read as an image',
+    image: '[A link](https://example.com/){: href="https://example.com/other"}',
+    expect: [],
+    calls: [],
+  },
+  {
+    name: 'an attribute list right after an open <image> start tag, which kramdown leaves as text, is accepted',
+    image: 'Text <image alt="x">{: href="https://example.com/p.png"} end.',
+    expect: [],
+  },
+
+  {
+    name: 'an attribute list with backslash escapes that sets style is refused',
+    image: 'A paragraph.\n{: style="background:url(x)" title="a\\}"}',
+    expect: [imageFinding('attribute list setting style cannot be checked; remove its backslash escapes', 9)],
+  },
+  {
+    name: 'a video poster in the own folder is accepted',
+    image: '<video poster="{{ \'/assets/blog/img-case/fig.png\' | relative_url }}"></video>',
+    expect: [],
+    calls: ['/assets/blog/img-case/fig.png'],
+  },
+  {
+    name: 'an SVG <image> href in the own folder is accepted',
+    image: '<svg><image href="/assets/blog/img-case/fig.png"/></svg>',
+    expect: [],
+    calls: ['/assets/blog/img-case/fig.png'],
+  },
+  { name: 'a blank video poster, which loads nothing, is accepted', image: '<video poster=" "></video>', expect: [], calls: [] },
+  {
+    name: 'a video <source> src, a media source rather than an image, is left to the CSP',
+    image: '<video controls><source src="/assets/blog/img-case/clip.mp4" type="video/mp4"></video>',
+    expect: [],
+    calls: [],
+  },
+  {
+    name: 'an SVG fill referring to a gradient in the page is accepted',
+    image: '<svg><linearGradient id="grad"></linearGradient><rect fill="url(#grad)" width="1" height="1"/></svg>',
+    expect: [],
+  },
+  { name: 'a style attribute without a CSS image is accepted', image: '<p style="color: red">x</p>', expect: [] },
+  { name: 'an attribute list setting a style without a CSS image is accepted', image: 'A paragraph.\n{: style="color: red"}', expect: [] },
+  {
+    name: 'a poster and a CSS image inside a fenced code block are accepted',
+    image: '```html\n<video poster="https://example.com/poster.png"></video>\n<p style="background:url(https://example.com/bg.png)">x</p>\n```',
+    expect: [],
+  },
+  {
+    name: 'a poster and a CSS image inside inline code are accepted',
+    image: 'Shown as code: `<video poster="https://example.com/poster.png">` and `<p style="background:url(https://example.com/bg.png)">`.',
+    expect: [],
+  },
 ]);
 
 test('[AC-04][F-017] images need alt text and an existing regular file in the article\'s own folder, never external or data:', async (t) => {
@@ -3336,6 +3734,17 @@ function definitionImageFindings(definition) {
   return { asked, errors };
 }
 
+/** The `validateArticle` errors of a post whose body (from file line 6) is `body`, as `<line>: <message>`. */
+function bodyFindings(body) {
+  const text = articleSource(VALID_FRONT_MATTER, body);
+  const { data, body: parsed } = parseArticle(text);
+  const errors = validateArticle({
+    path: SCHEMA_POST, data, body: parsed, kind: 'post', todayUtc: FIXED_TODAY, imageExists: () => true,
+    bodyStartLine: bodyStartLine(text, parsed),
+  });
+  return errors.map((error) => error.slice(SCHEMA_POST.length + 1));
+}
+
 /**
  * Inputs on which a backtracking reading of the article rules, or one that
  * re-reads shared input for each item, costs time quadratic or worse in
@@ -3343,10 +3752,11 @@ function definitionImageFindings(definition) {
  * list items; closing-fence-shaped lines that never close each other; key
  * lines whose whitespace ends in a line terminator; long whitespace runs in
  * table rows, plain values, flow lists, raw tags, list items and autolinks;
- * many images sharing a label with many definitions; and many autolinks on
- * one line. Each case states the result the rules give at any size: markup
- * after an unclosed fence is still found, code stays masked, and values
- * parse as they do when short.
+ * many images sharing a label with many definitions; many autolinks on one
+ * line; and many tags or attribute lists that all end at the same `>` or `}`.
+ * Each case states the result the rules give at any size: markup after an
+ * unclosed fence is still found, code stays masked, values parse as they do
+ * when short, and markup too tangled to read in full is refused.
  */
 const FAST_CASES = Object.freeze([
   {
@@ -3495,6 +3905,16 @@ const FAST_CASES = Object.freeze([
     name: 'a line of many autolinks gives no finding and leaves the markup after it scanned',
     run: () => findingLines(scanUnsafeMarkup(`See ${'<https://e.example/a> '.repeat(FAST_N / 5)}\n<b onclick=x>\n`)),
     expect: [2],
+  },
+  {
+    name: 'many overlapping tags that all carry one style are read within the budget and refused as too many',
+    run: () => bodyFindings(`${'<a title="x" '.repeat(FAST_N / 10)}style="color: red">\n`),
+    expect: ['6: too many overlapping HTML tags or attribute lists to check for images; simplify the markup'],
+  },
+  {
+    name: 'many overlapping attribute lists setting a style are read within the budget and refused as too many',
+    run: () => bodyFindings(`Text\n${'{: style="color: red" '.repeat(FAST_N / 20)}}\n`),
+    expect: ['7: too many overlapping HTML tags or attribute lists to check for images; simplify the markup'],
   },
 ]);
 

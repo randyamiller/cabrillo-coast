@@ -3016,6 +3016,50 @@ test('[AC-10][F-019] blog/search.js uses no HTML-writing or code-evaluating sink
   );
 });
 
+test('[AC-10][F-019] blog/search.js bidi-isolates the query it echoes into the search status', () => {
+  // The status quotes the visitor's query, from `?q=` or typing. An explicit
+  // override in it, such as U+202E, would run to the end of the paragraph,
+  // reversing the site's sentence and moving the query outside its quotes.
+  // So the echo sits in FSI/PDI (U+2068, U+2069) inside the quotes, with the
+  // explicit bidi controls U+202A-U+202E and U+2066-U+2069 stripped from it:
+  // a PDI left in the query would close the FSI early. Like the sink check
+  // this is lexical: it finds the two quote strings and, between them, a
+  // `q.replace(/…/g, "")` call whose regular expression it runs, and follows
+  // no variable or run-time value.
+  const tokens = scanJs(read('blog/search.js'));
+  const open = tokens.findIndex((token) => token.kind === 'string' && token.value.endsWith('\u201c\u2068'));
+  assert.notEqual(open, -1, 'the opening quote of the echoed query must be followed by FSI ("\\u201c\\u2068")');
+  const close = tokens.findIndex(
+    (token, index) => index > open && token.kind === 'string' && token.value.startsWith('\u2069\u201d'),
+  );
+  assert.notEqual(close, -1, 'the closing quote of the echoed query must follow PDI ("\\u2069\\u201d")');
+  const call = tokens.findIndex(
+    (token, index) =>
+      index > open &&
+      index + 7 < close &&
+      isWord(token, 'q') &&
+      isPunct(tokens[index + 1], '.') &&
+      tokens[index + 2].kind === 'name' &&
+      tokens[index + 2].value === 'replace' &&
+      isPunct(tokens[index + 3], '(') &&
+      tokens[index + 4].kind === 'regex' &&
+      tokens[index + 4].flags.includes('g') &&
+      isPunct(tokens[index + 5], ',') &&
+      tokens[index + 6].kind === 'string' &&
+      tokens[index + 6].value === '' &&
+      isPunct(tokens[index + 7], ')'),
+  );
+  assert.notEqual(call, -1, 'the quoted query must be q.replace(/…/g, "") with its bidi controls stripped');
+  const { value, flags } = tokens[call + 4];
+  const strip = new RegExp(value.slice(1, value.length - flags.length - 1), flags);
+  for (const control of ['\u202a', '\u202b', '\u202c', '\u202d', '\u202e', '\u2066', '\u2067', '\u2068', '\u2069']) {
+    const name = `U+${control.codePointAt(0).toString(16).toUpperCase()}`;
+    assert.equal(`a${control}b${control}`.replace(strip, ''), 'ab', `${value} must strip every ${name}`);
+  }
+  const visible = 'a1 \u00e9\u05d0\u0627.\u201c\u201d';
+  assert.equal(visible.replace(strip, ''), visible, `${value} must keep visible text`);
+});
+
 test('[AC-10][F-019] the ES5 scanner sees through comments, strings and regular-expression literals', () => {
   const es5 = (src) => es5Violations(scanJs(src)).map(({ what }) => what);
 

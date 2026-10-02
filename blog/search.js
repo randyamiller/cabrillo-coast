@@ -4,13 +4,11 @@
 
   function normalize(text) {
     var s = String(text == null ? "" : text).toLowerCase();
-    return typeof s.normalize === "function" ? s.normalize("NFD").replace(/[\u0300-\u036f]/g, "") : s;
+    return s.normalize ? s.normalize("NFD").replace(/[\u0300-\u036f]/g, "") : s;
   }
 
   function tokenize(query) {
-    var p = normalize(query).split(/\s+/), out = [], i;
-    for (i = 0; i < p.length; i++) if (p[i]) out.push(p[i]);
-    return out;
+    return normalize(query).split(/\s+/).filter(Boolean);
   }
 
   // Shallow copies; inputs untouched.
@@ -82,9 +80,10 @@
     }
     list.hidden = !!res && !n;
     if (f && f !== document.activeElement) f.focus();
+    // q in FSI/PDI, no bidi controls
     status.textContent = !entries ? "Search is unavailable right now; all articles are listed below." : !res ? "" :
-      (n ? n + (n > 1 ? " articles match " : " article matches ") : "No articles match ") + "\u201c" + q + "\u201d" +
-      (n ? "." : ". Try fewer or different words.");
+      (n ? n + (n > 1 ? " articles match " : " article matches ") : "No articles match ") + "\u201c\u2068" +
+      q.replace(/[\u202a-\u202e\u2066-\u2069]/g, "") + "\u2069\u201d" + (n ? "." : ". Try fewer or different words.");
   }
 
   function fail() { if (!entries && !failed) { failed = true; apply(1); } }

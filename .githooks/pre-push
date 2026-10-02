@@ -8,6 +8,7 @@ cd "$(git rev-parse --show-toplevel)" || exit 1
 command -v node >/dev/null 2>&1 || { echo "pre-push: Node.js 22 or later is required to run scripts/article.mjs guard; push refused." >&2; exit 1; }
 [ -f scripts/article.mjs ] || { echo "pre-push: scripts/article.mjs not found; push refused." >&2; exit 1; }
 # git's ref lines reach guard on the inherited stdin, untouched. The remote name and URL
-# ($1, $2) are deliberately not passed: guard takes no remote positional arguments (only
-# its --pre-push mode and --root options) and would exit 2 on them.
-exec node scripts/article.mjs guard --pre-push
+# git passes ($1, $2) follow `--`, so one starting with `-` is never read as an option:
+# guard skips only commits the repository at that URL advertises holding (git ls-remote),
+# and checks anything else in full.
+exec node scripts/article.mjs guard --pre-push -- "$@"

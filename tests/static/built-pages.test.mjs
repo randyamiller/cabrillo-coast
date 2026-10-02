@@ -12,6 +12,8 @@
  *
  *   - AC-06 [F-018] page contract: CSP, scripts, metadata, landmarks, list
  *     roles, the prose scan and the listing state the built articles call for.
+ *     The articles are every `blog/<slug>/index.html` and every page a post
+ *     URL of the listing or `search.json` names, wherever its permalink put it.
  *   - AC-07 [F-018] links, canonical URLs and the published outputs.
  *   - AC-02 [F-017] drafts, draft images and future-dated posts stay out of
  *     normal builds.
@@ -33,7 +35,8 @@
  *
  * Paths resolve from this file's location, never `process.cwd()`. The suite
  * never builds or uses the network and reads the output without changing
- * it; its one write is a temporary folder for the post-inventory self-test.
+ * it; its only writes are temporary folders under `os.tmpdir()` for the
+ * self-tests of the post inventory and the article inventory.
  *
  * Run: bundle exec jekyll build && node --test tests/static/built-pages.test.mjs
  */
@@ -162,6 +165,9 @@ const RAW_TEXT_MARKUP_RE = /<[A-Za-z!/?]/;
 /** A start-tag candidate's name: up to whitespace, `/`, `>` or `<`. */
 const CANDIDATE_NAME_RUN_RE = /[^\t\n\f\r /><]*/y;
 
+/** A line break as an HTML parser reads one: CR LF, a lone CR or a lone LF. */
+const LINE_BREAK_RE = /\r\n?|\n/g;
+
 /**
  * Repository-internal paths that must never be published (AAP 0.5.7, AC-07).
  * `assets/css/style.css` is what the default primer theme would emit without
@@ -237,6 +243,8 @@ const ESCAPED_TITLE = 'Escaping &quot;quotes&quot; &amp; &lt;angle&gt; brackets'
 /** An article page under a built site: `blog/<slug>/index.html`. */
 const ARTICLE_REL_RE = /^blog\/([^/]+)\/index\.html$/;
 const LISTING_REL = 'blog/index.html';
+const HOME_REL = 'index.html';
+const SEARCH_INDEX_REL = 'blog/search.json';
 
 /* Helpers                                                                   */
 
@@ -522,9 +530,9 @@ function hasAlignedTable(html) {
  * stays inside the region, and a page that does not match this structure
  * fails the calling test instead of leaving part of its prose unscanned.
  * @param {string} html
- * @returns {string}
+ * @returns {{ start: number, end: number }} offsets of the region in `html`
  */
-function proseRegion(html) {
+function proseBounds(html) {
   const all = tags(html);
   const prose = all.find((t) => t.name === 'div' && classTokens(t).includes('prose'));
   assert.ok(prose, 'article has no <div class="prose"> (layout contract of _layouts/post.html)');
@@ -545,7 +553,17 @@ function proseRegion(html) {
     `the closing ${POST_BACK_TAG} must be the "← All articles" link followed only by </div></article></main> ` +
       `(layout contract of _layouts/post.html and _layouts/blog.html), found: ${html.slice(boundary, boundary + 160)}`,
   );
-  return html.slice(prose.end, prose.end + close.index);
+  return { start: prose.end, end: prose.end + close.index };
+}
+
+/**
+ * The text of an article's prose region (`proseBounds`).
+ * @param {string} html
+ * @returns {string}
+ */
+function proseRegion(html) {
+  const { start, end } = proseBounds(html);
+  return html.slice(start, end);
 }
 
 /**
@@ -612,59 +630,232 @@ function startTagCandidates(html) {
  *   - Event-handler attributes, and `javascript:` URLs in a value decoded as
  *     a browser decodes it (`securityDecode`) or in the tag source.
  * Escaped code samples (`&lt;script…`) contain no `<` and are text.
+ *
+ * Each problem is one line, `line L, column C: <what>: <excerpt>`, located
+ * at the `<` of the markup it names (`lineLocator`), with any CR or LF in the
+ * excerpt written as `\r` or `\n`. Problems come in document order and are
+ * told apart by location as well as text, so identical elements written in
+ * two places are two problems.
  * @param {string} fragment
+ * @param {{ page?: string, offset?: number }} [where] `page`: the text that
+ *   holds the fragment, whose lines and columns the problems name (the
+ *   fragment itself by default); `offset`: where the fragment starts in it
  * @returns {string[]}
  */
-function unsafeMarkup(fragment) {
-  const problems = [];
+function unsafeMarkup(fragment, { page = fragment, offset = 0 } = {}) {
+  assert.ok(
+    Number.isInteger(offset) && offset >= 0 && page.startsWith(fragment, offset),
+    `unsafeMarkup: the fragment is not the text of the page at offset ${offset}`,
+  );
+  /** @type {{ at: number, text: string }[]} */
+  const found = [];
+  const report = (at, text) => found.push({ at, text });
   const tokens = tokenizeHtml(fragment, { rawText: true });
-  const excerpt = (start, end) => fragment.slice(start, Math.min(end, start + 160));
+  const excerpt = (start, end) => oneLine(fragment.slice(start, Math.min(end, start + 160)));
   const startTags = new Map(tokens.filter((token) => token.type === 'start-tag').map((token) => [token.start, token]));
   for (const { start, name } of startTagCandidates(fragment)) {
     if (!FORBIDDEN_PROSE_TAGS.has(name)) continue;
     const tag = startTags.get(start);
-    problems.push(`<${name}> element: ${excerpt(start, tag === undefined ? start + 80 : tag.end)}`);
+    report(start, `<${name}> element: ${excerpt(start, tag === undefined ? start + 80 : tag.end)}`);
   }
   for (const token of tokens) {
     const source = excerpt(token.start, token.end);
     const label = token.name === undefined ? token.type : `<${token.name}> ${token.type}`;
-    if (!token.terminated) problems.push(`${label} left open at the end of the prose: ${source}`);
+    const flag = (text) => report(token.start, text);
+    if (!token.terminated) flag(`${label} left open at the end of the prose: ${source}`);
     if (token.type === 'raw-text' && RAW_TEXT_MARKUP_RE.test(fragment.slice(token.start, token.end))) {
-      problems.push(`markup inside ${label}, which SVG and MathML read as tags: ${source}`);
+      flag(`markup inside ${label}, which SVG and MathML read as tags: ${source}`);
     }
     if (
       token.type === 'bogus-comment' &&
       fragment.startsWith('<![CDATA[', token.start) &&
       !fragment.slice(token.start, token.end).endsWith(']]>')
     ) {
-      problems.push(`CDATA section that SVG and MathML end after its first ">": ${source}`);
+      flag(`CDATA section that SVG and MathML end after its first ">": ${source}`);
     }
     if (token.type !== 'start-tag') continue;
     for (const { name, value } of token.attrs) {
-      if (EVENT_HANDLER_RE.test(name)) problems.push(`event handler attribute ${name}: ${source}`);
+      if (EVENT_HANDLER_RE.test(name)) flag(`event handler attribute ${name}: ${source}`);
       if (value !== null && JAVASCRIPT_URL_RE.test(securityDecode(value))) {
-        problems.push(`javascript: URL in ${name}: ${source}`);
+        flag(`javascript: URL in ${name}: ${source}`);
       }
     }
-    if (JAVASCRIPT_URL_RE.test(fragment.slice(token.start, token.end))) problems.push(`javascript: URL: ${source}`);
+    if (JAVASCRIPT_URL_RE.test(fragment.slice(token.start, token.end))) flag(`javascript: URL: ${source}`);
   }
-  return [...new Set(problems)];
+  if (found.length === 0) return [];
+
+  // A stable sort keeps the order problems at one offset were found in.
+  found.sort((a, b) => a.at - b.at);
+  const locate = lineLocator(page);
+  const seen = new Set();
+  const problems = [];
+  for (const { at, text } of found) {
+    const key = `${at}:${text}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const { line, column } = locate(offset + at);
+    problems.push(`line ${line}, column ${column}: ${text}`);
+  }
+  return problems;
 }
 
 /**
- * The blog pages of a built site: the listing and every article, with the
- * URL path each is served at under `base`.
+ * `text` on one line: each CR written as `\r` and each LF as `\n`.
+ * @param {string} text
+ * @returns {string}
+ */
+function oneLine(text) {
+  return text.replaceAll('\r', '\\r').replaceAll('\n', '\\n');
+}
+
+/**
+ * Maps offsets in `text` to 1-based lines and columns. Lines break as
+ * `LINE_BREAK_RE` reads them, and a column counts UTF-16 code units from
+ * the start of its line. The line starts are found in one pass, and each
+ * lookup is a binary search over them.
+ * @param {string} text
+ * @returns {(offset: number) => { line: number, column: number }}
+ */
+function lineLocator(text) {
+  const starts = [0];
+  for (const match of text.matchAll(LINE_BREAK_RE)) starts.push(match.index + match[0].length);
+  return (offset) => {
+    let low = 0;
+    let high = starts.length - 1;
+    while (low < high) {
+      const middle = (low + high + 1) >>> 1;
+      if (starts[middle] <= offset) low = middle;
+      else high = middle - 1;
+    }
+    return { line: low + 1, column: offset - starts[low] + 1 };
+  };
+}
+
+/**
+ * The blog pages of a built site, sorted by `rel`: the listing and every
+ * article, with the URL path each is published at under `base`. The articles
+ * are what the build publishes, wherever a permalink put them: every
+ * `blog/<slug>/index.html`, and every page a post URL names (`postUrls`,
+ * resolved by `resolvePostUrl`). A page a post URL names is published at the
+ * first such URL, which the canonical check then expects; a
+ * `blog/<slug>/index.html` page no post URL names keeps `base/blog/<slug>/`.
+ * A post URL that cannot name an article fails the calling test.
  * @param {string} dir
  * @param {string} base
- * @returns {{ file: string, rel: string, urlPath: string, kind: 'listing' | 'article', slug: string }[]}
+ * @returns {{ file: string, rel: string, urlPath: string, kind: 'listing' | 'article' }[]}
  */
 function blogPages(dir, base) {
-  return listHtmlPages(dir, base).flatMap((page) => {
-    if (page.rel === LISTING_REL) return [{ ...page, urlPath: `${base}/blog/`, kind: 'listing', slug: '' }];
+  const pages = listHtmlPages(dir, base);
+  const found = new Map();
+  for (const page of pages) {
     const match = ARTICLE_REL_RE.exec(page.rel);
-    if (match === null) return [];
-    return [{ ...page, urlPath: `${base}/blog/${match[1]}/`, kind: 'article', slug: match[1] }];
-  });
+    if (page.rel === LISTING_REL) found.set(page.rel, { ...page, urlPath: `${base}/blog/`, kind: 'listing' });
+    else if (match !== null) found.set(page.rel, { ...page, urlPath: `${base}/blog/${match[1]}/`, kind: 'article' });
+  }
+  const byRel = new Map(pages.map((page) => [page.rel, page]));
+  const named = new Set();
+  for (const { origin, url } of postUrls(dir, found.get(LISTING_REL))) {
+    const { page, urlPath } = resolvePostUrl(url, { base, origin, byRel });
+    if (named.has(page.rel)) continue;
+    named.add(page.rel);
+    found.set(page.rel, { ...page, urlPath, kind: 'article' });
+  }
+  return [...found.values()].sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
+}
+
+/**
+ * The post URLs a built site publishes, each with where it was read: the
+ * `data-url` of every `li` in the listing's `#post-list` (read to the end of
+ * the page when its `</ol>` is missing), and the `url` of every entry of
+ * `blog/search.json` when that file exists. Jekyll writes both from
+ * `site.posts` as `post.url | relative_url`. Fails the calling test when
+ * `search.json` is not a JSON array of objects with a string `url`;
+ * `built-search-index.test.mjs` validates the rest of the index.
+ * @param {string} dir
+ * @param {{ file: string } | undefined} listing The listing page, if built.
+ * @returns {{ origin: string, url: string }[]}
+ */
+function postUrls(dir, listing) {
+  const urls = [];
+  if (listing !== undefined) {
+    const html = readFileSync(listing.file, 'utf8');
+    const all = tags(html);
+    const list = all.find((tag) => tag.attrs.id === 'post-list');
+    if (list !== undefined) {
+      const close = closingTagIndex(html, 'ol', list.end);
+      const end = close === -1 ? html.length : close;
+      for (const tag of all) {
+        if (tag.name !== 'li' || tag.start < list.end || tag.start >= end || !Object.hasOwn(tag.attrs, 'data-url')) continue;
+        urls.push({ origin: `${LISTING_REL} li[data-url]`, url: tag.attrs['data-url'] });
+      }
+    }
+  }
+
+  const indexFile = path.join(dir, ...SEARCH_INDEX_REL.split('/'));
+  if (existsSync(indexFile)) {
+    let entries;
+    try {
+      entries = JSON.parse(readFileSync(indexFile, 'utf8'));
+    } catch (error) {
+      assert.fail(`${indexFile} is not valid JSON, so its post URLs cannot be read: ${error.message}`);
+    }
+    const isEntry = (entry) =>
+      entry !== null && typeof entry === 'object' && !Array.isArray(entry) && typeof entry.url === 'string';
+    assert.ok(
+      Array.isArray(entries) && entries.every(isEntry),
+      `${indexFile} must be a JSON array of objects with a string "url" (built-search-index.test.mjs checks it in full)`,
+    );
+    for (const { url } of entries) urls.push({ origin: `${SEARCH_INDEX_REL} url`, url });
+  }
+  return urls;
+}
+
+/**
+ * `value` percent-decoded, or `null` when it holds a malformed escape.
+ * @param {string} value
+ * @returns {string | null}
+ */
+function decodePath(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The built page a post URL names, with that URL as the path the page is
+ * published at: Jekyll writes the canonical link and `og:url` from the same
+ * `post.url`. The URL, percent-decoded and without the base path, is matched
+ * against the built files the way Jekyll derives a post's file from its URL:
+ * a path ending in `/` is written to its `index.html`, a path ending in
+ * `.html` (`/notes/x/index.html`, `/notes/x.html`) to that file, and any other
+ * path to that path plus `.html`. Fails the calling test when the URL is not
+ * a root-relative path under `base`, names no built HTML page, or names the
+ * listing or the home page.
+ * @param {string} url
+ * @param {{ base: string, origin: string, byRel: Map<string, import('./lib/site-links.mjs').HtmlPage> }} context
+ *   `origin`: where the URL was read; `byRel`: every built HTML page by its path relative to the site
+ * @returns {{ page: import('./lib/site-links.mjs').HtmlPage, urlPath: string }}
+ */
+function resolvePostUrl(url, { base, origin, byRel }) {
+  const named = `${origin} names "${url}"`;
+  const decoded = decodePath(url);
+  assert.ok(decoded !== null, `${named}, which holds a malformed percent-escape`);
+  assert.ok(
+    decoded.startsWith(`${base}/`) && !decoded.startsWith('//'),
+    `${named}, which is not a root-relative path under the base path "${base}"`,
+  );
+  const rel = decoded.slice(base.length + 1);
+  const files = rel === '' || rel.endsWith('/') ? [`${rel}index.html`] : [rel, `${rel}.html`];
+  const file = files.find((candidate) => byRel.has(candidate));
+  assert.ok(file !== undefined, `${named}, which no built HTML page serves: ${files.join(' or ')} not found`);
+  const page = byRel.get(file);
+  assert.ok(
+    page.rel !== LISTING_REL && page.rel !== HOME_REL,
+    `${named}, which is the ${page.rel === LISTING_REL ? 'listing' : 'home page'} (${page.rel}), not an article`,
+  );
+  return { page, urlPath: url };
 }
 
 /** The blog pages of `SITE_DIR`, failing the calling test when the listing is missing. */
@@ -1014,8 +1205,13 @@ function definePageContractTests() {
         // The prose scan runs before the script check so that a script written in an
         // article body is reported against the article content, where it must be fixed.
         if (page.kind === 'article') {
-          const problems = unsafeMarkup(proseRegion(html));
-          assert.deepEqual(problems, [], `unsafe markup in the prose of ${page.rel}:\n${problems.join('\n')}`);
+          const { start, end } = proseBounds(html);
+          const problems = unsafeMarkup(html.slice(start, end), { page: html, offset: start });
+          assert.deepEqual(
+            problems,
+            [],
+            `unsafe markup in the prose of ${page.rel} (lines and columns of ${page.file}):\n${problems.join('\n')}`,
+          );
         }
         assertScripts(
           html,
@@ -1119,6 +1315,75 @@ function definePageContractTests() {
       assert.notEqual(html, wrap('<p>ok</p>'), `case not built: ${why}`);
       assert.throws(() => proseRegion(html), assert.AssertionError, `prose region accepted: ${why}`);
     }
+  });
+
+  test('[AC-06][F-018] the prose scan reports every unsafe element at its line and column in the page', () => {
+    const back = '<p class="post-back"><a href="/blog/">← All articles</a></p>';
+    const page = (inner) =>
+      '<!DOCTYPE html>\n<html lang="en">\n<body>\n<main id="main">\n<article class="section post">\n' +
+      `<div class="container">\n${back}\n<header class="post-header"><h1>T</h1></header>\n<div class="prose">\n` +
+      `${inner}\n</div>\n${back}\n</div>\n</article>\n</main>\n</body>\n</html>\n`;
+    const scan = (html) => {
+      const { start, end } = proseBounds(html);
+      return unsafeMarkup(html.slice(start, end), { page: html, offset: start });
+    };
+
+    // The prose's first line is line 10, so the two identical scripts sit on lines 11 and 13.
+    const script = '<script>window.__p=1</script>';
+    const twice = page(`<p>a</p>\n${script}\n<p>b</p>\n  ${script}`);
+    assert.deepEqual(
+      [twice.split('\n')[10], twice.split('\n')[12]],
+      [script, `  ${script}`],
+      'case not built: the scripts must sit on lines 11 and 13',
+    );
+    assert.deepEqual(
+      scan(twice),
+      ['line 11, column 1: <script> element: <script>', 'line 13, column 3: <script> element: <script>'],
+      'identical scripts in two places are two problems, each at its own line of the page',
+    );
+
+    assert.deepEqual(
+      scan(page('<p>ok</p><iframe src="/"></iframe>')),
+      ['line 10, column 10: <iframe> element: <iframe src="/">'],
+      'one unsafe element is exactly one problem',
+    );
+    assert.deepEqual(
+      unsafeMarkup('<img src="/x.png" alt="x" onerror="alert(1)">'),
+      ['line 1, column 1: event handler attribute onerror: <img src="/x.png" alt="x" onerror="alert(1)">'],
+      'without a page, lines and columns are those of the fragment',
+    );
+    assert.deepEqual(
+      unsafeMarkup('<p onclick="a()" onclick="b()">x</p>'),
+      ['line 1, column 1: event handler attribute onclick: <p onclick="a()" onclick="b()">'],
+      'the same problem at the same place is reported once',
+    );
+
+    // Problems come in document order, and every line break before them counts: CR LF, CR and LF.
+    const ordered = unsafeMarkup(
+      '<p onclick="x()">a</p>\r\n<style>p {}</style>\r<a href="javascript:x()">b</a>\n<base href="/">',
+    );
+    assert.deepEqual(
+      ordered,
+      [
+        'line 1, column 1: event handler attribute onclick: <p onclick="x()">',
+        'line 2, column 1: <style> element: <style>',
+        'line 3, column 1: javascript: URL in href: <a href="javascript:x()">',
+        'line 3, column 1: javascript: URL: <a href="javascript:x()">',
+        'line 4, column 1: <base> element: <base href="/">',
+      ],
+      'problems in document order, located across CR LF, CR and LF line breaks',
+    );
+
+    // A tag written over several lines is still one line of the report.
+    assert.deepEqual(unsafeMarkup('<p>a</p>\n<script\r\nsrc="/main.js"></script>'), [
+      'line 2, column 1: <script> element: <script\\r\\nsrc="/main.js">',
+    ]);
+
+    assert.throws(
+      () => unsafeMarkup('<p>x</p>', { page: '<div><p>x</p>', offset: 0 }),
+      assert.AssertionError,
+      'a fragment that is not the page text at its offset must be refused',
+    );
   });
 
   test('[AC-06][F-018] the script check finds every script a browser could run', () => {
@@ -1243,6 +1508,119 @@ function definePageContractTests() {
     fails(launch, urls, 'launch state with built articles');
     fails(page('<p class="post-empty">Nothing here.</p>'), [], 'launch state with the wrong empty-state text');
     fails(page(''), [], 'no built article and no empty state');
+  });
+
+  test('[AC-06][F-018] the article inventory holds every page a post URL names, wherever its permalink put it', () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'built-pages-articles-'));
+    const write = (rel, text) => {
+      const file = path.join(dir, ...rel.split('/'));
+      mkdirSync(path.dirname(file), { recursive: true });
+      writeFileSync(file, text);
+    };
+    const doc = (body) => `<!DOCTYPE html>\n<html lang="en">\n<body>\n${body}\n</body>\n</html>\n`;
+    const listing = (urls) =>
+      doc(
+        '<ol class="post-list" id="post-list" role="list" aria-label="Articles">\n' +
+          urls.map((url) => `<li class="card post-card" data-url="${url}"><h2><a href="${url}">T</a></h2></li>`).join('\n') +
+          '\n</ol>',
+      );
+    const inventory = (base) => blogPages(dir, base).map(({ rel, urlPath, kind }) => ({ rel, urlPath, kind }));
+    const fails = (base, why, message) =>
+      assert.throws(() => blogPages(dir, base), { name: 'AssertionError', message }, `inventory accepted: ${why}`);
+    try {
+      write('index.html', doc('<p>Home</p>'));
+      const built = [
+        'blog/a/index.html',
+        'notes/v38/index.html',
+        'notes/v39.html',
+        'notes/explicit/index.html',
+        'notes/file.html',
+        'about/index.html',
+      ];
+      for (const rel of built) write(rel, doc('<div class="prose"><p>x</p></div>'));
+
+      for (const base of ['', '/cabrillo-coast']) {
+        const article = (rel, urlPath) => ({ rel, urlPath, kind: 'article' });
+        const listed = { rel: LISTING_REL, urlPath: `${base}/blog/`, kind: 'listing' };
+        rmSync(path.join(dir, ...SEARCH_INDEX_REL.split('/')), { force: true });
+
+        write(LISTING_REL, listing([`${base}/notes/v38/`, `${base}/blog/a/`]));
+        assert.deepEqual(
+          inventory(base),
+          [article('blog/a/index.html', `${base}/blog/a/`), listed, article('notes/v38/index.html', `${base}/notes/v38/`)],
+          `a listed article outside blog/ is an article under the base path "${base}"; an unlisted page is not`,
+        );
+
+        // search.json names articles too; an extension-less permalink is served without its .html.
+        write(SEARCH_INDEX_REL, JSON.stringify([{ url: `${base}/notes/v39` }, { url: `${base}/notes/v38/` }]));
+        assert.deepEqual(
+          inventory(base),
+          [
+            article('blog/a/index.html', `${base}/blog/a/`),
+            listed,
+            article('notes/v38/index.html', `${base}/notes/v38/`),
+            article('notes/v39.html', `${base}/notes/v39`),
+          ],
+          `an article only search.json names is an article under the base path "${base}"`,
+        );
+
+        // A permalink naming its file is published at that URL, index.html included,
+        // and a post URL names a blog/<slug>/ page at the URL it publishes it under.
+        write(SEARCH_INDEX_REL, '[]');
+        write(
+          LISTING_REL,
+          listing([`${base}/notes/explicit/index.html`, `${base}/notes/file.html`, `${base}/blog/a/index.html`]),
+        );
+        assert.deepEqual(
+          inventory(base),
+          [
+            article('blog/a/index.html', `${base}/blog/a/index.html`),
+            listed,
+            article('notes/explicit/index.html', `${base}/notes/explicit/index.html`),
+            article('notes/file.html', `${base}/notes/file.html`),
+          ],
+          `a post URL naming a .html file is an article published at that URL under the base path "${base}"`,
+        );
+
+        write(SEARCH_INDEX_REL, '[]');
+        write(LISTING_REL, listing([`${base}/notes/gone/`]));
+        fails(base, 'a listed URL with no built page', /names ".*\/notes\/gone\/", which no built HTML page serves/);
+        write(LISTING_REL, listing([`${base}/blog/`]));
+        fails(base, 'a listed URL naming the listing', /which is the listing \(blog\/index\.html\), not an article/);
+        write(LISTING_REL, listing([`${base}/`]));
+        fails(base, 'a listed URL naming the home page', /which is the home page \(index\.html\), not an article/);
+        write(LISTING_REL, listing([base === '' ? '//evil.example/notes/v38/' : '/notes/v38/']));
+        fails(base, 'a listed URL outside the base path', /which is not a root-relative path under the base path/);
+        write(LISTING_REL, listing([`${base}/notes/%E0%A4%A/`]));
+        fails(base, 'a listed URL with a malformed escape', /which holds a malformed percent-escape/);
+
+        write(LISTING_REL, listing([]));
+        write(SEARCH_INDEX_REL, JSON.stringify([{ url: `${base}/notes/missing` }]));
+        const unbuilt = /search\.json url names .*: notes\/missing or notes\/missing\.html not found/;
+        fails(base, 'an indexed URL with no built page', unbuilt);
+        const malformed = /search\.json (is not valid JSON|must be a JSON array of objects with a string "url")/;
+        for (const [why, text] of Object.entries({
+          'invalid JSON': '[{"url": ',
+          'an object, not an array': JSON.stringify({ url: `${base}/blog/a/` }),
+          'an entry without a string url': JSON.stringify([{ url: `${base}/blog/a/` }, { url: 7 }]),
+          'a null entry': '[null]',
+        })) {
+          write(SEARCH_INDEX_REL, text);
+          fails(base, `search.json holding ${why}`, malformed);
+        }
+      }
+
+      // The launch state: no list and an empty index leave only the blog/<slug>/ pages.
+      write(LISTING_REL, doc('<p class="post-empty">No articles have been published yet.</p>'));
+      write(SEARCH_INDEX_REL, '[]');
+      assert.deepEqual(
+        blogPages(dir, '').filter((page) => page.kind === 'article').map((page) => page.rel),
+        ['blog/a/index.html'],
+        'without post URLs, only blog/<slug>/index.html pages are articles',
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 }
 

@@ -23,7 +23,11 @@
  * with `_`, `.`, `#` or `~`. Jekyll reads `<dir>/_drafts/` as drafts and
  * `<dir>/_posts/` as posts in every folder it builds, which the article
  * checks would not cover, and skips the last kind of folder, so its files
- * stay off the site while GitHub shows them (see `folderRefusal`).
+ * stay off the site while GitHub shows them (see `folderRefusal`). These
+ * names match in any letter case, as a case-insensitive file system such as
+ * macOS's matches them, and an entry at such a path (a file, symbolic link or
+ * submodule) is refused as the folder would be. `_posts/` and `assets/blog/`
+ * must be real folders spelled exactly so.
  *
  * Front matter accepts `title`, `summary`, `tags`, `updated` and `author` only,
  * written in a restricted YAML subset that `parseArticle` reads without a
@@ -97,10 +101,26 @@ const POST_FILENAME_RE = /^(\d{4}-\d{2}-\d{2})-(.+)\.md$/;
 const DRAFT_FILENAME_RE = /^(.+)\.md$/;
 const POST_PATH_RE = /^_posts\/(?:[^/]+\/)*(\d{4}-\d{2}-\d{2})-([^/]+)\.md$/;
 const DATED_BASENAME_RE = /^(\d{4}-\d{2}-\d{2})-/;
-/** A path inside a `_drafts` folder at any depth (whole folder names only). */
-const DRAFTS_FOLDER_RE = /(?:^|\/)_drafts\//;
-/** A path inside a `_posts` folder below the repository root (whole folder names only). */
-const NESTED_POSTS_FOLDER_RE = /\/_posts\//;
+/**
+ * A `_drafts` folder, or an entry named `_drafts` (a file, symbolic link or
+ * submodule), at any depth and in any letter case (whole names only).
+ */
+const DRAFTS_FOLDER_RE = /(?:^|\/)_drafts(?:\/|$)/iu;
+/** The `assets/drafts` folder, or an entry at that path, in any letter case. */
+const DRAFT_IMAGES_FOLDER_RE = /^assets\/drafts(?:\/|$)/iu;
+/**
+ * A `_posts` folder, or an entry named `_posts`, below the repository root, in
+ * any letter case (whole names only).
+ */
+const NESTED_POSTS_FOLDER_RE = /\/_posts(?:\/|$)/iu;
+/**
+ * The root article folder and the article image folder, each as tracked paths
+ * must spell it, with one pattern per segment matching it in any letter case.
+ */
+const EXACT_FOLDERS = Object.freeze([
+  { canonical: '_posts', segments: [/^_posts$/iu] },
+  { canonical: 'assets/blog', segments: [/^assets$/iu, /^blog$/iu] },
+]);
 /** A folder name Jekyll's entry filter skips: one starting with `_`, `.`, `#` or `~`. */
 const SKIPPED_FOLDER_RE = /^[_.#~]/;
 
@@ -2912,9 +2932,11 @@ function parseAttributeList(text) {
  *     lines directly before the line starting at `start`, or `start`;
  *   - `effect(lists)`: what such lists give an image, through every ALD
  *     (`{:name: …}`) they name, every definition of that name and the names
- *     those name in turn, as `{ srcs, alts, srcset, problem }`: the `src`
- *     and `alt` values set, in any letter case, whether `srcset` is set, and
- *     a message when the lists cannot be read with certainty.
+ *     those name in turn, as `{ srcs, alts, hrefs, srcset, problem }`: the
+ *     `src`, `alt` and `href` values set, in any letter case, whether
+ *     `srcset` is set, and a message when the lists cannot be read with
+ *     certainty. `hrefs` load the image of an SVG `<image>` or `<feImage>`
+ *     (`collectAttributeImages`).
  * A list runs from a `{:` outside code to the first `}` after it, read from
  * the original text, as kramdown matches it there. Where this reading could
  * differ from kramdown's it reports `problem` rather than guess: a list
@@ -3045,7 +3067,7 @@ function imageAttributeLists(body, masked) {
   };
 
   const effect = (lists) => {
-    const result = { srcs: [], alts: [], srcset: false, problem: undefined };
+    const result = { srcs: [], alts: [], hrefs: [], srcset: false, problem: undefined };
     const named = new Set();
     const queue = [...lists];
     for (let q = 0; q < queue.length; q += 1) {
@@ -3063,6 +3085,7 @@ function imageAttributeLists(body, masked) {
         const name = key.toLowerCase();
         if (name === 'src') result.srcs.push(value);
         else if (name === 'alt') result.alts.push(value);
+        else if (name === 'href') result.hrefs.push(value);
         else if (name === 'srcset') result.srcset = true;
       }
       // kramdown ignores a name nothing defines.
@@ -3282,12 +3305,13 @@ function containerLinkDefinitions(text) {
  * (`IMAGE_TAG_WORK_PER_CHAR`), the tags from there on go
  * unread and one entry `{ offset, html: true, unchecked: true }` stands for
  * them, so validation fails instead of passing images it never read.
+ * `lists` is the body's `imageAttributeLists`, built here when not given, so
+ * that `collectAttributeImages` can share one instance and its work budget.
  */
-function collectImages(body, masked, trustedLines) {
+function collectImages(body, masked, trustedLines, lists = imageAttributeLists(body, masked)) {
   const images = [];
   const inlineSpans = [];
   const paragraphs = paragraphSpans(body);
-  const lists = imageAttributeLists(body, masked);
   // What the attribute lists right after an image ending at `end` give it.
   const listsFor = (end) => {
     const chain = lists.spanLists(end);
@@ -3432,6 +3456,302 @@ function collectImages(body, masked, trustedLines) {
 }
 
 /**
+ * Attributes that load an image on any element: `poster` (`<video>`) and
+ * `background` (`<body>`, `<table>` and its rows and cells). Their values
+ * are held to the image source rules wherever they stand.
+ */
+const ANY_ELEMENT_IMAGE_SOURCES = ['poster', 'background'];
+
+/**
+ * Attributes a browser reads as CSS that can load an image (`url()`,
+ * `image-set()`): `style` on any element and the SVG presentation
+ * attributes that take a URL.
+ */
+const CSS_IMAGE_ATTRIBUTES = [
+  'style', 'fill', 'stroke', 'filter', 'mask', 'clip-path', 'marker-start', 'marker-mid', 'marker-end', 'cursor',
+];
+
+/**
+ * The attributes that load the image of these elements, `<img>` aside
+ * (`collectImages` reads it): `<image>`, which the HTML parser turns into an
+ * `<img>` and which inside SVG is the SVG image; SVG `<feImage>`; `<input>`,
+ * read whatever its `type`, as an image button (`type="image"`) loads its
+ * `src`; and MathML `<mglyph>`. Media sources (`src` on `<video>`, `<audio>`,
+ * `<source>` and `<track>`) are not images and are left to the CSP.
+ */
+const ELEMENT_IMAGE_SOURCES = new Map([
+  ['image', ['src', 'href', 'xlink:href']],
+  ['feimage', ['href', 'xlink:href']],
+  ['input', ['src']],
+  ['mglyph', ['src']],
+]);
+
+/** Elements besides `<img>` whose `srcset` loads images: `<image>` (an `<img>` to the HTML parser) and `<source>` in `<picture>`. */
+const SRCSET_ELEMENTS = new Set(['image', 'source']);
+
+/** A key `collectAttributeImages` checks, set with `=` in the text of an attribute list, in any letter case; group 1 is the key. */
+const LIST_IMAGE_KEY_RE = new RegExp(
+  `(?<![\\w-])(${[...CSS_IMAGE_ATTRIBUTES, ...ANY_ELEMENT_IMAGE_SOURCES].map(escapeRegExp).join('|')})=`,
+  'i',
+);
+
+/** The element name a browser reads at the start of a tag's text. */
+const TAG_NAME_AT_RE = /^<([^\s/>]+)/;
+
+/**
+ * The elements besides `<img>` whose image a kramdown span attribute list
+ * can set, each mapped to what such lists give it (an `imageAttributeLists`
+ * `effect` result) in the form `attributeListErrors` reads: on `<input>`
+ * its `src`, alt text and `srcset`; on `<source>` its `srcset` alone, as its
+ * `src` is a media source; on `<image>` its `src` and `href`; on SVG
+ * `<feImage>` its `href` alone; on MathML `<mglyph>` its `src` and alt text.
+ * kramdown applies the list after the `>` of a void `<input>` or `<source>`,
+ * and after the self-closing `/>` or the close tag of the others, inside
+ * `<svg markdown="span">` and `<math markdown="span">` as well (verified
+ * with kramdown 2.4.0). A list cannot set `xlink:href`: its keys hold no `:`.
+ */
+const LIST_IMAGE_EFFECTS = new Map([
+  ['input', (lists) => lists],
+  ['source', (lists) => ({ ...lists, srcs: [], alts: [] })],
+  ['image', (lists) => ({ ...lists, srcs: [...lists.srcs, ...lists.hrefs] })],
+  ['feimage', (lists) => ({ ...lists, srcs: lists.hrefs, alts: [], srcset: false })],
+  ['mglyph', (lists) => ({ ...lists, srcset: false })],
+]);
+
+/**
+ * A close tag of a `LIST_IMAGE_EFFECTS` element with a body (`<image>`,
+ * `<feImage>`, `<mglyph>`) in any letter case; group 1 is the name. kramdown
+ * matches the close tag of an element it does not know in the letter case of
+ * its start tag, so this finds every close tag it may match, and some it
+ * does not.
+ */
+const LIST_IMAGE_CLOSE_TAG_RE = /<\/(image|feimage|mglyph)[ \t\n\v\f\r]*>/gi;
+
+/**
+ * A CSS escape as a browser reads it: a backslash, then one to six hex
+ * digits (group 1) and one optional whitespace, CRLF counting as one; or a
+ * backslash and any one character but a line break (group 2), which it
+ * stands for.
+ */
+const CSS_ESCAPE_RE = /\\(?:([0-9a-fA-F]{1,6})(?:\r\n|[ \t\n\r\f])?|([^\n\r\f]))/g;
+
+/** The CSS functions that load an image: `url()`, `image()`, `image-set()` (with `-webkit-image-set()`) and `src()`. */
+const CSS_IMAGE_FUNCTION_RE = /(?:url|image|image-set|src)\(/g;
+
+/** What follows `url(` in a fragment-only reference such as `url(#grad)`, which loads nothing; sticky. */
+const CSS_FRAGMENT_URL_AT_RE = /[ \t\n\r\f]*["']?#/y;
+
+/**
+ * Tag and attribute-list text `collectAttributeImages` may read, per
+ * character of the body and in all. Constructs that do not overlap total at
+ * most twice the body's length; overlapping ones (`'<a style="x" '.repeat(n)`
+ * or `'{:a '.repeat(n)`) all end at the same `>` or `}`, and reading each of
+ * them would take quadratic time.
+ */
+const ATTRIBUTE_IMAGE_WORK_PER_CHAR = 4;
+const ATTRIBUTE_IMAGE_WORK_BASE = 65536;
+
+/** The finding that stands for the tags and lists left unread once `ATTRIBUTE_IMAGE_WORK_PER_CHAR` is spent. */
+const ATTRIBUTE_IMAGE_BUDGET = 'too many overlapping HTML tags or attribute lists to check for images; simplify the markup';
+/** The refusal of CSS that loads an image (`cssLoadsImage`), after the attribute holding it. */
+const CSS_IMAGE_REFUSAL = 'CSS images (url(), image-set()) are not allowed; use a Markdown image or an <img> with alt text';
+/** The refusal of `srcset` on an element of `SRCSET_ELEMENTS`, after the element. */
+const SRCSET_REFUSAL = 'srcset is not supported; use a Markdown image or an <img> with a single src';
+
+/**
+ * Whether `value`, an attribute value a browser reads as CSS (`style` or an
+ * SVG presentation attribute) with its character references decoded, may
+ * load an image. It first decodes what the browser still would: `&bsol;`,
+ * which `decodeEntities` leaves alone, and CSS escapes (`\75rl(` is `url(`),
+ * those in strings and comments included, which can only add findings. Any
+ * `url(`, `image(`, `image-set(` or `src(`, in any ASCII letter case,
+ * counts, local files included: a CSS image carries no alt text, so it can
+ * never meet the image rules. Only a fragment-only `url(#id)`, an SVG paint,
+ * filter or marker reference into the page itself, loads nothing and passes.
+ */
+function cssLoadsImage(value) {
+  const css = value
+    .replace(/&bsol;/gi, '\\')
+    .replace(CSS_ESCAPE_RE, (all, hex, char) => {
+      if (hex === undefined) return char;
+      const cp = Number.parseInt(hex, 16);
+      return cp === 0 || (cp >= 0xd800 && cp <= 0xdfff) || cp > 0x10ffff ? '\ufffd' : String.fromCodePoint(cp);
+    })
+    .replace(/[A-Z]+/g, (letters) => letters.toLowerCase());
+  for (const m of css.matchAll(CSS_IMAGE_FUNCTION_RE)) {
+    if (m[0] !== 'url(') return true;
+    CSS_FRAGMENT_URL_AT_RE.lastIndex = m.index + m[0].length;
+    if (!CSS_FRAGMENT_URL_AT_RE.test(css)) return true;
+  }
+  return false;
+}
+
+/**
+ * The image references a body makes, outside code, other than Markdown
+ * images and the `src`, `srcset` and `alt` of `<img>` (`collectImages`):
+ *   - in raw start tags (`TAG_START_RE`, Markdown autolinks excepted), named
+ *     and read as a browser reads them (`readAttributes`): `poster` and
+ *     `background` on any element and the `ELEMENT_IMAGE_SOURCES`, each held
+ *     to the image source rules; CSS that loads an image (`cssLoadsImage`)
+ *     in `style` or an SVG presentation attribute (`CSS_IMAGE_ATTRIBUTES`);
+ *     `srcset` on `<image>` and `<source>`; an `<image>` given a `src` but
+ *     no alt text; and any of these attributes written twice, as kramdown
+ *     renders the last and browsers reading the tag as written the first;
+ *   - in the span attribute lists kramdown applies to a raw `<input>` or
+ *     `<source>` (right after its `>`) or `<image>`, `<feImage>` or
+ *     `<mglyph>` (right after a self-closing `/>`, or after a close tag,
+ *     which closes the innermost element of its name still open), read with
+ *     `lists`, the body's `imageAttributeLists`: the sources, alt text and
+ *     `srcset` they set, as `LIST_IMAGE_EFFECTS` maps them for each element;
+ *   - in every attribute list (`{: …}` and ALD definitions alike, whether or
+ *     not kramdown applies it to anything), `poster` and `background`, held
+ *     to the source rules, and CSS images in `style` and the presentation
+ *     attributes. A list holding a backslash that sets one of these cannot be
+ *     read with certainty (`parseAttributeList`) and is refused. A list's
+ *     `src`, `href`, `srcset` and `alt` matter only where it applies to an
+ *     image, which `collectImages` and the chains above cover, so a list
+ *     setting the `href` of a link is not read for images.
+ * Blank values load nothing and are skipped. `autolinks` are the autolinks
+ * `findCodeRegions` found. Once tag and list text exceeds
+ * `ATTRIBUTE_IMAGE_WORK_PER_CHAR`, the rest goes unread and one finding
+ * stands for it, so validation fails instead of passing markup it never read.
+ *
+ * @returns {object[]} Entries ordered by offset, each one of:
+ *   `{ offset, message }`, a finding as it stands;
+ *   `{ offset, label, source }`, reported as `${label}: …` when `source`
+ *   breaks the image source rules (`imagePublicPath`, `imageExists`);
+ *   `{ offset, label, attributes, src }`, what attribute lists give an
+ *   element whose own source is `src`, reported through
+ *   `attributeListErrors` with `label` before each message.
+ */
+function collectAttributeImages(body, masked, autolinks, lists) {
+  const found = [];
+  const markup = markupOutsideCode(body, hideAutolinks(masked, autolinks), TAG_START_RE, true);
+  let work = ATTRIBUTE_IMAGE_WORK_PER_CHAR * body.length + ATTRIBUTE_IMAGE_WORK_BASE;
+  // Charges `cost`; once the budget is spent, one finding at `offset` stands for the rest.
+  const spend = (offset, cost) => {
+    work -= cost;
+    if (work < 0) found.push({ offset, message: ATTRIBUTE_IMAGE_BUDGET });
+    return work >= 0;
+  };
+  // What the span attribute lists starting at `end` give the element before them, or `undefined`.
+  const listsAt = (end) => {
+    const chain = lists.spanLists(end);
+    if (chain.lists.length === 0 && chain.problem === undefined) return undefined;
+    const result = lists.effect(chain.lists);
+    result.problem ??= chain.problem;
+    return result;
+  };
+  const checkSource = (offset, label, value) => {
+    const source = value.trim();
+    if (source !== '') found.push({ offset, label, source });
+  };
+  const checkCss = (offset, label, value) => {
+    if (cssLoadsImage(value)) found.push({ offset, message: `${label}: ${CSS_IMAGE_REFUSAL}` });
+  };
+
+  // `<image>`, `<feImage>` and `<mglyph>` elements as `{ offset, name, src, alt, attributes }`: the
+  // own `src` (trimmed) or `undefined`, whether the own alt text is filled, and what the lists after
+  // the self-closing tag or the close tag give it. A close tag closes the innermost element of its
+  // name still open; lists after one that closes none go to an element of their own.
+  const elements = [];
+  const open = new Map();
+  const closes = [...masked.matchAll(LIST_IMAGE_CLOSE_TAG_RE)];
+  let close = 0;
+  const closeBefore = (offset) => {
+    for (; close < closes.length && closes[close].index < offset; close += 1) {
+      const m = closes[close];
+      const name = m[1].replace(/[A-Z]+/g, (letters) => letters.toLowerCase());
+      const attributes = listsAt(m.index + m[0].length);
+      const element = open.get(name)?.pop();
+      if (element !== undefined) element.attributes = attributes;
+      else if (attributes !== undefined) elements.push({ offset: m.index, name, src: undefined, alt: false, attributes });
+    }
+  };
+
+  let reading = true;
+  for (const tag of markup.tags) {
+    closeBefore(tag.start);
+    if (!spend(tag.start, tag.end + 1 - tag.start)) {
+      reading = false;
+      break;
+    }
+    const source = body.slice(tag.start, tag.end + 1);
+    const name = TAG_NAME_AT_RE.exec(source)[1].replace(/[A-Z]+/g, (letters) => letters.toLowerCase());
+    const label = `<${preview(name)}>`;
+    const repeated = new Set();
+    const attrs = readAttributes(source, repeated);
+    const sources = [...ANY_ELEMENT_IMAGE_SOURCES, ...(ELEMENT_IMAGE_SOURCES.get(name) ?? [])];
+    for (const attr of sources) if (attrs.has(attr)) checkSource(tag.start, `${label} ${attr}`, attrs.get(attr));
+    for (const attr of CSS_IMAGE_ATTRIBUTES) if (attrs.has(attr)) checkCss(tag.start, `${label} ${attr}`, attrs.get(attr));
+    const read = [...sources, ...CSS_IMAGE_ATTRIBUTES];
+    if (SRCSET_ELEMENTS.has(name)) {
+      read.push('srcset');
+      if (attrs.has('srcset')) found.push({ offset: tag.start, message: `${label} ${SRCSET_REFUSAL}` });
+    }
+    if (name === 'image') read.push('alt');
+    // kramdown renders the last of a repeated attribute and browsers reading the tag as written the first.
+    for (const attr of read) {
+      if (repeated.has(attr)) found.push({ offset: tag.start, message: `${label} repeats the ${attr} attribute; write it once` });
+    }
+    // A `<source>` has no `src` image of its own: its `src` is a media source.
+    const src = attrs.has('src') && name !== 'source' ? attrs.get('src').trim() : undefined;
+    if (LIST_IMAGE_EFFECTS.has(name) && HTML_VOID_ELEMENTS.has(name)) {
+      const attributes = listsAt(tag.end + 1);
+      if (attributes !== undefined) found.push({ offset: tag.start, label, attributes: LIST_IMAGE_EFFECTS.get(name)(attributes), src });
+    } else if (LIST_IMAGE_EFFECTS.has(name)) {
+      const element = { offset: tag.start, name, src, alt: (attrs.get('alt') ?? '').trim() !== '', attributes: undefined };
+      elements.push(element);
+      if (source.endsWith('/>')) {
+        element.attributes = listsAt(tag.end + 1);
+      } else {
+        if (!open.has(name)) open.set(name, []);
+        open.get(name).push(element);
+      }
+    }
+  }
+  if (reading) closeBefore(Infinity);
+  for (const { offset, name, src, alt, attributes } of elements) {
+    if (attributes !== undefined) {
+      found.push({ offset, label: `<${name}>`, attributes: LIST_IMAGE_EFFECTS.get(name)(attributes), src });
+    }
+    if (name !== 'image') continue;
+    // The HTML parser turns `<image>` into `<img>`, which needs alt text once it has a `src` (an
+    // `href` makes it the SVG image, which has none); `attributeListErrors` reports a blank alt the
+    // lists set.
+    const hasSrc = src !== undefined || (attributes !== undefined && attributes.srcs.length > 0);
+    if (hasSrc && !alt && (attributes === undefined || attributes.alts.length === 0)) {
+      found.push({ offset, message: '<image> has no alt text' });
+    }
+  }
+
+  if (reading) {
+    for (const list of markup.lists) {
+      if (!spend(list.start, list.end + 1 - list.start)) break;
+      const text = body.slice(list.start + 2, list.end);
+      const parsed = parseAttributeList(text);
+      if (parsed === null) {
+        const key = LIST_IMAGE_KEY_RE.exec(text);
+        if (key !== null) {
+          found.push({
+            offset: list.start,
+            message: `attribute list setting ${key[1].toLowerCase()} cannot be checked; remove its backslash escapes`,
+          });
+        }
+        continue;
+      }
+      for (const [key, value] of parsed.pairs) {
+        const attr = key.toLowerCase();
+        const label = `attribute list: ${attr}`;
+        if (CSS_IMAGE_ATTRIBUTES.includes(attr)) checkCss(list.start, label, decodeEntities(value));
+        else if (ANY_ELEMENT_IMAGE_SOURCES.includes(attr)) checkSource(list.start, label, decodeEntities(value));
+      }
+    }
+  }
+  return found.sort((a, b) => a.offset - b.offset);
+}
+
+/**
  * A character reference a browser decodes in an attribute value: named,
  * decimal or hexadecimal, ended by `;`. kramdown passes these through to the
  * rendered attribute unchanged.
@@ -3571,7 +3891,23 @@ function futureDateMessage(path, date, today) {
  *     page renders: kramdown attribute lists that apply to an image (`{: …}`
  *     right after it, those on the link definition it uses and the ALDs they
  *     name) must set no `srcset`, no blank `alt` and only a `src` that passes
- *     them too, and an `<img>` must not repeat `src`, `alt` or `srcset`.
+ *     them too, and an `<img>` must not repeat `src`, `alt` or `srcset`;
+ *   - images loaded through other attributes outside code are held to the
+ *     same source rules: `poster` and `background` on any raw tag or set by
+ *     any attribute list, `src`, `href` and `xlink:href` on `<image>`, `href`
+ *     and `xlink:href` on SVG `<feImage>`, and `src` on `<input>` and
+ *     `<mglyph>`. An `<image>` given a `src` needs alt text, `srcset` on
+ *     `<image>` and `<source>` is rejected, and attribute lists applied to a
+ *     raw `<input>`, `<source>`, `<image>`, `<feImage>` or `<mglyph>`, the
+ *     `href` they give an `<image>` or `<feImage>` included, are held to the
+ *     rules above.
+ *     CSS that loads an image (`url()` other than a fragment-only `url(#id)`,
+ *     `image()`, `image-set()`, `src()`), read through character references
+ *     and CSS escapes, is rejected in `style` and the SVG presentation
+ *     attributes, on raw tags and in attribute lists, local files included,
+ *     as it carries no alt text. A tag must not repeat any of these
+ *     attributes. Media sources (`src` on `<video>`, `<audio>`, `<source>`
+ *     and `<track>`) are not images: the CSP's `default-src` governs them.
  *
  * @param {object} args
  * @param {string} args.path Repository-relative path, such as `_posts/2026-01-15-foo.md` or `_drafts/foo.md`.
@@ -3595,12 +3931,15 @@ export function validateArticle({ path, data, body, kind, todayUtc, imageExists,
 /**
  * The part of an article check that depends on nothing but the body: a line
  * locator for its offsets, the lines carrying a leftover template placeholder
- * outside code, and every image outside code (`collectImages`). Code regions
- * are found once and the masked body is not kept. Because neither path, date
- * nor tree enters it, one analysis serves every check of the same body.
+ * outside code, every image outside code (`collectImages`) and the image
+ * references made through other attributes, CSS and attribute lists
+ * (`collectAttributeImages`). Code regions and the attribute lists that can
+ * apply to images are found once and the masked body is not kept. Because
+ * neither path, date nor tree enters it, one analysis serves every check of
+ * the same body.
  *
  * @param {string} body Markdown body (from `parseArticle`).
- * @returns {{ lineAt: (offset: number) => number, todoLines: number[], images: object[] }}
+ * @returns {{ lineAt: (offset: number) => number, todoLines: number[], images: object[], attributeImages: object[] }}
  *   `todoLines` are 1-based lines of `body` in ascending order.
  */
 function analyzeBody(body) {
@@ -3608,10 +3947,12 @@ function analyzeBody(body) {
   const masked = maskCode(body, findCodeRegions(body, code));
   const todo = lineFindings(body);
   for (const m of masked.matchAll(/TODO:/g)) todo.note(m.index);
+  const lists = imageAttributeLists(body, masked);
   return {
     lineAt: lineLocator(body),
     todoLines: todo.list().map((finding) => finding.line),
-    images: collectImages(body, masked, code.trustedLines),
+    images: collectImages(body, masked, code.trustedLines, lists),
+    attributeImages: collectAttributeImages(body, masked, code.autolinks, lists),
   };
 }
 
@@ -3639,7 +3980,7 @@ function validateWithAnalysis({ path, data, body, kind, todayUtc, imageExists, b
 
   const errors = [];
   const fileError = (message) => errors.push(`${path}: ${message}`);
-  const { lineAt, todoLines, images } = analysis ?? analyzeBody(text);
+  const { lineAt, todoLines, images, attributeImages } = analysis ?? analyzeBody(text);
   const bodyError = (offset, message) => errors.push(`${path}:${startLine + lineAt(offset) - 1}: ${message}`);
 
   // Filename, slug and date.
@@ -3779,6 +4120,20 @@ function validateWithAnalysis({ path, data, body, kind, todayUtc, imageExists, b
     }
     if (image.attributes !== undefined) {
       for (const message of attributeListErrors(image.attributes, src, sourceProblem)) bodyError(at, message);
+    }
+  }
+  // Image references through other attributes, CSS and attribute lists, after the images above so
+  // that they keep the order of their findings and existence checks.
+  for (const finding of attributeImages) {
+    if (finding.message !== undefined) {
+      bodyError(finding.offset, finding.message);
+    } else if (finding.attributes !== undefined) {
+      for (const message of attributeListErrors(finding.attributes, finding.src, sourceProblem)) {
+        bodyError(finding.offset, `${finding.label} ${message}`);
+      }
+    } else {
+      const problem = sourceProblem(finding.source);
+      if (problem !== null) bodyError(finding.offset, `${finding.label}: ${problem}`);
     }
   }
   return errors;
@@ -4172,29 +4527,64 @@ function normalizePath(p) {
 }
 
 /**
+ * The folder named by the leading segments of `p` when they spell an
+ * `EXACT_FOLDERS` entry's `canonical` name in another letter case, such as
+ * `_Posts` for `_posts`, or null.
+ */
+function caseVariantOf(p, { canonical, segments }) {
+  const names = p.split('/');
+  if (names.length < segments.length || !segments.every((re, i) => re.test(names[i]))) return null;
+  const spelled = names.slice(0, segments.length).join('/');
+  return spelled === canonical ? null : spelled;
+}
+
+/**
  * The folder refusal for one tracked path, or null. Each folder below keeps
- * a file from the site, or puts it there unchecked, while GitHub shows it:
+ * a file from the site, or puts it there unchecked, while GitHub shows it.
+ * Every name is matched in any letter case, because a case-insensitive file
+ * system (the macOS default) gives `_Drafts/` and `_drafts/` one folder, while
+ * the Pages build and these checks see two:
  *   - a `_drafts/` folder at any depth, or `assets/drafts/` (rule 1 of
- *     `checkTrackedContent`). Jekyll reads `<dir>/_drafts/` in every folder it
- *     builds when run with `--drafts`;
- *   - a `_posts/` folder below the root. Jekyll reads `<dir>/_posts/` in every
- *     folder it builds as posts, but `ARTICLE_PATH_RE` and the article checks
- *     cover only the root one;
+ *     `checkTrackedContent`), and an entry at such a path, a file, symbolic
+ *     link or submodule. Jekyll reads `<dir>/_drafts/` in every folder it
+ *     builds when run with `--drafts`, and a link there makes its target the
+ *     drafts folder;
+ *   - a `_posts/` folder below the root, or an entry named `_posts` there.
+ *     Jekyll reads `<dir>/_posts/` in every folder it builds as posts, but
+ *     `ARTICLE_PATH_RE` and the article checks cover only the root one;
+ *   - `_posts/` or `assets/blog/` spelled in another letter case, such as
+ *     `_Posts/`: the author's Mac shows it as the real folder, but the Pages
+ *     build skips `_Posts/` (its name starts with `_`) and serves
+ *     `assets/Blog/` without the image-folder rule;
+ *   - an entry at exactly `_posts` or `assets/blog`. A tree lists no folders,
+ *     so it is a file, symbolic link or submodule, whose content the checks
+ *     never read;
  *   - a folder inside the root `_posts/` whose name starts with `_`, `.`, `#`
  *     or `~`. Jekyll 3.10.0 skips such a folder directly below `_posts/`, so
  *     its posts never reach the site. It reads deeper ones, so refusing them
  *     at every depth is stricter than Jekyll on purpose: a misjudgement here
  *     can only produce a false finding, which the author fixes by renaming
  *     the folder, never a missed one.
- * Folder names are matched whole: `notes/my_drafts/` and `_posts/sub/` pass.
+ * Folder names are matched whole: `notes/my_drafts/`, `docs/_drafts.md` and
+ * `_posts/sub/` pass.
  */
 function folderRefusal(p) {
-  if (DRAFTS_FOLDER_RE.test(p) || p.startsWith('assets/drafts/')) {
+  if (DRAFTS_FOLDER_RE.test(p) || DRAFT_IMAGES_FOLDER_RE.test(p)) {
     return `${p}: drafts and draft images must never be tracked (git rm --cached; they belong only in your working copy)`;
   }
   if (NESTED_POSTS_FOLDER_RE.test(p)) {
     return `${p}: articles belong only in the root _posts/ folder; Jekyll can read a nested _posts/ folder `
       + 'as posts, but the article checks cover only the root one';
+  }
+  for (const folder of EXACT_FOLDERS) {
+    const variant = caseVariantOf(p, folder);
+    if (variant !== null) {
+      return `${p}: folder ${variant}/ must be named exactly ${folder.canonical}/; a case-insensitive file system `
+        + "such as macOS's treats them as one folder, but the Pages build and these checks do not";
+    }
+    if (p === folder.canonical) {
+      return `${p}: must be a real folder; a file, symbolic link or submodule here supplies content the checks never read`;
+    }
   }
   if (p.startsWith('_posts/')) {
     const skipped = p.split('/').slice(1, -1).find((name) => SKIPPED_FOLDER_RE.test(name));
@@ -4235,7 +4625,9 @@ function analyzeArticle(text) {
  * complete tree (the staged index for `guard --staged`, each pushed commit
  * for `guard --pre-push`, the working tree for the AC-01 test):
  *   1. nothing in a `_drafts/` folder at any depth (`blog/_drafts/` and
- *      `_posts/_drafts/` included) or under `assets/drafts/` is tracked;
+ *      `_posts/_drafts/` included) or under `assets/drafts/` is tracked, in
+ *      any letter case (`_Drafts/`), and no entry (a file, symbolic link or
+ *      submodule) sits at such a path;
  *   2. no article has a `published:` key (through `validateArticle`);
  *   3. no article path (`ARTICLE_PATH_RE`) carries a date after `todayUtc`;
  *   4. every `assets/blog/<slug>/` folder has a matching
@@ -4245,8 +4637,16 @@ function analyzeArticle(text) {
  * Each rule keeps material from being hidden from the site while staying
  * world-readable on GitHub. For the same reason:
  *   - nothing is tracked in a `_posts/` folder below the root, such as
- *     `blog/_posts/`: Jekyll can publish it as posts, but rules 2 and 3 and the
+ *     `blog/_posts/`, in any letter case, and no entry is named `_posts`
+ *     there: Jekyll can publish it as posts, but rules 2 and 3 and the
  *     article checks cover only the root `_posts/` and `tests/fixtures/posts/`;
+ *   - nothing is tracked in `_posts/` or `assets/blog/` spelled in another
+ *     letter case, such as `_Posts/` or `assets/Blog/`: a case-insensitive
+ *     file system shows it as the real folder, but the Pages build skips
+ *     `_Posts/` and serves `assets/Blog/` past rule 4;
+ *   - no entry sits at exactly `_posts` or `assets/blog`: a tree lists no
+ *     folders, so it is a file, symbolic link or submodule whose content these
+ *     rules never read;
  *   - no folder inside `_posts/` has a name starting with `_`, `.`, `#` or `~`,
  *     such as `_posts/_hold/`: Jekyll skips it, so its posts stay off the site
  *     (deeper ones, which Jekyll reads, are refused too; see `folderRefusal`);
@@ -4254,7 +4654,7 @@ function analyzeArticle(text) {
  *     (Jekyll silently skips a misnamed post);
  *   - two posts may not share a slug (they would publish to the same URL and
  *     one would vanish).
- * A path refused by rule 1 or either folder rule gets one such refusal and
+ * A path refused by rule 1 or any folder rule gets one such refusal and
  * is not counted as a post: it is never a duplicate slug and never the post
  * of an `assets/blog/<slug>/` folder.
  *

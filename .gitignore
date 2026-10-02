@@ -11,6 +11,9 @@ Thumbs.db
 # Jekyll / blog
 _drafts/
 assets/drafts/
+# The same in every letter case, and as a file or symbolic link (no trailing slash)
+_[Dd][Rr][Aa][Ff][Tt][Ss]
+/[Aa][Ss][Ss][Ee][Tt][Ss]/[Dd][Rr][Aa][Ff][Tt][Ss]
 _site/
 .jekyll-cache/
 .jekyll-metadata

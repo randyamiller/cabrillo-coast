@@ -38,12 +38,16 @@ The home page alone needs no tooling. Just open `index.html` in a browser. Or se
 it (nicer for testing):
 
 ```bash
-python -m http.server 8000
+python -m http.server 8000 --bind 127.0.0.1
 # then visit http://localhost:8000
 ```
 
-Served this way, blog paths show raw Liquid instead of rendered pages. Use Jekyll to
-preview the blog.
+The command serves every file in your working copy, including `_drafts/`,
+`assets/drafts/` and `.git/`. Keep `--bind 127.0.0.1`: without it, Python listens on
+every network interface and anyone on your network can read your drafts.
+
+Served this way, blog paths show raw Liquid instead of rendered pages. Use the Jekyll
+[preview](#preview) for the blog.
 
 ### One-time setup
 
@@ -194,12 +198,23 @@ Every safeguard runs on your machine except the last, which only reports.
 
 | Safeguard | What it stops | Limit |
 |-----------|---------------|-------|
-| `.gitignore` (`_drafts/`, `assets/drafts/`) | `git add -A` and `git add .` skip drafts and draft images | `git add -f` overrides it |
+| `.gitignore` (`_drafts/`, `assets/drafts/`, in every letter case and as a file or symbolic link too) | `git add -A` and `git add .` skip drafts and draft images | `git add -f` overrides it; for a `_drafts` or `assets/drafts` link to another folder of the repository, only the link is skipped, not that folder's files (the hooks refuse them) |
 | `article.mjs check` and `publish` | A draft that fails the schema, date or image rules is not moved into `_posts/` | Runs only when you run it |
-| `.githooks/pre-commit` (`guard --staged`) | Refuses a commit when the complete staged tree tracks a draft or draft image (a `_drafts/` folder at any depth included), a file in a `_posts/` folder below the repository root or in a `_posts/` subfolder whose name starts with `_`, `.`, `#` or `~`, a misnamed or duplicate-slug file in `_posts/`, an article whose filename date is in the future or an `assets/blog/<slug>/` folder without its post (the tree rules); when an article the commit adds or changes fails the schema (which rejects a `published:` key), image or unsafe-markup checks (the article checks); or when a staged `.githooks/` file lacks mode `100755` | Needs `git config core.hooksPath .githooks` once per clone; skipped by `git commit --no-verify`; does not run for edits made on github.com or in a clone without the setting |
-| `.githooks/pre-push` (`guard --pre-push`) | Refuses a push when the complete tree of any pushed commit, not only the tip, breaks the tree rules, or an article that commit adds or modifies fails the article checks. A draft committed and later deleted, or an image folder left behind when its post is deleted, therefore still blocks the push | As for pre-commit; skipped by `git push --no-verify`; does not check hook modes (only pre-commit does) |
+| `.githooks/pre-commit` (`guard --staged`) | Refuses a commit when the complete staged tree tracks a draft or draft image (a `_drafts/` folder at any depth included, in any letter case, and a file, link or submodule named `_drafts` or `assets/drafts`), a file in a folder of this working copy that a `_drafts` or `assets/drafts` symbolic link points to, a file in a `_posts/` folder below the repository root or in a `_posts/` subfolder whose name starts with `_`, `.`, `#` or `~`, `_posts/` or `assets/blog/` spelled in another letter case or present as a file, link or submodule instead of a folder, a submodule anywhere, a misnamed or duplicate-slug file in `_posts/`, an article whose filename date is in the future or an `assets/blog/<slug>/` folder without its post (the tree rules); when an article the commit adds or changes fails the schema (which rejects a `published:` key), image or unsafe-markup checks (the article checks); or when a staged `.githooks/` file lacks mode `100755` | Needs `git config core.hooksPath .githooks` once per clone; skipped by `git commit --no-verify`; does not run for edits made on github.com or in a clone without the setting |
+| `.githooks/pre-push` (`guard --pre-push`) | Refuses a push when the complete tree of any pushed commit, not only the tip, breaks the tree rules, or an article that commit adds or modifies fails the article checks. A draft committed and later deleted, or an image folder left behind when its post is deleted, therefore still blocks the push. Only commits the destination itself advertises holding (`git ls-remote` of the URL being pushed to) are skipped; tracking refs, which can describe another repository, are not trusted. A pushed ref that points at a tree is checked like a commit's tree, and one that points at a blob is refused | As for pre-commit; skipped by `git push --no-verify`; does not check hook modes (only pre-commit does) |
 | `node scripts/verify.mjs` | Every automated check, before the push | Voluntary |
 | `blog-checks` workflow | Reports a violation after the push | Detection only: the content is already public |
+
+Both hooks also read the site configuration Pages builds with, `_config.yml` (or
+`_config.yaml` when that is the file Jekyll reads), and refuse settings that would
+keep a tracked post off the site while GitHub still shows it: `published`, `date`,
+`permalink` or `slug` in `defaults`; an `exclude` that is not a list of strings, or an
+entry in it that matches a file in `_posts/`; `limit_posts` or `collections_dir`;
+`collections` configuring `posts`; `future`, `show_drafts` or `unpublished` set to
+anything but `false` or `null`; a `timezone` other than `Etc/UTC`; and a `permalink`
+other than `/blog/:title/`. They also refuse
+a configuration they cannot read: YAML they do not understand, a file that is not
+valid UTF-8, or a symbolic link, submodule or folder in its place.
 
 **Residual risk.** Drafts stay private only while the hooks are enabled and not
 bypassed. GitHub offers no server-side push rule that could refuse draft paths for
@@ -247,7 +262,10 @@ Content-Security-Policy. `check` applies these rules to the `src` and `alt` the 
 will render, including values set by kramdown attribute lists such as `{: alt="…"}`.
 Use a single `src`: `srcset` is not supported. Write image paths with plain
 characters: character references (`&…;`), malformed percent-encoding and control
-characters are refused.
+characters are refused. The same local-folder rule applies to `poster` and
+`background`, to SVG `<image>` and `<feImage>` `href`, and to `<input type="image">`
+`src`; `<source srcset>` is refused like `srcset`, and so are CSS images (`url()`,
+`image-set()`) in `style` attributes or attribute lists.
 
 #### Code and links
 

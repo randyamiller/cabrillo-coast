@@ -526,6 +526,22 @@ function prePush(repo, localRef, remoteRef, remoteSha) {
   return run(['guard', '--pre-push'], { cwd: repo, input: `${localRef} ${localSha} ${remoteRef} ${remoteSha}\n` });
 }
 
+/**
+ * Runs `guard --pre-push` as `.githooks/pre-push` runs it: `hookArgs`, the
+ * `<remote> <url>` git passes the hook (or nothing), after `--`, and one ref
+ * line per `[localRef, localSha, remoteRef, remoteSha]` of `refLines` on
+ * standard input. Asserts that guard left the repository and every bare
+ * repository in `remotes` exactly as it found them.
+ */
+function prePushHook(repo, remotes, hookArgs, refLines) {
+  const input = refLines.map((fields) => `${fields.join(' ')}\n`).join('');
+  return unchangedBy(
+    () => ({ repo: repoSnapshot(repo), remotes: remotes.map((remote) => remoteSnapshot(remote)) }),
+    () => run(['guard', '--pre-push', '--', ...hookArgs], { cwd: repo, input }),
+    'the repository and its remotes',
+  );
+}
+
 /* State snapshots                                                           */
 
 /**
@@ -779,6 +795,31 @@ test('[AC-03][F-017] usage errors exit 2: no command, an unknown command, publis
     assert.match(result.stderr, /Usage:/, `usage block for ${JSON.stringify(args)}`);
   }
   assert.deepEqual(list(root, '.'), ['_config.yml', '_templates'], 'a usage error writes nothing');
+});
+
+test('[AC-03][F-017] guard --pre-push takes git\'s <remote> <url> as both or neither, guard --staged takes none, and any other count exits 2', GIT_CASE, () => {
+  const repo = makeRepo();
+  const refusals = [
+    [['guard', '--pre-push', 'origin'], /^error: guard --pre-push takes either no arguments or <remote> <url>, not 1 argument: origin\n/],
+    [['guard', '--pre-push', '--', 'origin'], /^error: guard --pre-push takes either no arguments or <remote> <url>, not 1 argument/],
+    [['guard', '--pre-push', 'origin', 'url', 'extra'], /^error: guard --pre-push takes either no arguments or <remote> <url>, not 3 arguments/],
+    [['guard', '--pre-push', '--', 'origin', 'url', 'extra'], /^error: guard --pre-push takes either no arguments or <remote> <url>, not 3 arguments/],
+    [['guard', '--staged', 'origin'], /^error: unexpected arguments for guard --staged: origin\n/],
+    [['guard', '--staged', '--', 'origin', 'url'], /^error: unexpected arguments for guard --staged: origin url\n/],
+  ];
+  for (const [args, error] of refusals) {
+    const result = unchangedBy(() => repoSnapshot(repo), () => run(args, { cwd: repo }), 'the repository');
+    expectExit(result, 2);
+    assert.match(result.stderr, error, `${args.join(' ')}:\n${result.out}`);
+    assert.match(result.stderr, /\nUsage: /, `${args.join(' ')}: the usage block follows`);
+    assert.equal(result.stdout, '', `${args.join(' ')} checks nothing`);
+  }
+  // After --, a remote name or URL that starts with - is an argument, never an option; nothing is pushed here.
+  for (const args of [['guard', '--pre-push', 'origin', 'url'], ['guard', '--pre-push', '--', '-remote', '--root=/nonexistent']]) {
+    const result = run(args, { cwd: repo });
+    expectExit(result, 0);
+    assert.equal(result.out, '', `${args.join(' ')}: an empty push prints nothing`);
+  }
 });
 
 /* new <slug>                                                                */
@@ -1078,6 +1119,48 @@ test('[AC-03][F-017] check rejects external, data:, alt-less and missing images 
       validArticle({ body: `Figure:\n\n![A labelled figure](${image('img-ok', 'figure.png')})` }));
     expectExit(checkRoot(root, '_drafts/img-ok.md'), 0);
   });
+});
+
+test('[AC-03][F-017] check refuses an external video poster and a CSS image in a style attribute, each on its line', () => {
+  const root = makeRoot();
+  const cover = validArticle({ body: 'Clip:\n\n<video poster="https://example.com/cover.png"></video>' });
+  const tinted = validArticle({ body: 'Block:\n\n<p style="background:url(https://example.com/bg.png)">Text</p>' });
+  write(root, '_drafts/clip-cover.md', cover);
+  write(root, '_drafts/tinted-block.md', tinted);
+  const result = checkRoot(root, '_drafts/clip-cover.md', '_drafts/tinted-block.md');
+  expectExit(result, 1);
+  const lineOf = (text, mark) => text.split('\n').findIndex((line) => line.includes(mark)) + 1;
+  assert.match(result.stderr, new RegExp(escapeRegExp(
+    `_drafts/clip-cover.md:${lineOf(cover, '<video')}: <video> poster: external images are not allowed (https://example.com/cover.png)`,
+  )));
+  assert.match(result.stderr, new RegExp(escapeRegExp(
+    `_drafts/tinted-block.md:${lineOf(tinted, '<p style')}: <p> style: CSS images (url(), image-set()) are not allowed`,
+  )));
+});
+
+test('[AC-03][F-017] check refuses an external or data: href an attribute list gives an SVG <image>, and accepts one in the own folder', () => {
+  const root = makeRoot();
+  const svg = (href) => `Figure:\n\n<svg markdown="span"><image width="40" height="40"/>{: href="${href}"}</svg>`;
+  const remote = validArticle({ body: svg('https://example.com/p.png') });
+  const inline = validArticle({ body: svg('data:image/png;base64,eA==') });
+  write(root, '_drafts/svg-remote.md', remote);
+  write(root, '_drafts/svg-inline.md', inline);
+  const result = checkRoot(root, '_drafts/svg-remote.md', '_drafts/svg-inline.md');
+  expectExit(result, 1);
+  const lineOf = (text) => text.split('\n').findIndex((line) => line.includes('<svg')) + 1;
+  assert.match(result.stderr, new RegExp(escapeRegExp(`_drafts/svg-remote.md:${lineOf(remote)}: <image> attribute list on the image: `
+    + 'external images are not allowed (https://example.com/p.png)')));
+  assert.match(result.stderr, new RegExp(escapeRegExp(`_drafts/svg-inline.md:${lineOf(inline)}: <image> attribute list on the image: `
+    + 'data: images are not allowed (data:image/png;base64,eA==)')));
+
+  write(root, 'assets/drafts/svg-local/figure.png', PNG);
+  write(root, '_drafts/svg-local.md', validArticle({ body: svg('/assets/drafts/svg-local/figure.png') }));
+  expectExit(checkRoot(root, '_drafts/svg-local.md'), 0);
+  write(root, '_drafts/svg-absent.md', validArticle({ body: svg('/assets/drafts/svg-absent/figure.png') }));
+  const absent = checkRoot(root, '_drafts/svg-absent.md');
+  expectExit(absent, 1);
+  assert.match(absent.stderr, /<image> attribute list on the image: image \/assets\/drafts\/svg-absent\/figure\.png does not exist/,
+    'the own-folder href is checked, not skipped');
 });
 
 test('[AC-03][F-017] check validates the image source kramdown renders, not a different one', async (t) => {
@@ -1748,6 +1831,55 @@ test('[AC-03][F-017] check reports a _drafts or _posts folder that is a symbolic
         'a named article is not checked for slug uniqueness against a folder that cannot be listed');
     });
   }
+});
+
+test('[AC-03][F-017] check refuses a named path that exists but is not a regular file by saying what it is, and a missing one as no such file', async (t) => {
+  /**
+   * Asserts that `check <arg>` in `root` is a usage error whose first line is
+   * `error: <arg>: <reason>`, followed by the usage block, that it reports
+   * nothing as checked and that it leaves the root as it was.
+   */
+  const refusedAsUsage = (root, arg, reason) => {
+    const result = checkRoot(root, arg);
+    expectExit(result, 2);
+    assert.ok(result.stderr.startsWith(`error: ${arg}: ${reason}\n\nUsage: node scripts/article.mjs `), result.out);
+    assert.equal(result.stdout, '', 'nothing is reported as checked');
+  };
+
+  await t.test('[AC-03][F-017] check refuses a folder', () => {
+    const root = makeRoot();
+    write(root, '_drafts/valid.md', validArticle());
+    refusedAsUsage(root, '_drafts', 'not a regular file (a directory)');
+  });
+
+  await t.test('[AC-03][F-017] check refuses a FIFO without opening it, so the run cannot stall', {
+    skip: process.platform === 'win32' ? 'Windows has no FIFOs' : false,
+  }, () => {
+    const root = makeRoot();
+    // Outside the root: checkRoot's snapshot reads every file in the root, and reading a FIFO no one writes to blocks.
+    const fifo = path.join(caseDir('fifo'), 'fifo.md');
+    spawnOk('mkfifo', [fifo]);
+    refusedAsUsage(root, fifo, 'not a regular file (a FIFO)');
+    assert.ok(fs.lstatSync(fifo).isFIFO(), 'the FIFO is left as it was');
+  });
+
+  await t.test('[AC-03][F-017] check refuses /dev/null, a character device', {
+    skip: fs.existsSync('/dev/null') ? false : 'needs /dev/null',
+  }, () => {
+    refusedAsUsage(makeRoot(), '/dev/null', 'not a regular file (a character device)');
+  });
+
+  await t.test('[AC-03][F-017] check refuses a dangling symbolic link and a symbolic-link loop', LINK_CASE, () => {
+    const root = makeRoot();
+    link(root, '_drafts/dangling.md', 'missing-target.md');
+    refusedAsUsage(root, '_drafts/dangling.md', 'not a regular file (a symbolic link that leads to no file)');
+    link(root, '_drafts/loop.md', 'loop.md');
+    refusedAsUsage(root, '_drafts/loop.md', 'not a regular file (a symbolic link that leads to no file)');
+  });
+
+  await t.test('[AC-03][F-017] check still refuses a missing path as no such file', () => {
+    refusedAsUsage(makeRoot(), '_drafts/missing.md', 'no such file');
+  });
 });
 
 test('[AC-03][F-017] the root itself may be a symbolic link, as os.tmpdir() is on macOS', LINK_CASE, () => {
@@ -2582,6 +2714,26 @@ test('[AC-03][F-017] guard --staged refuses every tracked-content and article ru
       },
     },
     {
+      name: 'a post with an external video poster',
+      offender: `_posts/${PAST}-cover.md`,
+      message: /<video> poster: external images are not allowed \(https:\/\/example\.com\/cover\.png\)/,
+      setup(repo) {
+        write(repo, `_posts/${PAST}-cover.md`, validArticle({ body: 'Clip:\n\n<video poster="https://example.com/cover.png"></video>' }));
+        git(repo, 'add', `_posts/${PAST}-cover.md`);
+      },
+    },
+    {
+      name: 'a post whose attribute list gives an SVG <image> a data: href',
+      offender: `_posts/${PAST}-svg-inline.md`,
+      message: /<image> attribute list on the image: data: images are not allowed \(data:image\/png;base64,eA==\)/,
+      setup(repo) {
+        write(repo, `_posts/${PAST}-svg-inline.md`, validArticle({
+          body: 'Figure:\n\n<svg markdown="span"><image width="40" height="40"/>{: href="data:image/png;base64,eA=="}</svg>',
+        }));
+        git(repo, 'add', `_posts/${PAST}-svg-inline.md`);
+      },
+    },
+    {
       name: 'a hook staged without mode 100755',
       offender: '.githooks/pre-commit',
       message: /100644/,
@@ -2890,6 +3042,28 @@ test('[AC-03][F-017] guard --pre-push refuses a pushed commit holding a future-d
   assert.match(result.stderr, /guard: push refused \(1 problem in 1 commit\)/, 'the date is the only problem');
 });
 
+test('[AC-03][F-017] guard --pre-push refuses a range in which one commit gives an SVG <image> an external href through an attribute list and a later one removes it', GIT_CASE, () => {
+  const { repo, remote } = makeRemoteRepo();
+  const remoteSha = git(repo, 'rev-parse', 'HEAD');
+  const postRel = `_posts/${PAST}-svg-figure.md`;
+  write(repo, postRel, validArticle({
+    body: 'Figure:\n\n<svg markdown="span"><image width="40" height="40"/>{: href="https://example.com/p.png"}</svg>',
+  }));
+  git(repo, 'add', postRel);
+  commit(repo, 'Publish with an external SVG image');
+  const leakCommit = git(repo, 'rev-parse', 'HEAD').slice(0, 7);
+  write(repo, postRel, validArticle({ body: 'Figure removed.' }));
+  git(repo, 'add', postRel);
+  commit(repo, 'Remove the external SVG image');
+
+  const result = prePushUnchanged({ repo, remote }, 'refs/heads/main', 'refs/heads/main', remoteSha);
+  expectExit(result, 1);
+  assert.match(result.stderr, new RegExp(`^error: ${leakCommit}: ${escapeRegExp(postRel)}:\\d+: <image> attribute list on `
+    + 'the image: external images are not allowed \\(https://example\\.com/p\\.png\\)$', 'm'));
+  assert.match(result.stderr, /guard: push refused \(1 problem in 1 commit\)/, 'only the commit carrying the image is refused');
+});
+
+
 test('[AC-03][F-017] guard --pre-push refuses a commit that deletes a post but leaves its image folder', GIT_CASE, async (t) => {
   const postRel = `_posts/${PAST}-gone.md`;
   /** A pushed post with an image, then a local commit that deletes only the post. */
@@ -3010,6 +3184,494 @@ test('[AC-03][F-017] guard --pre-push accepts an empty push, checking no commit,
     assert.equal(result.stdout, 'guard: ok (0 commits checked)\n');
     assert.equal(result.stderr, '');
     refusesWhenPushed(repos, featureSha, remoteSha);
+  });
+});
+
+/* guard --pre-push: what the destination already holds                     */
+
+const ZERO_SHA = '0'.repeat(40);
+
+/** Asserts that guard refused the push for the forced draft `_drafts/private.md` in `commitSha`, and for nothing else. */
+function refusesPrivateDraft(result, commitSha) {
+  expectExit(result, 1);
+  assert.match(result.stderr, new RegExp(`^error: ${commitSha.slice(0, 7)}: _drafts/private\\.md: drafts and draft images `
+    + 'must never be tracked ', 'm'));
+  assert.match(result.stderr, /guard: push refused \(1 problem in 1 commit\)\.\n$/);
+}
+
+/** Commits a forced draft `_drafts/private.md` on a new branch `branch` of `repo` and returns the commit. */
+function commitPrivateDraft(repo, branch) {
+  git(repo, 'checkout', '-q', '-b', branch);
+  write(repo, '_drafts/private.md', validArticle({ title: 'Kept off the public remote' }));
+  git(repo, 'add', '-f', '_drafts/private.md');
+  commit(repo, 'A draft for a private remote');
+  return git(repo, 'rev-parse', 'HEAD');
+}
+
+/**
+ * `makeRemoteRepo()` plus a private bare remote `backup` holding a forced
+ * draft on `feature`, pushed there with `--no-verify` and fetched back, so
+ * `refs/remotes/backup/feature` is the only ref here that holds it and
+ * `origin` has never received it.
+ *
+ * @returns {{ repo: string, remote: string, backup: string, draft: string }}
+ */
+function privateRemoteRepo() {
+  const { repo, remote } = makeRemoteRepo();
+  const backup = caseDir('backup.git');
+  git(backup, 'init', '-q', '--bare');
+  git(repo, 'remote', 'add', 'backup', backup);
+  const draft = commitPrivateDraft(repo, 'feature');
+  git(repo, 'push', '-q', '--no-verify', 'backup', 'feature');
+  git(repo, 'checkout', '-q', 'main');
+  git(repo, 'branch', '-q', '-D', 'feature');
+  git(repo, 'fetch', '-q', 'backup');
+  assert.equal(git(repo, 'rev-parse', 'refs/remotes/backup/feature'), draft, 'the fetched backup ref holds the draft');
+  const inOrigin = spawnSync('git', ['cat-file', '-e', `${draft}^{commit}`], { cwd: remote, env: ENV, encoding: 'utf8' });
+  assert.equal(inOrigin.status, 128, `origin has never received the draft:\n${inOrigin.stderr}`);
+  return { repo, remote, backup, draft };
+}
+
+test('[AC-03][F-017] guard --pre-push skips only commits the repository it pushes to advertises holding', GIT_CASE, async (t) => {
+  await t.test('[AC-03][F-017] a commit only a private remote holds, pushed to origin as a new branch, is checked and refused', GIT_CASE, () => {
+    const { repo, remote, backup, draft } = privateRemoteRepo();
+    const result = prePushHook(repo, [remote, backup], ['origin', git(repo, 'remote', 'get-url', 'origin')],
+      [['refs/remotes/backup/feature', draft, 'refs/heads/feature', ZERO_SHA]]);
+    refusesPrivateDraft(result, draft);
+  });
+
+  await t.test('[AC-03][F-017] the same commit pushed to origin as a new tag is refused', GIT_CASE, () => {
+    const { repo, remote, backup, draft } = privateRemoteRepo();
+    git(repo, 'tag', 'v1', draft);
+    const result = prePushHook(repo, [remote, backup], ['origin', git(repo, 'remote', 'get-url', 'origin')],
+      [['refs/tags/v1', draft, 'refs/tags/v1', ZERO_SHA]]);
+    refusesPrivateDraft(result, draft);
+  });
+
+  await t.test('[AC-03][F-017] pushed back to the private remote, which advertises it, the commit it already holds is skipped', GIT_CASE, () => {
+    const { repo, remote, backup, draft } = privateRemoteRepo();
+    const result = prePushHook(repo, [remote, backup], ['backup', git(repo, 'remote', 'get-url', 'backup')],
+      [['refs/remotes/backup/feature', draft, 'refs/heads/copy', ZERO_SHA]]);
+    expectExit(result, 0);
+    assert.equal(result.stdout, 'guard: ok (0 commits checked)\n');
+    assert.equal(result.stderr, '');
+  });
+
+  await t.test('[AC-03][F-017] a new branch whose commits origin advertises is accepted, checking none', GIT_CASE, () => {
+    const { repo, remote } = makeRemoteRepo();
+    git(repo, 'checkout', '-q', '-b', 'feature');
+    const result = prePushHook(repo, [remote], ['origin', git(repo, 'remote', 'get-url', 'origin')],
+      [['refs/heads/feature', git(repo, 'rev-parse', 'HEAD'), 'refs/heads/feature', ZERO_SHA]]);
+    expectExit(result, 0);
+    assert.equal(result.stdout, 'guard: ok (0 commits checked)\n');
+    assert.equal(result.stderr, '');
+  });
+
+  await t.test('[AC-03][F-017] after git remote set-url points the private remote at an empty public repository, its fetched draft is refused as a branch and as a tag', GIT_CASE, () => {
+    const { repo, remote, backup, draft } = privateRemoteRepo();
+    const published = caseDir('retarget-public.git');
+    git(published, 'init', '-q', '--bare');
+    git(repo, 'remote', 'set-url', 'backup', published);
+    assert.equal(git(repo, 'remote', 'get-url', 'backup'), published, 'backup now fetches from and pushes to the public repository');
+    assert.equal(git(repo, 'rev-parse', 'refs/remotes/backup/feature'), draft, 'set-url keeps the tracking ref of the old URL');
+    git(repo, 'tag', 'v1', draft);
+    for (const [localRef, remoteRef] of [['refs/remotes/backup/feature', 'refs/heads/feature'], ['refs/tags/v1', 'refs/tags/v1']]) {
+      const result = prePushHook(repo, [remote, backup, published], ['backup', published], [[localRef, draft, remoteRef, ZERO_SHA]]);
+      refusesPrivateDraft(result, draft);
+    }
+  });
+
+  await t.test('[AC-03][F-017] an insteadOf rule that would send the query for the destination to the private remote proves nothing', GIT_CASE, () => {
+    const { repo, remote, backup, draft } = privateRemoteRepo();
+    const published = caseDir('rewritten-public.git');
+    git(published, 'init', '-q', '--bare');
+    git(repo, 'config', `url.${backup}.insteadOf`, published);
+    assert.equal(git(repo, 'ls-remote', '--get-url', '--', published), backup, 'a query for the public URL reaches the private remote');
+    const result = prePushHook(repo, [remote, backup, published], ['public', published],
+      [['refs/remotes/backup/feature', draft, 'refs/heads/feature', ZERO_SHA]]);
+    refusesPrivateDraft(result, draft);
+  });
+
+  await t.test('[AC-03][F-017] a commit origin holds is skipped for any push to its URL, and checked when git pushes elsewhere, to an unreachable URL or without arguments', GIT_CASE, () => {
+    const { repo, remote } = makeRemoteRepo();
+    const held = commitPrivateDraft(repo, 'held');
+    git(repo, 'push', '-q', '--no-verify', 'origin', 'held');
+    git(repo, 'checkout', '-q', 'main');
+    git(repo, 'branch', '-q', '-D', 'held');
+    const fetchUrl = git(repo, 'remote', 'get-url', 'origin');
+    const pushUrl = caseDir('push-url.git');
+    git(pushUrl, 'init', '-q', '--bare');
+    git(repo, 'config', 'remote.origin.pushurl', pushUrl);
+    assert.equal(git(repo, 'remote', 'get-url', '--push', 'origin'), pushUrl, 'git pushes origin to its push URL');
+    const unreachable = path.join(caseDir('unreachable'), 'absent.git');
+    const refLines = [['refs/remotes/origin/held', held, 'refs/heads/copy', ZERO_SHA]];
+
+    for (const hookArgs of [['origin', fetchUrl], [fetchUrl, fetchUrl], ['nosuch', fetchUrl]]) {
+      const proven = prePushHook(repo, [remote, pushUrl], hookArgs, refLines);
+      expectExit(proven, 0);
+      assert.equal(proven.stdout, 'guard: ok (0 commits checked)\n', `${JSON.stringify(hookArgs)}: the URL advertises the held commit`);
+    }
+    for (const hookArgs of [['origin', pushUrl], ['origin', unreachable], []]) {
+      const result = prePushHook(repo, [remote, pushUrl], hookArgs, refLines);
+      refusesPrivateDraft(result, held);
+    }
+  });
+
+  await t.test('[AC-03][F-017] a tracking ref inside origin\'s own folder proves nothing origin does not advertise', GIT_CASE, () => {
+    const { repo, remote } = makeRemoteRepo();
+    const mirror = caseDir('mirror.git');
+    git(mirror, 'init', '-q', '--bare');
+    // A remote named origin/mirror fetches into refs/remotes/origin/mirror/, inside origin's folder.
+    git(repo, 'config', 'remote.origin/mirror.url', mirror);
+    git(repo, 'config', 'remote.origin/mirror.fetch', '+refs/heads/*:refs/remotes/origin/mirror/*');
+    const draft = commitPrivateDraft(repo, 'feature');
+    git(repo, 'push', '-q', '--no-verify', mirror, 'feature');
+    git(repo, 'checkout', '-q', 'main');
+    git(repo, 'branch', '-q', '-D', 'feature');
+    git(repo, 'fetch', '-q', 'origin/mirror');
+    assert.equal(git(repo, 'rev-parse', 'refs/remotes/origin/mirror/feature'), draft);
+
+    const result = prePushHook(repo, [remote, mirror], ['origin', git(repo, 'remote', 'get-url', 'origin')],
+      [['refs/remotes/origin/mirror/feature', draft, 'refs/heads/feature', ZERO_SHA]]);
+    refusesPrivateDraft(result, draft);
+  });
+
+  await t.test('[AC-03][F-017] an advertised annotated tag proves the commit it tags; advertised trees, blobs and unknown commits prove nothing', GIT_CASE, () => {
+    const { repo, remote } = makeRemoteRepo();
+    const held = commitPrivateDraft(repo, 'held');
+    git(repo, 'tag', '-a', '-m', 'Held', 'v-held', held);
+    const tree = git(repo, 'rev-parse', 'HEAD^{tree}');
+    const blob = git(repo, 'rev-parse', 'HEAD:_drafts/private.md');
+    git(repo, 'tag', 't-tree', tree);
+    git(repo, 'tag', 't-blob', blob);
+    git(repo, 'push', '-q', '--no-verify', 'origin', 'v-held', 't-tree', 't-blob');
+    const foreign = path.join(caseDir('foreign'), 'clone');
+    git(PARENT, 'clone', '-q', remote, foreign);
+    write(foreign, 'foreign.txt', 'A commit this clone never fetches.\n');
+    git(foreign, 'add', 'foreign.txt');
+    commit(foreign, 'Elsewhere');
+    git(foreign, 'push', '-q', '--no-verify', 'origin', 'HEAD:refs/heads/foreign');
+    git(repo, 'checkout', '-q', 'main');
+    git(repo, 'branch', '-q', '-D', 'held');
+    const fetchUrl = git(repo, 'remote', 'get-url', 'origin');
+    assert.equal(git(remote, 'for-each-ref', '--format=%(refname)', 'refs/heads/'), 'refs/heads/foreign\nrefs/heads/main',
+      'origin holds the draft commit only through the annotated tag');
+
+    const proven = prePushHook(repo, [remote], ['origin', fetchUrl], [['refs/tags/v-held', held, 'refs/heads/copy', ZERO_SHA]]);
+    expectExit(proven, 0);
+    assert.equal(proven.stdout, 'guard: ok (0 commits checked)\n');
+    assert.equal(proven.stderr, '');
+
+    git(repo, 'checkout', '-q', '-b', 'next', held);
+    write(repo, 'notes.txt', 'Built on the held commit.\n');
+    git(repo, 'add', 'notes.txt');
+    commit(repo, 'On top of the held commit');
+    const next = git(repo, 'rev-parse', 'HEAD');
+    const result = prePushHook(repo, [remote], ['origin', fetchUrl], [['refs/heads/next', next, 'refs/heads/next', ZERO_SHA]]);
+    refusesPrivateDraft(result, next);
+  });
+});
+
+/* guard --pre-push: refs that point at tags, trees and blobs                */
+
+/**
+ * `makeRemoteRepo()` plus the tree and the blob of a forced draft
+ * `_drafts/x.md`, stored as `git write-tree` and `git hash-object -w` store
+ * them and then unstaged, so no commit holds them.
+ *
+ * @returns {{ repo: string, remote: string, tree: string, blob: string }}
+ */
+function draftObjectsRepo() {
+  const { repo, remote } = makeRemoteRepo();
+  write(repo, '_drafts/x.md', validArticle({ title: 'Not for publication' }));
+  git(repo, 'add', '-f', '_drafts/x.md');
+  const tree = git(repo, 'write-tree');
+  git(repo, 'reset', '-q');
+  const blob = git(repo, 'hash-object', '-w', '_drafts/x.md');
+  return { repo, remote, tree, blob };
+}
+
+/** Runs guard as the hook does for a push of `refLines` to `origin` at its fetch URL. */
+function prePushToOrigin({ repo, remote }, refLines) {
+  return prePushHook(repo, [remote], ['origin', git(repo, 'remote', 'get-url', 'origin')], refLines);
+}
+
+test('[AC-03][F-017] guard --pre-push peels pushed tags, checks a pushed tree as a commit\'s tree and refuses a pushed blob', GIT_CASE, async (t) => {
+  await t.test('[AC-03][F-017] a tag pointing at a tree that holds a forced draft is refused, naming the tree', GIT_CASE, () => {
+    const repos = draftObjectsRepo();
+    git(repos.repo, 'tag', 't-tree', repos.tree);
+    const result = prePushToOrigin(repos, [['refs/tags/t-tree', repos.tree, 'refs/tags/t-tree', ZERO_SHA]]);
+    expectExit(result, 1);
+    assert.match(result.stderr, new RegExp(`^error: ${repos.tree.slice(0, 7)}: _drafts/x\\.md: drafts and draft images `
+      + 'must never be tracked ', 'm'));
+    assert.match(result.stderr, /guard: push refused \(1 problem in 1 tree\)\.\n$/);
+  });
+
+  await t.test('[AC-03][F-017] a tag pointing at a blob, or an annotated tag of it, is refused, naming the ref', GIT_CASE, () => {
+    const repos = draftObjectsRepo();
+    git(repos.repo, 'tag', 't-blob', repos.blob);
+    git(repos.repo, 'tag', '-a', '-m', 'A tag of a blob', 't-ann-blob', repos.blob);
+    const tagObject = git(repos.repo, 'rev-parse', 'refs/tags/t-ann-blob');
+    assert.equal(git(repos.repo, 'cat-file', '-t', tagObject), 'tag');
+    const blobRefusal = (ref) => new RegExp(`^error: ${repos.blob.slice(0, 7)}: ${escapeRegExp(ref)} points at a blob, `
+      + 'which has no path, so guard cannot check it against the content rules; ', 'm');
+
+    for (const [ref, sha] of [['refs/tags/t-blob', repos.blob], ['refs/tags/t-ann-blob', tagObject]]) {
+      const result = prePushToOrigin(repos, [[ref, sha, ref, ZERO_SHA]]);
+      expectExit(result, 1);
+      assert.match(result.stderr, blobRefusal(ref));
+      assert.match(result.stderr, /guard: push refused \(1 problem in 1 blob\)\.\n$/);
+    }
+  });
+
+  await t.test('[AC-03][F-017] an annotated tag of a commit is checked as that commit', GIT_CASE, () => {
+    const { repo, remote } = makeRemoteRepo();
+    const draft = commitPrivateDraft(repo, 'drafted');
+    git(repo, 'tag', '-a', '-m', 'A tag of a draft commit', 'v-draft', draft);
+    git(repo, 'checkout', '-q', 'main');
+    git(repo, 'checkout', '-q', '-b', 'shipped');
+    const postRel = `_posts/${PAST}-tagged.md`;
+    write(repo, postRel, validArticle({ title: 'Tagged article' }));
+    git(repo, 'add', postRel);
+    commit(repo, 'Publish: Tagged article');
+    git(repo, 'tag', '-a', '-m', 'A tag of a valid commit', 'v-ok');
+    git(repo, 'checkout', '-q', 'main');
+    const tagOf = (name) => git(repo, 'rev-parse', `refs/tags/${name}`);
+
+    refusesPrivateDraft(prePushToOrigin({ repo, remote }, [['refs/tags/v-draft', tagOf('v-draft'), 'refs/tags/v-draft', ZERO_SHA]]), draft);
+    const accepted = prePushToOrigin({ repo, remote }, [['refs/tags/v-ok', tagOf('v-ok'), 'refs/tags/v-ok', ZERO_SHA]]);
+    expectExit(accepted, 0);
+    assert.equal(accepted.stdout, 'guard: ok (1 commit checked)\n', 'only the tagged commit origin lacks is checked');
+  });
+
+  await t.test('[AC-03][F-017] a tree of valid content is accepted and named in the summary, with any commit pushed beside it', GIT_CASE, () => {
+    const { repo, remote } = makeRemoteRepo();
+    const postRel = `_posts/${PAST}-tree.md`;
+    write(repo, postRel, validArticle({ title: 'An article in a pushed tree' }));
+    git(repo, 'add', postRel);
+    const tree = git(repo, 'write-tree');
+    git(repo, 'tag', 't-clean', tree);
+    commit(repo, 'Publish: An article in a pushed tree');
+    const tip = git(repo, 'rev-parse', 'HEAD');
+    const treeLine = ['refs/tags/t-clean', tree, 'refs/tags/t-clean', ZERO_SHA];
+
+    const alone = prePushToOrigin({ repo, remote }, [treeLine]);
+    expectExit(alone, 0);
+    assert.equal(alone.stdout, 'guard: ok (1 tree checked)\n');
+    const both = prePushToOrigin({ repo, remote }, [['refs/heads/main', tip, 'refs/heads/main', git(repo, 'rev-parse', 'HEAD~1')], treeLine]);
+    expectExit(both, 0);
+    assert.equal(both.stdout, 'guard: ok (1 commit and 1 tree checked)\n');
+  });
+
+  await t.test('[AC-03][F-017] every article in a pushed tree gets the article checks', GIT_CASE, () => {
+    const { repo, remote } = makeRemoteRepo();
+    const postRel = `_posts/${PAST}-keyed.md`;
+    write(repo, postRel, validArticle({ extra: 'published: true' }));
+    git(repo, 'add', postRel);
+    const tree = git(repo, 'write-tree');
+    git(repo, 'reset', '-q');
+    const result = prePushToOrigin({ repo, remote }, [['refs/tags/t-keyed', tree, 'refs/tags/t-keyed', ZERO_SHA]]);
+    expectExit(result, 1);
+    assert.match(result.stderr, new RegExp(`^error: ${tree.slice(0, 7)}: ${escapeRegExp(postRel)}: .*published: is not allowed`, 'm'));
+    assert.match(result.stderr, /guard: push refused \(1 problem in 1 tree\)\.\n$/);
+  });
+
+  await t.test('[AC-03][F-017] a pushed object this clone does not have fails closed', GIT_CASE, () => {
+    const repos = makeRemoteRepo();
+    const missing = '1'.repeat(40);
+    const result = prePushToOrigin(repos, [['refs/tags/gone', missing, 'refs/tags/gone', ZERO_SHA]]);
+    expectExit(result, 1);
+    assert.match(result.stderr, new RegExp(`^error: refs/tags/gone ${missing} is not an object in this clone, so it cannot be checked$`, 'm'));
+    assert.match(result.stderr, /fail closed/);
+  });
+});
+
+/* guard and the site configuration                                          */
+
+/**
+ * A site configuration for the guard cases holding the real `_config.yml`'s
+ * settings that the site-configuration rules read, each harmless, and ending
+ * inside its `defaults` list so a case can append an item.
+ */
+const GUARD_SITE_CONFIG = [
+  'timezone: Etc/UTC',
+  'permalink: /blog/:title/',
+  'future: false',
+  'exclude:',
+  '  - README.md',
+  '  - assets/drafts',
+  'defaults:',
+  '  - scope:',
+  '      path: ""',
+  '      type: posts',
+  '    values:',
+  '      layout: post',
+  '',
+].join('\n');
+
+/** `GUARD_SITE_CONFIG` plus a `defaults` item scoped to `postRel` whose values are `lines`, as the QA reproduction appended. */
+function scopedDefault(postRel, ...lines) {
+  return `${GUARD_SITE_CONFIG}  - scope:\n      path: "${postRel}"\n    values:\n${lines.map((line) => `      ${line}\n`).join('')}`;
+}
+
+/** The line of `text`, from 1, holding `needle`. */
+function configLine(text, needle) {
+  return text.split('\n').findIndex((line) => line.includes(needle)) + 1;
+}
+
+/** A repository with a valid post at `postRel` and the configuration `config` at `configRel`, both staged. */
+function stagedWithConfig(postRel, configRel, config) {
+  const repo = makeRepo();
+  write(repo, configRel, config);
+  write(repo, postRel, validArticle({ title: 'Held article' }));
+  git(repo, 'add', configRel, postRel);
+  return repo;
+}
+
+test('[AC-03][F-017] guard --staged refuses a site configuration that keeps a staged post off the site, and accepts a harmless one', GIT_CASE, async (t) => {
+  const postRel = `_posts/${PAST}-held.md`;
+  const excluding = GUARD_SITE_CONFIG.replace('  - assets/drafts\n', `  - assets/drafts\n  - ${postRel}\n`);
+  const limited = `${GUARD_SITE_CONFIG}limit_posts: 1\n`;
+  const cases = [
+    {
+      name: 'a published: false default',
+      config: scopedDefault(postRel, 'published: false'),
+      message: (config) => `_config.yml: line ${configLine(config, 'published:')}: defaults set published for the posts in `
+        + 'their scope: published: false keeps them off the site while GitHub still shows them; remove published from '
+        + 'the defaults values',
+    },
+    {
+      name: 'a future date default',
+      config: scopedDefault(postRel, 'date: "2099-01-01 00:00:00 +0000"'),
+      message: (config) => `_config.yml: line ${configLine(config, 'date:')}: defaults set date for the posts in their `
+        + 'scope: it replaces their filename dates, and one after the build keeps them off the site as future posts '
+        + 'while GitHub still shows them; remove date from the defaults values',
+    },
+    {
+      name: 'limit_posts: 1',
+      config: limited,
+      message: (config) => `_config.yml: line ${configLine(config, 'limit_posts')}: limit_posts must not be set; Jekyll then `
+        + 'builds only the newest posts and leaves the rest off the site while GitHub still shows them; remove it',
+    },
+    {
+      name: 'an exclude entry naming the post',
+      config: excluding,
+      message: (config) => `_config.yml: line ${configLine(config, 'exclude:')}: exclude entry ${JSON.stringify(postRel)} `
+        + `keeps ${postRel} off the site while GitHub still shows it; remove the entry or narrow it so it matches no `
+        + 'file in _posts/',
+    },
+  ];
+  for (const { name, config, message } of cases) {
+    await t.test(`[AC-03][F-017] guard --staged refuses a valid post staged with a _config.yml holding ${name}`, GIT_CASE, () => {
+      const result = guardStagedUnchanged(stagedWithConfig(postRel, '_config.yml', config));
+      expectExit(result, 1);
+      assert.deepEqual(result.stderr.split('\n').filter((line) => line.startsWith('error: ')), [`error: ${message(config)}`],
+        `stderr:\n${result.stderr}`);
+      assert.match(result.stderr, /guard: commit refused \(1 problem\)/);
+    });
+  }
+
+  await t.test('[AC-03][F-017] guard --staged refuses a _config.yml that is a symbolic link', { ...GIT_CASE, ...LINK_CASE }, () => {
+    const repo = stagedWithConfig(postRel, 'site.yml', GUARD_SITE_CONFIG);
+    fs.symlinkSync('site.yml', abs(repo, '_config.yml'));
+    git(repo, 'add', '_config.yml');
+    assert.equal(indexMode(repo, '_config.yml'), '120000', 'staged as a symbolic link');
+    const result = guardStagedUnchanged(repo);
+    expectExit(result, 1);
+    assert.match(result.stderr, /^error: _config\.yml: Jekyll reads the site configuration from this path, and guard can check it only as a regular file, not a symbolic link; /m);
+  });
+
+  await t.test('[AC-03][F-017] guard --staged refuses a folder named _config.yml, which makes Jekyll read no configuration', GIT_CASE, () => {
+    const repo = stagedWithConfig(postRel, '_config.yaml', GUARD_SITE_CONFIG);
+    write(repo, '_config.yml/site.yml', GUARD_SITE_CONFIG);
+    git(repo, 'add', '_config.yml/site.yml');
+    const result = guardStagedUnchanged(repo);
+    expectExit(result, 1);
+    assert.deepEqual(result.stderr.split('\n').filter((line) => line.startsWith('error: ')), ['error: _config.yml: Jekyll '
+      + 'reads the site configuration from this path, and guard can check it only as a regular file, not a folder; '
+      + 'track the configuration itself here'], `stderr:\n${result.stderr}`);
+  });
+
+  await t.test('[AC-03][F-017] guard --staged refuses a hiding _config.yaml, the file Jekyll reads when _config.yml is absent', GIT_CASE, () => {
+    const result = guardStagedUnchanged(stagedWithConfig(postRel, '_config.yaml', limited));
+    expectExit(result, 1);
+    assert.match(result.stderr, new RegExp(`^error: _config\\.yaml: line ${configLine(limited, 'limit_posts')}: limit_posts must not be set; `, 'm'));
+  });
+
+  await t.test('[AC-03][F-017] guard --staged accepts a valid post staged with a harmless author default', GIT_CASE, () => {
+    const result = guardStagedUnchanged(stagedWithConfig(postRel, '_config.yml', scopedDefault(postRel, 'author: "Someone Else"')));
+    expectExit(result, 0);
+    assert.equal(result.stdout, 'guard: staged tree ok (1 changed article checked)\n');
+    assert.equal(result.stderr, '');
+  });
+});
+
+test('[AC-03][F-017] guard --pre-push refuses a range in which one commit adds a post with a hiding _config.yml and a later one deletes both', GIT_CASE, () => {
+  const { repo, remote } = makeRemoteRepo();
+  const remoteSha = git(repo, 'rev-parse', 'HEAD');
+  const postRel = `_posts/${PAST}-held.md`;
+  const config = scopedDefault(postRel, 'published: false');
+  write(repo, '_config.yml', config);
+  write(repo, postRel, validArticle({ title: 'Held article' }));
+  git(repo, 'add', '_config.yml', postRel);
+  commit(repo, 'Add a post the configuration hides');
+  const hidingCommit = git(repo, 'rev-parse', 'HEAD').slice(0, 7);
+  git(repo, 'rm', '-q', '_config.yml', postRel);
+  commit(repo, 'Remove both again');
+  assert.equal(git(repo, 'ls-tree', '-r', '--name-only', 'HEAD').includes('_config.yml'), false,
+    'the tip itself holds no configuration, so only a check of every commit catches it');
+
+  const result = prePushUnchanged({ repo, remote }, 'refs/heads/main', 'refs/heads/main', remoteSha);
+  expectExit(result, 1);
+  assert.match(result.stderr, new RegExp(`^error: ${hidingCommit}: _config\\.yml: line ${configLine(config, 'published:')}: `
+    + 'defaults set published for the posts in their scope: published: false keeps them off the site ', 'm'));
+  assert.match(result.stderr, /guard: push refused \(1 problem in 1 commit\)/);
+});
+
+test('[AC-03][F-017] guard --pre-push accepts a valid post pushed with a harmless _config.yml', GIT_CASE, () => {
+  const { repo } = makeRemoteRepo();
+  const remoteSha = git(repo, 'rev-parse', 'HEAD');
+  const postRel = `_posts/${PAST}-shipped.md`;
+  write(repo, '_config.yml', scopedDefault(postRel, 'author: "Someone Else"'));
+  write(repo, postRel, validArticle({ title: 'Shipped article' }));
+  git(repo, 'add', '_config.yml', postRel);
+  commit(repo, 'Publish: Shipped article');
+
+  const result = prePush(repo, 'refs/heads/main', 'refs/heads/main', remoteSha);
+  expectExit(result, 0);
+  assert.equal(result.stdout, 'guard: ok (1 commit checked)\n');
+  assert.equal(result.stderr, '');
+});
+
+/* guard --pre-push: a pushed tree gets every rule a commit's tree gets      */
+
+test('[AC-03][F-017] guard --pre-push applies the site-configuration and submodule rules to a pushed tree as to a commit\'s tree', GIT_CASE, async (t) => {
+  await t.test('[AC-03][F-017] a tree whose configuration keeps one of its posts off the site is refused, naming the tree', GIT_CASE, () => {
+    const { repo, remote } = makeRemoteRepo();
+    const postRel = `_posts/${PAST}-held.md`;
+    const config = scopedDefault(postRel, 'published: false');
+    write(repo, '_config.yml', config);
+    write(repo, postRel, validArticle({ title: 'Held article' }));
+    git(repo, 'add', '_config.yml', postRel);
+    const tree = git(repo, 'write-tree');
+    git(repo, 'reset', '-q');
+    const result = prePushToOrigin({ repo, remote }, [['refs/tags/t-held', tree, 'refs/tags/t-held', ZERO_SHA]]);
+    expectExit(result, 1);
+    assert.match(result.stderr, new RegExp(`^error: ${tree.slice(0, 7)}: _config\\.yml: line `
+      + `${configLine(config, 'published:')}: defaults set published for the posts in their scope: `, 'm'));
+    assert.match(result.stderr, /guard: push refused \(1 problem in 1 tree\)\.\n$/);
+  });
+
+  await t.test('[AC-03][F-017] a tree holding a submodule is refused, naming the tree', GIT_CASE, () => {
+    const { repo, remote } = makeRemoteRepo();
+    const head = git(repo, 'rev-parse', 'HEAD');
+    git(repo, 'update-index', '--add', '--cacheinfo', `160000,${head},notes`);
+    const tree = git(repo, 'write-tree');
+    git(repo, 'reset', '-q');
+    const result = prePushToOrigin({ repo, remote }, [['refs/tags/t-subm', tree, 'refs/tags/t-subm', ZERO_SHA]]);
+    expectExit(result, 1);
+    assert.match(result.stderr, new RegExp(`^error: ${tree.slice(0, 7)}: notes: submodules are not allowed; `, 'm'));
+    assert.match(result.stderr, /guard: push refused \(1 problem in 1 tree\)\.\n$/);
   });
 });
 
@@ -3247,6 +3909,233 @@ test('[AC-03][F-017] guard checks an article path that changes type and refuses 
     commit(repo, 'Link the notes');
     expectExit(prePushUnchanged({ repo, remote }, 'refs/heads/main', 'refs/heads/main', remoteSha), 0);
   });
+});
+
+/** guard's refusal of `rel` as a tracked draft or draft image. */
+function draftError(rel) {
+  return `${rel}: drafts and draft images must never be tracked (git rm --cached; they belong only in your working copy)`;
+}
+
+/** guard's refusal of `rel`, whose leading folder `folder` spells `canonical` (`_posts` or `assets/blog`) in another letter case. */
+function caseVariantError(rel, folder, canonical) {
+  return `${rel}: folder ${folder}/ must be named exactly ${canonical}/; a case-insensitive file system such as macOS's `
+    + 'treats them as one folder, but the Pages build and these checks do not';
+}
+
+/** guard's refusal of an entry at exactly `rel` (`_posts` or `assets/blog`), which must be a real folder. */
+function realFolderError(rel) {
+  return `${rel}: must be a real folder; a file, symbolic link or submodule here supplies content the checks never read`;
+}
+
+/** guard's refusal of `rel`, a path in a `_posts` folder below the repository root. */
+function nestedPostsError(rel) {
+  return `${rel}: articles belong only in the root _posts/ folder; Jekyll can read a nested _posts/ folder as posts, `
+    + 'but the article checks cover only the root one';
+}
+
+/**
+ * Runs each case's `stage(repo)` in a new repository and asserts that guard
+ * refuses it with exactly the errors `expect` lists, in order: from the index
+ * with `guard --staged`, and once committed with `guard --pre-push`. Both
+ * runs must leave the repository (and the remote) exactly as they were.
+ */
+async function assertGuardRefusesInBothModes(t, cases) {
+  for (const { name, stage, expect } of cases) {
+    await t.test(`[AC-03][F-017] guard --staged refuses ${name}`, GIT_CASE, () => {
+      const repo = makeRepo();
+      stage(repo);
+      const result = guardStagedUnchanged(repo);
+      expectExit(result, 1);
+      assert.deepEqual(guardErrors(result), expect, `stderr:\n${result.stderr}`);
+    });
+
+    await t.test(`[AC-03][F-017] guard --pre-push refuses ${name}`, GIT_CASE, () => {
+      const { repo, remote } = makeRemoteRepo();
+      const remoteSha = git(repo, 'rev-parse', 'HEAD');
+      stage(repo);
+      commit(repo, 'Change');
+      const result = prePushUnchanged({ repo, remote }, 'refs/heads/main', 'refs/heads/main', remoteSha);
+      expectExit(result, 1);
+      assert.deepEqual(guardErrors(result, git(repo, 'rev-parse', 'HEAD').slice(0, 7)), expect, `stderr:\n${result.stderr}`);
+    });
+  }
+}
+
+test('[AC-03][F-017] guard refuses drafts and post folders in another letter case, and entries at the reserved folder paths', GIT_CASE, async (t) => {
+  /** Writes `rel` and stages it with `git add -f`, past any ignore pattern. */
+  const forceAdd = (rel, content) => (repo) => {
+    write(repo, rel, content);
+    git(repo, 'add', '-f', '--', rel);
+  };
+  await assertGuardRefusesInBothModes(t, [
+    {
+      name: 'a draft in _Drafts/ added with git add -f',
+      stage: forceAdd('_Drafts/my-post.md', validArticle()),
+      expect: [draftError('_Drafts/my-post.md')],
+    },
+    {
+      name: 'a draft image in assets/Drafts/ added with git add -f',
+      stage: forceAdd('assets/Drafts/my-post/fig.png', PNG),
+      expect: [draftError('assets/Drafts/my-post/fig.png')],
+    },
+    {
+      name: 'a draft in a nested blog/_DRAFTS/ folder',
+      stage: forceAdd('blog/_DRAFTS/x.md', validArticle()),
+      expect: [draftError('blog/_DRAFTS/x.md')],
+    },
+    {
+      name: 'a future-dated post in _Posts/',
+      stage: forceAdd('_Posts/2099-01-01-x.md', validArticle()),
+      expect: [caseVariantError('_Posts/2099-01-01-x.md', '_Posts', '_posts')],
+    },
+    {
+      name: 'an image in assets/Blog/ without its post',
+      stage: forceAdd('assets/Blog/ghost/fig.png', PNG),
+      expect: [caseVariantError('assets/Blog/ghost/fig.png', 'assets/Blog', 'assets/blog')],
+    },
+    {
+      name: 'a symbolic link at _drafts',
+      stage: (repo) => stageSymlink(repo, '_drafts', '_hold'),
+      expect: [draftError('_drafts')],
+    },
+    {
+      name: 'a symbolic link at assets/drafts naming a local folder',
+      stage: (repo) => stageSymlink(repo, 'assets/drafts', '/home/author/Dropbox/blog-drafts/img'),
+      expect: [draftError('assets/drafts')],
+    },
+    {
+      name: 'a symbolic link at _posts',
+      stage: (repo) => stageSymlink(repo, '_posts', '_hold'),
+      expect: [realFolderError('_posts')],
+    },
+    {
+      name: 'a symbolic link at assets/blog',
+      stage: (repo) => stageSymlink(repo, 'assets/blog', '../elsewhere'),
+      expect: [realFolderError('assets/blog')],
+    },
+  ]);
+});
+
+/** guard's refusal of a submodule (gitlink) at `rel`, refused wherever it sits. */
+function submoduleError(rel) {
+  return `${rel}: submodules are not allowed; GitHub Pages builds a submodule's files into the site, where they would `
+    + 'skip every check';
+}
+
+test('[AC-03][F-017] guard refuses a submodule anywhere, also by the folder rule of its path', GIT_CASE, async (t) => {
+  await assertGuardRefusesInBothModes(t, [
+    { name: 'a submodule at _posts', stage: (repo) => stageGitlink(repo, '_posts'), expect: [submoduleError('_posts'), realFolderError('_posts')] },
+    {
+      name: 'a submodule at a nested blog/_posts',
+      stage: (repo) => stageGitlink(repo, 'blog/_posts'),
+      expect: [submoduleError('blog/_posts'), nestedPostsError('blog/_posts')],
+    },
+    { name: 'a submodule at _drafts', stage: (repo) => stageGitlink(repo, '_drafts'), expect: [submoduleError('_drafts'), draftError('_drafts')] },
+    {
+      name: 'a submodule at assets/blog',
+      stage: (repo) => stageGitlink(repo, 'assets/blog'),
+      expect: [submoduleError('assets/blog'), realFolderError('assets/blog')],
+    },
+    { name: 'a submodule at notes, outside every content folder', stage: (repo) => stageGitlink(repo, 'notes'), expect: [submoduleError('notes')] },
+  ]);
+});
+
+/** The repository's own `.gitignore`, which ignores a `_drafts` or `assets/drafts` link rather than staging it. */
+const REPO_GITIGNORE = fs.readFileSync(path.join(ROOT, '.gitignore'));
+
+/** guard's refusal of `rel`, a file in `target/`, the folder the link `linkRel` makes a folder of `kind`. */
+function linkedDraftError(rel, linkRel, target, kind = 'drafts') {
+  return `${rel}: drafts and draft images must never be tracked; ${linkRel} is a symbolic link to ${target}/, so the `
+    + `files there are ${kind} (git rm --cached, or replace ${linkRel} with a real, git-ignored folder)`;
+}
+
+test('[AC-03][F-017] guard refuses the files of a repository folder that a _drafts or assets/drafts link turns into drafts', { ...GIT_CASE, ...LINK_CASE }, async (t) => {
+  /**
+   * Writes `files`, creates each link of `links` as [link, target], and
+   * stages everything with the repository's `.gitignore` and `git add -A`,
+   * as an author would: the ignored link stays out, its target's files go in.
+   */
+  const addAll = (files, links) => (repo) => {
+    write(repo, '.gitignore', REPO_GITIGNORE);
+    for (const [rel, content] of Object.entries(files)) write(repo, rel, content);
+    for (const [rel, target] of links) link(repo, rel, target);
+    git(repo, 'add', '-A');
+    for (const [rel] of links) assert.equal(git(repo, 'ls-files', '--', rel), '', `${rel} is git-ignored, not staged`);
+  };
+  const draft = validArticle({ title: 'Not for publication yet' });
+  await assertGuardRefusesInBothModes(t, [
+    {
+      name: 'a draft in _hold/ while _drafts links to _hold',
+      stage: addAll({ '_hold/my-post.md': draft }, [['_drafts', '_hold']]),
+      expect: [linkedDraftError('_hold/my-post.md', '_drafts', '_hold')],
+    },
+    {
+      name: 'a draft in _hold/ while a nested blog/_drafts links to ../_hold',
+      stage: addAll({ 'blog/index.html': '<p>Blog</p>\n', '_hold/my-post.md': draft }, [['blog/_drafts', '../_hold']]),
+      expect: [linkedDraftError('_hold/my-post.md', 'blog/_drafts', '_hold')],
+    },
+    {
+      name: 'a draft in Hold/ while _Drafts, in another letter case, links to Hold',
+      stage: addAll({ 'Hold/notes/my-post.md': draft }, [['_Drafts', 'Hold']]),
+      expect: [linkedDraftError('Hold/notes/my-post.md', '_Drafts', 'Hold')],
+    },
+    {
+      name: 'a draft image in imgs/ while assets/drafts links to ../imgs',
+      stage: addAll({ 'assets/hero.png': PNG, 'imgs/my-post/fig.png': PNG }, [['assets/drafts', '../imgs']]),
+      expect: [linkedDraftError('imgs/my-post/fig.png', 'assets/drafts', 'imgs', 'draft images')],
+    },
+    {
+      name: 'any commit while _drafts links to the top folder itself, refused once by the link',
+      stage: addAll({ [`_posts/${PAST}-fine.md`]: validArticle() }, [['_drafts', '.']]),
+      expect: ["_drafts: a symbolic link to the repository's top folder makes every file in it one of your drafts, "
+        + 'which must never be tracked; replace _drafts with a real, git-ignored folder'],
+    },
+  ]);
+
+  const outside = caseDir('outside-drafts');
+  write(outside, 'private.md', draft);
+  const accepted = [
+    { name: 'a _drafts link to a folder outside the repository', links: [['_drafts', outside]] },
+    { name: 'a dangling _drafts link', links: [['_drafts', '_missing']] },
+    { name: 'an assets/drafts link to a folder outside the repository', links: [['assets/drafts', outside]] },
+  ];
+  for (const { name, links } of accepted) {
+    await t.test(`[AC-03][F-017] guard --staged and --pre-push accept a valid post beside ${name}`, GIT_CASE, () => {
+      const { repo, remote } = makeRemoteRepo();
+      const remoteSha = git(repo, 'rev-parse', 'HEAD');
+      addAll({ [`_posts/${PAST}-fine.md`]: validArticle() }, links)(repo);
+      expectExit(guardStagedUnchanged(repo), 0);
+      commit(repo, 'Publish: fine');
+      expectExit(prePushUnchanged({ repo, remote }, 'refs/heads/main', 'refs/heads/main', remoteSha), 0);
+    });
+  }
+
+  // Listing a folder for links fails: EACCES must refuse (fail closed); ENOENT, a folder gone from disk, is skipped.
+  const folder = `${path.sep}notes-q7`;
+  for (const [code, status] of [['EACCES', 1], ['ENOENT', 0]]) {
+    await t.test(`[AC-03][F-017] guard --staged and --pre-push exit ${status} when listing a checked folder for links fails with ${code}`, GIT_CASE, () => {
+      const { repo, remote } = makeRemoteRepo();
+      const remoteSha = git(repo, 'rev-parse', 'HEAD');
+      write(repo, 'notes-q7/readme.md', 'Notes.\n');
+      git(repo, 'add', 'notes-q7/readme.md');
+      const faults = JSON.stringify([{ fn: 'readdirSync', path: folder, action: 'throw', code }]);
+      const faulty = { nodeArgs: ['--import', FAULT_PRELOAD_URL], env: { ARTICLE_FAULTS: faults } };
+      const denied = new RegExp(`^error: EACCES: injected fault, readdirSync '.*${escapeRegExp(folder)}'$`, 'm');
+      const staged = unchangedBy(() => repoSnapshot(repo), () => run(['guard', '--staged'], { cwd: repo, ...faulty }),
+        'the repository');
+      expectExit(staged, status);
+      if (status === 1) assert.match(staged.stderr, denied);
+      commit(repo, 'Add notes');
+      const input = `refs/heads/main ${git(repo, 'rev-parse', 'HEAD')} refs/heads/main ${remoteSha}\n`;
+      const pushed = unchangedBy(
+        () => ({ repo: repoSnapshot(repo), remote: remoteSnapshot(remote) }),
+        () => run(['guard', '--pre-push'], { cwd: repo, input, ...faulty }),
+        'the repository and its remote',
+      );
+      expectExit(pushed, status);
+      if (status === 1) assert.match(pushed.stderr, denied);
+    });
+  }
 });
 
 test('[AC-03][F-017] checkTrackedContent reuses a cached analysis per id across trees and redoes it for changed text', async () => {
@@ -3681,6 +4570,148 @@ test('[AC-03][F-017] a write failure other than a closed pipe fails the command 
   }
 });
 
+/* Terminal control characters in output                                    */
+
+/**
+ * A character a terminal acts on instead of showing, as the tool must never
+ * write it: a C0 control other than TAB and the LF that ends each line, DEL,
+ * or a C1 control.
+ */
+const RAW_CONTROL_RE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/;
+
+/** Options of the cases whose file names hold control characters, which Windows does not allow. */
+const CONTROL_NAME_CASE = {
+  skip: process.platform === 'win32' ? 'Windows file names cannot hold control characters' : false,
+};
+
+/**
+ * Asserts that a tool run wrote no raw terminal control character to stdout
+ * or stderr, and that each of `visible` (text holding the escapes the tool
+ * writes, such as `\u001b`) appears in its output. Failure messages show the
+ * output JSON-quoted, so the test runner's own terminal is not driven by it.
+ */
+function assertNeutralized(result, ...visible) {
+  const raw = RAW_CONTROL_RE.exec(result.out);
+  assert.equal(raw, null,
+    `the raw character ${JSON.stringify(raw?.[0])} reached the output: ${JSON.stringify(result.out)}`);
+  for (const text of visible) {
+    assert.ok(result.out.includes(text), `${JSON.stringify(text)} is printed: ${JSON.stringify(result.out)}`);
+  }
+}
+
+test('[AC-03][F-017] check and unpublish escape control characters from file names and article text, so each message is one terminal line', async (t) => {
+  await t.test('[AC-03][F-017] check escapes the OSC, BEL and CSI sequences in a draft and a post name', CONTROL_NAME_CASE, () => {
+    const root = makeRoot();
+    write(root, '_drafts/x\u001b]0;QA9E-TITLE\u0007\u001b[2J.md', validArticle());
+    write(root, '_posts/2026-01-01-y\u001b[31m.md', validArticle());
+    const result = checkRoot(root);
+    expectExit(result, 1);
+    assertNeutralized(result,
+      'error: _drafts/x\\u001b]0;QA9E-TITLE\\u0007\\u001b[2J.md: ',
+      '(got "x\\u001b]0;QA9E-TITLE\\u0007\\u001b[2J")',
+      'error: _posts/2026-01-01-y\\u001b[31m.md: ');
+  });
+
+  await t.test('[AC-03][F-017] unpublish keeps its refusal line and escapes a reference line that would erase it', () => {
+    const root = makeRoot();
+    const target = writePostWithImage(root, 'target');
+    const refRel = `_posts/${PAST}-ref.md`;
+    const refText = validArticle({
+      title: 'The referrer',
+      body: 'See [it](/blog/target/) \u001b[1A\u001b[2KHIDDEN\u001b]0;QA9E\u0007 here.',
+    });
+    write(root, refRel, refText);
+    const line = refText.split('\n').findIndex((text) => text.includes('/blog/target/')) + 1;
+    assert.ok(line > 0);
+    const result = unpublishRefused(root, 'target');
+    expectExit(result, 1);
+    assertNeutralized(result, `error: unpublish refused: 1 reference to ${target.rel} remains:\n`
+      + `  ${refRel}:${line}: See [it](/blog/target/) \\u001b[1A\\u001b[2KHIDDEN\\u001b]0;QA9E\\u0007 here.\n`);
+  });
+
+  await t.test('[AC-03][F-017] check escapes a CSI sequence in the unsafe-markup excerpt', () => {
+    const root = makeRoot();
+    write(root, '_drafts/esc-markup.md', validArticle({ body: '<script>x</script>\u001b[2K' }));
+    const result = checkRoot(root, '_drafts/esc-markup.md');
+    expectExit(result, 1);
+    assertNeutralized(result, 'unsafe markup "<script>x</script>\\u001b[2K"');
+  });
+
+  await t.test('[AC-03][F-017] check escapes a C1 CSI, a CR and an LF in a draft name, which cannot forge a line', CONTROL_NAME_CASE, () => {
+    const root = makeRoot();
+    write(root, '_drafts/csi\u009b2Jcr\rlf\nok forged.md', validArticle());
+    const result = checkRoot(root);
+    expectExit(result, 1);
+    assertNeutralized(result, 'error: _drafts/csi\\u009b2Jcr\\rlf\\nok forged.md: ');
+    assert.doesNotMatch(result.out, /^ok forged/m, 'the name holds no line of its own');
+  });
+});
+
+test('[AC-03][F-017] guard --staged escapes a control character in the name of a draft added with git add -f', { ...GIT_CASE, ...CONTROL_NAME_CASE }, () => {
+  const repo = makeRepo();
+  const draftRel = '_drafts/x\u001b]0;QA9E\u0007.md';
+  write(repo, draftRel, validArticle());
+  git(repo, 'add', '-f', draftRel);
+  const result = guardStagedUnchanged(repo);
+  expectExit(result, 1);
+  assertNeutralized(result, '_drafts/x\\u001b]0;QA9E\\u0007.md', 'guard: commit refused (');
+});
+
+test('[AC-03][F-017] git stderr of two lines is reported with the second indented and escaped, and guard still fails closed', SHIM_CASE, () => {
+  const repo = makeRepo();
+  const dir = caseDir('git-two-lines');
+  const log = path.join(dir, 'calls.log');
+  const second = '\u001b[2Kerror: forged second line\u001b]0;QA9E\u0007';
+  // The stand-in fails the first call guard makes, finding the repository root, as a git that cannot answer it would.
+  fs.writeFileSync(path.join(dir, 'git'), [
+    '#!/bin/sh',
+    `printf '%s\\n' "$*" >> ${shQuote(log)}`,
+    `case "$*" in 'rev-parse --show-toplevel') printf '%s\\n%s\\n' 'fatal: first line' ${shQuote(second)} >&2; `
+      + 'exit 128 ;; esac',
+    `exec ${shQuote(realGit())} "$@"`,
+    '',
+  ].join('\n'), { mode: 0o755 });
+  const env = { PATH: `${dir}${path.delimiter}${ENV.PATH ?? ''}` };
+  const result = unchangedBy(() => repoSnapshot(repo), () => run(['guard', '--staged'], { cwd: repo, env }),
+    'the repository');
+  expectExit(result, 1);
+  assert.equal(result.stderr, [
+    'error: git rev-parse --show-toplevel failed: fatal: first line',
+    '  \\u001b[2Kerror: forged second line\\u001b]0;QA9E\\u0007',
+    'error: guard could not complete its checks, so it refuses (fail closed)',
+    '',
+  ].join('\n'), `JSON-quoted output: ${JSON.stringify(result.out)}`);
+  assertNeutralized(result);
+  const calls = fs.readFileSync(log, 'utf8').split('\n').filter((call) => call !== '');
+  assert.deepEqual(calls, ['rev-parse --show-toplevel'], 'the failing call is the first and only one guard makes');
+});
+
+test('[AC-03][F-017] scripts/article.mjs writes to stdout and stderr in one place, function emit', () => {
+  const source = fs.readFileSync(ARTICLE_MJS, 'utf8');
+  const writes = [...source.matchAll(/\.write\(/g)];
+  assert.equal(writes.length, 1, `exactly one .write( call, found at offsets ${writes.map((w) => w.index).join(', ')}`);
+  const start = source.indexOf('\nfunction emit(');
+  assert.notEqual(start, -1, 'function emit exists');
+  const end = source.indexOf('\n}\n', start);
+  assert.ok(writes[0].index > start && writes[0].index < end, 'the one .write( call is inside function emit');
+});
+
+test('[AC-03][F-017] --help prints the usage block on stdout ending with its last line, and a usage error prints it after one blank line', () => {
+  const root = makeRoot();
+  const help = cli(root, '--help');
+  expectExit(help, 0);
+  assert.equal(help.stderr, '');
+  assert.ok(help.stdout.startsWith('Usage: node scripts/article.mjs'), help.stdout);
+  assert.ok(help.stdout.endsWith('Exit codes: 0 success, 1 validation failure, 2 usage error.\n'), help.stdout);
+  assert.ok(!help.stdout.endsWith('\n\n'), 'no blank line follows the block');
+
+  const refused = cli(root, 'frobnicate');
+  expectExit(refused, 2);
+  assert.equal(refused.stdout, '');
+  assert.equal(refused.stderr, `error: unknown command "frobnicate"\n\n${help.stdout}`,
+    'the usage error, one blank line, then the same block');
+});
+
 /* The site root                                                             */
 
 test('[AC-03][F-017] new, check, publish and unpublish refuse a root without _config.yml with exit 2 and change nothing; guard still runs from a subfolder', GIT_CASE, async (t) => {
@@ -3754,5 +4785,48 @@ test('[AC-03][F-017] new, check, publish and unpublish refuse a root without _co
     const refused = unchangedBy(() => repoSnapshot(repo), () => run(['guard', '--staged'], { cwd: sub }), 'the repository');
     expectExit(refused, 1);
     assert.match(refused.stderr, /_drafts\/waiting\.md/, 'a draft staged outside the subfolder is refused');
+  });
+});
+
+test('[AC-03][F-017] every command refuses a --root too long for the filesystem, or a link loop, as a usage error (exit 2) and writes nothing', async (t) => {
+  /** Every command, so none reaches its own folder handling with a root that cannot be a folder. */
+  const commands = [
+    ['new', 'okslug'], ['check'], ['publish', 'okslug'], ['unpublish', 'okslug'], ['guard', '--staged'], ['guard', '--pre-push'],
+  ];
+  /**
+   * Asserts that each command, run with `rootArgs` from the site root `cwd`, is refused with
+   * `--root <resolved> is not a directory` and the usage block, leaving `cwd` as it was: a run
+   * that fell back to its working folder would write there.
+   */
+  const refusedAsNotAFolder = (cwd, rootArgs, resolved) => {
+    for (const args of commands) {
+      const result = unchangedBy(() => treeSnapshot(cwd), () => run([...args, ...rootArgs], { cwd }), `the folder ${cwd}`);
+      expectExit(result, 2);
+      assert.ok(result.stderr.startsWith(`error: --root ${resolved} is not a directory\n`),
+        `${args.join(' ')}: a usage error naming the resolved root, not a system error:\n${result.out.slice(0, 2000)}`);
+      assert.match(result.stderr, /\nUsage: /, `${args.join(' ')}: the usage block follows`);
+      assert.doesNotMatch(result.stderr, /ENAMETOOLONG|ELOOP/, `${args.join(' ')}: no raw error code`);
+      assert.equal(result.stdout, '', `${args.join(' ')} reports nothing as created, checked or moved`);
+    }
+  };
+
+  await t.test('[AC-03][F-017] a --root whose last folder name is 300 characters long', () => {
+    const cwd = makeRoot();
+    const root = path.join(PARENT, 'b'.repeat(300));
+    refusedAsNotAFolder(cwd, ['--root', root], root);
+  });
+
+  await t.test('[AC-03][F-017] a --root= path 5,000 characters long', () => {
+    const cwd = makeRoot();
+    const root = path.join(PARENT, 'a'.repeat(5000));
+    refusedAsNotAFolder(cwd, [`--root=${root}`], root);
+  });
+
+  await t.test('[AC-03][F-017] a --root that is a symbolic-link loop', LINK_CASE, () => {
+    const cwd = makeRoot();
+    link(cwd, 'loop-a', 'loop-b');
+    link(cwd, 'loop-b', 'loop-a');
+    const root = path.join(cwd, 'loop-a');
+    refusedAsNotAFolder(cwd, ['--root', root], root);
   });
 });

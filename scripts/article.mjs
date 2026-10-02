@@ -9,13 +9,17 @@
  *   node scripts/article.mjs publish <slug>    _drafts/<slug>.md → _posts/<UTC date>-<slug>.md
  *   node scripts/article.mjs unpublish <slug>  the reverse, refused while other articles link to it
  *   node scripts/article.mjs guard --staged    pre-commit: refuse drafts and rule breaks in the index
- *   node scripts/article.mjs guard --pre-push  pre-push: the same for every commit being pushed
+ *   node scripts/article.mjs guard --pre-push [<remote> <url>]
+ *                                              pre-push: the same for every commit or tree being pushed
  *
  * `--root <dir>` (anywhere on the command line) names the repository root and
  * defaults to the current directory. `new`, `check`, `publish` and
  * `unpublish` refuse a root without `_config.yml` (exit 2), so a run from a
  * subfolder is never taken for a site without articles; `guard` finds the
- * repository root with git.
+ * repository root with git. `guard --pre-push` takes the remote name and URL
+ * git gives the hook: it skips only commits the repository at that URL
+ * advertises (`git ls-remote`) that it already holds, and otherwise checks
+ * the complete history of what is pushed.
  *
  * Why it exists: the repository is public, so a draft is private only while
  * it stays out of git. Drafts live in the git-ignored `_drafts/` and
@@ -26,15 +30,26 @@
  *
  * Division of labour: every article rule (schema, dates, images, unsafe
  * markup, Liquid in code, inbound references, tracked-content rules) lives in
- * `./lib/articles.mjs`, so commit time, push time and test time apply
+ * `./lib/articles.mjs`, and the site-configuration rules (settings in the
+ * Jekyll configuration file that would keep a tracked post off the site) live
+ * in `./lib/site-config.mjs`, so commit time, push time and test time apply
  * identical checks. This file only reads and moves files, runs git plumbing
  * and reports.
  *
+ * What `guard` reads: the index (`--staged`) or the pushed commits
+ * (`--pre-push`), never working-tree files, with one exception. It lists the
+ * working tree's folders for symbolic links named `_drafts` or
+ * `assets/drafts` and resolves where they lead (`makeDraftLinkCheck`), so a
+ * file in a repository folder that such a link makes a drafts folder is
+ * refused as a draft.
+ *
  * Git safety: the tool never changes git state. Only `new` and `guard` run
  * git, and only read-only commands (`config --get`, `ls-files`, `diff`,
- * `rev-parse`, `hash-object` without `-w`, `cat-file`, `rev-list`, `ls-tree`,
- * `diff-tree`), spawned without a shell and with `GIT_OPTIONAL_LOCKS=0` so
- * not even an opportunistic index refresh is written. Every git command runs
+ * `rev-parse`, `hash-object` without `-w`, `cat-file` (`--batch-check`
+ * included), `rev-list`, `ls-tree`, `diff-tree`, and `ls-remote` with
+ * `GIT_TERMINAL_PROMPT=0`), spawned without a shell and with
+ * `GIT_OPTIONAL_LOCKS=0` so not even an opportunistic index refresh is
+ * written. Every git command runs
  * under a one-minute deadline (`DEADLINES.gitQuery` in `./lib/subprocess.mjs`)
  * and is killed with SIGKILL when it exceeds it; `guard` then refuses with
  * exit 1, and `new` warns.
@@ -48,6 +63,13 @@
  * first, and each undo first checks that it removes no content the run did
  * not write. An undo that cannot complete is reported with the paths to
  * repair by hand; empty folders made on the way may remain.
+ *
+ * Output: every line goes through `emit`, the one place that writes to stdout
+ * or stderr, which writes control characters as JSON escapes (`\u001b`,
+ * `\r`, …), so each message is exactly one terminal line. File names and
+ * article text come from the repository, which a checked-out pull request can
+ * supply, and must not retitle the terminal, clear it or erase a refusal line
+ * (CWE-150).
  *
  * Exit codes: 0 success, 1 validation failure (details on stderr), 2 usage
  * error. Unwrapped Liquid inside code is a warning and never changes the
@@ -71,6 +93,7 @@ import {
   findInboundReferences,
   checkTrackedContent,
 } from './lib/articles.mjs';
+import { checkSiteConfig, siteConfigFile } from './lib/site-config.mjs';
 
 /* ------------------------------------------------------------------------ */
 /* Constants                                                                 */
@@ -92,7 +115,7 @@ const ZERO_ID_RE = /^0+$/;
 /** Index and tree mode of an executable file; hooks must carry it. */
 const EXECUTABLE_MODE = '100755';
 
-/** Index and tree mode of a submodule (gitlink), which can never be an article. */
+/** Index and tree mode of a submodule (gitlink), which is refused at every path (`entryModeProblem`). */
 const GITLINK_MODE = '160000';
 
 const GIT_MAX_BUFFER = 256 * 1024 * 1024;
@@ -112,8 +135,12 @@ Commands:
                       folders; refused while other articles still link to it
   guard --staged      Refuse a commit whose staged tree breaks the content rules
                       (run by .githooks/pre-commit)
-  guard --pre-push    Refuse a push whose commits break the content rules; reads
-                      git's ref lines on stdin (run by .githooks/pre-push)
+  guard --pre-push [<remote> <url>]
+                      Refuse a push whose commits or trees break the content
+                      rules, or that pushes a blob; reads git's ref lines on
+                      stdin (run by .githooks/pre-push). Only commits the
+                      repository at <url> advertises holding are skipped;
+                      without <url>, all history pushed is checked
 
 Options:
   --root <dir>        Repository root, the folder holding _config.yml (default:
@@ -141,9 +168,48 @@ class SourceChanged extends Error {}
 
 /**
  * Standard output and error streams on which a write has failed (see
- * `watchOutput`); `say`, `fail` and `warn` write nothing more to them.
+ * `watchOutput`); `emit` writes nothing more to them.
  */
 const closedStreams = new Set();
+
+/**
+ * The characters a terminal acts on instead of showing: every C0 control but
+ * TAB (U+0000 to U+001F, LF and CR included), DEL (U+007F) and every C1
+ * control (U+0080 to U+009F, among them the one-character CSI U+009B). TAB is
+ * kept: it only advances the cursor to the next tab stop, and can neither move
+ * it back, erase anything nor start an escape sequence.
+ */
+const TERMINAL_CONTROL_RE = /[\u0000-\u0008\u000a-\u001f\u007f-\u009f]/g;
+
+/** The short forms `JSON.stringify` uses for the controls that have one (TAB aside, which is kept). */
+const SHORT_CONTROL_ESCAPES = new Map([['\b', '\\b'], ['\n', '\\n'], ['\f', '\\f'], ['\r', '\\r']]);
+
+/**
+ * `text` with every `TERMINAL_CONTROL_RE` character written as the escape
+ * `JSON.stringify` uses: `\n`, `\r`, `\b` and `\f`, and `\u00XX` in lowercase
+ * hex for the rest (ESC is `\u001b`, BEL `\u0007`, the C1 CSI `\u009b`), so a
+ * file name reads as it does in `refuseSlug`'s message. Backslashes are left
+ * as they are: the printed next-step commands hold `shellQuote`'s `'\''`.
+ */
+function neutralizeControls(text) {
+  return text.replace(TERMINAL_CONTROL_RE, (control) => SHORT_CONTROL_ESCAPES.get(control)
+    ?? `\\u${control.charCodeAt(0).toString(16).padStart(4, '0')}`);
+}
+
+/**
+ * Writes `line` and a newline to `stream`, the only place this tool writes to
+ * its output, unless a write to it has already failed (`closedStreams`).
+ * Control characters are neutralized (`neutralizeControls`), so each call is
+ * exactly one terminal line: file names and article text come from the
+ * repository, and a crafted one can neither retitle or clear the terminal nor
+ * erase or forge a line (CWE-150).
+ *
+ * @param {NodeJS.WriteStream} stream `process.stdout` or `process.stderr`.
+ * @param {string} line One line of output, without its newline.
+ */
+function emit(stream, line) {
+  if (!closedStreams.has(stream)) stream.write(`${neutralizeControls(line)}\n`);
+}
 
 /**
  * Handles a failed write to stdout or stderr, which Node reports as an
@@ -168,16 +234,33 @@ function watchOutput() {
 }
 
 function say(message = '') {
-  if (!closedStreams.has(process.stdout)) process.stdout.write(`${message}\n`);
+  emit(process.stdout, message);
 }
 
 function fail(message) {
-  if (!closedStreams.has(process.stderr)) process.stderr.write(`error: ${message}\n`);
+  emit(process.stderr, `error: ${message}`);
 }
 
 /** Advisory findings go to stderr, prefixed `warning: `; they never change the exit code. */
 function warn(message) {
-  if (!closedStreams.has(process.stderr)) process.stderr.write(`warning: ${message}\n`);
+  emit(process.stderr, `warning: ${message}`);
+}
+
+/**
+ * Reports text that can span lines: git's own stderr inside a `GitError`
+ * message, or the stack of an unexpected error. The first line is an error
+ * (`fail`) and every further line is indented by two spaces, so none can pose
+ * as a top-level `error:`, `warning:`, `ok` or `guard:` line.
+ */
+function failLines(text) {
+  const [first, ...rest] = String(text).split(/\r?\n/);
+  fail(first);
+  for (const line of rest) emit(process.stderr, `  ${line}`);
+}
+
+/** Writes `USAGE` to `stream` one line at a time; its final newline ends the last line, adding no blank one. */
+function printUsage(stream) {
+  for (const line of USAGE.replace(/\n$/, '').split('\n')) emit(stream, line);
 }
 
 /** `1 problem`, `2 problems`. */
@@ -254,8 +337,9 @@ function inRoot(root, relPath) {
 
 /**
  * `fs.lstatSync` or `fs.statSync` that returns `undefined` for a path that
- * cannot exist: missing, below a file (`ENOTDIR`) or, when following links,
- * a symbolic-link loop (`ELOOP`). Other errors, such as `EACCES`, are thrown.
+ * cannot exist: missing, below a file (`ENOTDIR`), too long for the
+ * filesystem (`ENAMETOOLONG`) or, when following links, a symbolic-link loop
+ * (`ELOOP`). Other errors, such as `EACCES`, are thrown.
  */
 function statOrUndefined(absPath, follow) {
   try {
@@ -721,18 +805,22 @@ function kindOf(root, absFile) {
  * `guard` would read as "no". `guard` then refuses with exit 1 (fail closed);
  * `new`, whose only git read is advisory, warns instead.
  *
+ * @param {string} cwd Folder git runs in.
+ * @param {string[]} args Git's arguments.
+ * @param {Buffer} [input] Standard input.
+ * @param {Record<string, string>} [env] Variables set for this command only.
  * @returns {{ ok: boolean, stdout: Buffer, stderr: string, detail: string }}
  *   The exit of a git that ran to its end; when `ok` is false, `detail` is
  *   git's trimmed stderr, or its exit status when stderr is empty.
  * @throws {GitError} naming the command and how it ended, when git did not run to its end.
  */
-function runGit(cwd, args, input) {
+function runGit(cwd, args, input, env = {}) {
   const result = runSync('git', args, {
     cwd,
     input,
     encoding: 'buffer',
     maxBuffer: GIT_MAX_BUFFER,
-    env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
+    env: { ...process.env, ...env, GIT_OPTIONAL_LOCKS: '0' },
     timeoutMs: DEADLINES.gitQuery,
   });
   if (!result.completed) {
@@ -1509,9 +1597,9 @@ function reportFailure({ command, root, step, err, undo, paths, leftovers = [], 
     }
   }
   fail('not every change could be rolled back; fix these paths by hand:');
-  process.stderr.write(`  present: ${present.join(', ') || 'none'}\n`);
-  process.stderr.write(`  missing: ${missing.join(', ') || 'none'}\n`);
-  if (unknown.length > 0) process.stderr.write(`  cannot tell: ${unknown.join(', ')}\n`);
+  emit(process.stderr, `  present: ${present.join(', ') || 'none'}`);
+  emit(process.stderr, `  missing: ${missing.join(', ') || 'none'}`);
+  if (unknown.length > 0) emit(process.stderr, `  cannot tell: ${unknown.join(', ')}`);
   return EXIT_INVALID;
 }
 
@@ -1616,15 +1704,37 @@ function createDraft(root, slug) {
 /* check [files…]                                                            */
 /* ------------------------------------------------------------------------ */
 
-/** The files `check` was given, resolved against the working directory; missing files are usage errors. */
+/** What an entry that is not a regular file is, as a message names it: `a directory`, `a FIFO`, … */
+function entryTypeName(stat) {
+  if (stat.isDirectory()) return 'a directory';
+  if (stat.isFIFO()) return 'a FIFO';
+  if (stat.isCharacterDevice()) return 'a character device';
+  if (stat.isBlockDevice()) return 'a block device';
+  if (stat.isSocket()) return 'a socket';
+  return 'an entry of another type';
+}
+
+/**
+ * The files `check` was given, resolved against the working directory. Each
+ * must be a regular file, symbolic links followed; any other is a usage error
+ * that says what it is: missing, a symbolic link that leads to no file (one
+ * that dangles or loops), or a directory, FIFO, device or socket. A path is
+ * only stat'ed, never opened, so a FIFO cannot stall the run.
+ *
+ * @throws {UsageError} for a named path that is not a regular file.
+ */
 function resolveCheckTargets(root, files) {
   const targets = [];
   const seen = new Set();
   for (const file of files) {
     const absFile = path.resolve(process.cwd(), file);
-    if (!isFile(absFile)) {
-      throw new UsageError(`${file}: no such file`);
+    const stat = statOrUndefined(absFile, true);
+    if (stat === undefined) {
+      throw new UsageError(statOrUndefined(absFile, false) === undefined
+        ? `${file}: no such file`
+        : `${file}: not a regular file (a symbolic link that leads to no file)`);
     }
+    if (!stat.isFile()) throw new UsageError(`${file}: not a regular file (${entryTypeName(stat)})`);
     const rel = toPosix(path.relative(root, absFile));
     if (seen.has(rel)) continue;
     seen.add(rel);
@@ -1967,7 +2077,7 @@ function unpublishPost(root, slug) {
   if (references.length > 0) {
     fail(`unpublish refused: ${plural(references.length, 'reference')} to ${postRel} `
       + `${references.length === 1 ? 'remains' : 'remain'}:`);
-    for (const ref of references) process.stderr.write(`  ${ref.file}:${ref.line}: ${ref.text}\n`);
+    for (const ref of references) emit(process.stderr, `  ${ref.file}:${ref.line}: ${ref.text}`);
     fail('a remaining post_url would fail the Pages build and leave the old page live, and an ordinary '
       + 'link would break; repoint or remove these references, then run unpublish again (nothing was moved)');
     return EXIT_INVALID;
@@ -2108,6 +2218,23 @@ function articleModeProblem(p, mode) {
 }
 
 /**
+ * The refusal for an index or tree entry by its mode, or null: an article
+ * path that is not a regular file (`articleModeProblem`), or a submodule
+ * anywhere. GitHub Pages builds a submodule's files into the site, where no
+ * check reads them, so one at `_posts`, `blog/_posts` or any other folder
+ * could publish unchecked posts, drafts or images; the site needs none.
+ */
+function entryModeProblem(p, mode) {
+  const articleProblem = articleModeProblem(p, mode);
+  if (articleProblem !== null) return articleProblem;
+  if (mode === GITLINK_MODE) {
+    return `${p}: submodules are not allowed; GitHub Pages builds a submodule's files into the site, where they `
+      + 'would skip every check';
+  }
+  return null;
+}
+
+/**
  * Paths the commit adds, copies, modifies, renames or changes the type of (a
  * symbolic link or submodule that becomes a regular file, or the reverse). On
  * an unborn branch `git diff --cached` already compares against the empty
@@ -2128,7 +2255,7 @@ function stagedChanges(top) {
 /**
  * Reads the given articles from tree or index entries, each with its blob id
  * as `id`. An entry that is not a regular file has no article text and is
- * never read; `articleModeProblem`, applied to the complete tree, refuses it.
+ * never read; `entryModeProblem`, applied to the complete tree, refuses it.
  * An article that is not valid UTF-8, which the Pages build would leave out,
  * is not checked further: its refusal is added to `errors` instead.
  */
@@ -2144,6 +2271,161 @@ function readArticles(changedPaths, entryFor, readBlob, errors) {
     else errors.push(notUtf8(p, invalid));
   }
   return articles;
+}
+
+/** A link name that makes its target a drafts folder: `_drafts` in any folder, in any letter case. */
+const DRAFTS_LINK_NAME_RE = /^_drafts$/iu;
+/** A top-level `assets` folder, in any letter case, whose `drafts` entry is the draft-image folder. */
+const ASSETS_FOLDER_NAME_RE = /^assets$/iu;
+/** A link name inside `assets` that makes its target the draft-image folder, in any letter case. */
+const DRAFT_IMAGES_LINK_NAME_RE = /^drafts$/iu;
+
+/** Codes for a path that leads nowhere: missing (a dangling link), through a file, looping or over-long. */
+const NOWHERE_CODES = new Set(['ENOENT', 'ENOTDIR', 'ELOOP', 'ENAMETOOLONG']);
+
+/** `text` as a literal inside a regular expression with the `u` flag. */
+function regExpLiteral(text) {
+  return text.replace(/[\\^$.*+?()[\]{}|/]/g, '\\$&');
+}
+
+/**
+ * Makes the check for drafts kept behind a symbolic link. `.gitignore`
+ * ignores an entry named `_drafts`, or `assets/drafts`, in any letter case and
+ * whatever its type, so when such an entry is a link to another folder of the
+ * repository, `git add -A` stages that folder's files as ordinary files while
+ * the local preview (`--drafts`) reads them as drafts. Each checked path at
+ * or below such a target is refused; a link to the top folder itself is
+ * refused once, by its own name.
+ *
+ * Links are found by their own type (`lstat`; none is followed while
+ * searching) in the top folder and every folder that holds a checked path
+ * (Jekyll reads `<dir>/_drafts/` in each folder it builds), and as `drafts`
+ * in each top-level `assets` folder; names match in any letter case, as a
+ * case-insensitive file system matches them.
+ * Each link is resolved with `realpath`. A dangling link, one to anything but
+ * a folder, and one that leads outside the repository (an author's own drafts
+ * folder elsewhere, say) are left alone: no checked path lies in their
+ * target. Paths are compared with the target in any letter case, so a
+ * misjudgement can only produce a false finding. A folder no longer on disk
+ * (or that cannot be one, as in `NOWHERE_CODES`) is skipped; any other error
+ * reading the disk, such as `EACCES`, is thrown, so guard refuses.
+ * Listings and targets are cached, so `guard --pre-push` reads each folder
+ * once for all its commits. Nothing is written.
+ *
+ * @param {string} top The repository's top folder, as `gitToplevel` returns it.
+ * @returns {(paths: string[]) => string[]} The refusals for one complete tree's paths.
+ */
+function makeDraftLinkCheck(top) {
+  const realTop = fs.realpathSync.native(top);
+  const insideTop = realTop.endsWith(path.sep) ? realTop : `${realTop}${path.sep}`;
+  const listings = new Map();
+  const targets = new Map();
+
+  /** The entries of the repository folder `relDir`, sorted by name; none when it is gone from disk. */
+  const entriesOf = (relDir) => {
+    if (!listings.has(relDir)) {
+      let entries = [];
+      try {
+        entries = fs.readdirSync(inRoot(top, relDir), { withFileTypes: true });
+      } catch (err) {
+        if (!NOWHERE_CODES.has(err.code)) throw err;
+      }
+      entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+      listings.set(relDir, entries);
+    }
+    return listings.get(relDir);
+  };
+
+  /** The repository-relative folder the link `linkRel` leads to, `''` for the top folder, or null. */
+  const targetOf = (linkRel) => {
+    if (!targets.has(linkRel)) {
+      let target = null;
+      try {
+        const real = fs.realpathSync.native(inRoot(top, linkRel));
+        if (fs.statSync(real).isDirectory()) {
+          if (real === realTop) target = '';
+          else if (real.startsWith(insideTop)) target = toPosix(path.relative(realTop, real));
+        }
+      } catch (err) {
+        if (!NOWHERE_CODES.has(err.code)) throw err;
+      }
+      targets.set(linkRel, target);
+    }
+    return targets.get(linkRel);
+  };
+
+  return (paths) => {
+    const folders = new Set(['']);
+    for (const p of paths) {
+      for (let slash = p.indexOf('/'); slash !== -1; slash = p.indexOf('/', slash + 1)) folders.add(p.slice(0, slash));
+    }
+    const links = [];
+    const collect = (relDir, nameRe, kind) => {
+      for (const entry of entriesOf(relDir)) {
+        if (entry.isSymbolicLink() && nameRe.test(entry.name)) {
+          links.push({ rel: relDir === '' ? entry.name : `${relDir}/${entry.name}`, kind });
+        }
+      }
+    };
+    for (const relDir of folders) collect(relDir, DRAFTS_LINK_NAME_RE, 'drafts');
+    for (const entry of entriesOf('')) {
+      if (entry.isDirectory() && ASSETS_FOLDER_NAME_RE.test(entry.name)) {
+        collect(entry.name, DRAFT_IMAGES_LINK_NAME_RE, 'draft images');
+      }
+    }
+
+    // One link per target, so two links to one folder refuse each path once.
+    const errors = [];
+    const reported = new Set();
+    for (const { rel, kind } of links) {
+      const target = targetOf(rel);
+      if (target === null || reported.has(target.toLowerCase())) continue;
+      reported.add(target.toLowerCase());
+      if (target === '') {
+        errors.push(`${rel}: a symbolic link to the repository's top folder makes every file in it one of your `
+          + `${kind}, which must never be tracked; replace ${rel} with a real, git-ignored folder`);
+        continue;
+      }
+      const atOrBelow = new RegExp(`^${regExpLiteral(target)}(?:/|$)`, 'iu');
+      for (const p of paths) {
+        if (!atOrBelow.test(p)) continue;
+        errors.push(`${p}: drafts and draft images must never be tracked; ${rel} is a symbolic link to ${target}/, `
+          + `so the files there are ${kind} (git rm --cached, or replace ${rel} with a real, git-ignored folder)`);
+      }
+    }
+    return errors;
+  };
+}
+
+/**
+ * The refusals for the Jekyll configuration of a complete tree or index:
+ * `checkSiteConfig` on the file Jekyll reads (`siteConfigFile`), read from
+ * its entry by blob id. Only a regular file can be read and checked, so a
+ * symbolic link, a submodule or a folder in its place is refused, and so is
+ * a file that is not valid UTF-8. A tree without a configuration file has
+ * nothing to refuse.
+ *
+ * @param {string[]} paths The complete tree.
+ * @param {(p: string) => { mode: string, oid: string } | undefined} entryFor The entry of a path.
+ * @param {ReturnType<typeof makeBlobReader>} readBlob Reads and decodes a blob by id.
+ * @returns {string[]}
+ */
+function siteConfigProblems(paths, entryFor, readBlob) {
+  const file = siteConfigFile(paths);
+  if (file === null) return [];
+  const entry = entryFor(file);
+  let kind = null;
+  if (entry === undefined) kind = 'a folder';
+  else if (entry.mode === SYMLINK_MODE) kind = 'a symbolic link';
+  else if (entry.mode === GITLINK_MODE) kind = 'a submodule';
+  else if (!REGULAR_FILE_MODES.has(entry.mode)) kind = `an entry of mode ${entry.mode}`;
+  if (kind !== null) {
+    return [`${file}: Jekyll reads the site configuration from this path, and guard can check it only as a regular `
+      + `file, not ${kind}; track the configuration itself here`];
+  }
+  const { text, invalid } = readBlob(entry.oid);
+  if (invalid !== null) return [notUtf8(file, invalid)];
+  return checkSiteConfig({ path: file, text, paths });
 }
 
 function cmdGuardStaged(root) {
@@ -2167,21 +2449,24 @@ function cmdGuardStaged(root) {
       errors.push(`${record.path}: staged with mode ${record.mode}; run git update-index --chmod=+x -- `
         + shellPath(record.path));
     }
-    const modeProblem = articleModeProblem(record.path, record.mode);
+    const modeProblem = entryModeProblem(record.path, record.mode);
     if (modeProblem !== null) {
       modeReported.add(record.path);
       errors.push(modeProblem);
     }
   }
 
+  for (const message of makeDraftLinkCheck(top)(paths)) errors.push(message);
+
   const readBlob = makeBlobReader(top);
   const articles = readArticles(stagedChanges(top), (p) => entries.get(p), readBlob, errors);
   for (const message of checkTrackedContent({ paths, articles, todayUtc: today })) errors.push(message);
+  for (const message of siteConfigProblems(paths, (p) => entries.get(p), readBlob)) errors.push(message);
 
   if (errors.length > 0) {
     for (const message of errors) fail(message);
-    process.stderr.write(`guard: commit refused (${plural(errors.length, 'problem')}). `
-      + 'Fix them, or unstage the files.\n');
+    emit(process.stderr, `guard: commit refused (${plural(errors.length, 'problem')}). `
+      + 'Fix them, or unstage the files.');
     return EXIT_INVALID;
   }
   say(`guard: staged tree ok (${plural(articles.length, 'changed article')} checked)`);
@@ -2235,19 +2520,129 @@ function parsePushLines(input) {
   return lines;
 }
 
+/** A `git cat-file --batch-check='%(objectname) %(objecttype)'` answer for an object that exists. */
+const BATCH_CHECK_RE = /^([0-9a-f]{40}|[0-9a-f]{64}) ([a-z]+)$/;
+
 /**
- * Every commit the push would publish, deduplicated across ref lines. A new
- * branch (zero remote sha), or a remote tip this clone does not have, is
- * checked against everything no remote-tracking ref already holds.
+ * The object each pushed ref line publishes, tags peeled: a pushed tag
+ * publishes its target, which may be a commit, a tree or a blob, and
+ * `rev-list` lists no commit at all for a tree or a blob. One
+ * `git cat-file --batch-check` resolves `<local sha>^{}` for every line
+ * that is not a deletion, which publishes nothing.
+ *
+ * @param {string} top Working-tree root.
+ * @param {Array<{ localRef: string, localSha: string, remoteSha: string }>} lines From `parsePushLines`.
+ * @returns {Array<{ localRef: string, remoteSha: string, oid: string, type: string }>} One entry
+ *   per pushed line, in input order: the peeled object and its type.
+ * @throws {GitError} when this clone lacks a pushed object, or git does not answer each line
+ *   with one `<object> <type>` record.
  */
-function commitsToPush(top, lines) {
+function peelPushed(top, lines) {
+  const pushed = lines.filter(({ localSha }) => !ZERO_ID_RE.test(localSha));
+  if (pushed.length === 0) return [];
+  const format = '--batch-check=%(objectname) %(objecttype)';
+  const input = Buffer.from(pushed.map(({ localSha }) => `${localSha}^{}\n`).join(''));
+  const records = splitLines(git(top, ['cat-file', format], input));
+  if (records.length !== pushed.length) {
+    throw new GitError(`git cat-file ${format} answered ${records.length} of ${pushed.length} pushed objects`);
+  }
+  return pushed.map(({ localRef, localSha, remoteSha }, i) => {
+    const match = BATCH_CHECK_RE.exec(records[i]);
+    if (match !== null) return { localRef, remoteSha, oid: match[1], type: match[2] };
+    if (records[i] === `${localSha}^{} missing`) {
+      throw new GitError(`${localRef} ${localSha} is not an object in this clone, so it cannot be checked`);
+    }
+    throw new GitError(`unexpected git cat-file ${format} record for ${localRef}: ${records[i]}`);
+  });
+}
+
+/**
+ * Commits the push destination provably holds already: the commits its refs
+ * point at, tags peeled, as the destination itself advertises them to
+ * `git ls-remote -- <url>`, where `url` is where git is pushing (the hook's
+ * `$2`). Git's push negotiation trusts the same advertisement: it never
+ * sends the destination a commit it advertises. Remote-tracking refs prove
+ * nothing, neither another remote's (a private one included) nor the
+ * destination remote's own: a fetch from elsewhere or a `git remote set-url`
+ * leaves them describing some other repository. Only advertised commits
+ * this clone has can bound `rev-list`; the others are left out.
+ *
+ * With no destination, or when `ls-remote` exits non-zero (the destination
+ * is unreachable, or needs credentials that no helper supplies, since it may
+ * not prompt), nothing is proven and the whole pushed history is checked.
+ * The same holds when `ls-remote --get-url` shows that a `url.<base>.insteadOf`
+ * rule would send the query to another repository than the one git pushes to
+ * (git has already rewritten `url` once). An `ls-remote` that does not answer
+ * in time fails closed, as every git command here does.
+ *
+ * @param {string} top Working-tree root.
+ * @param {{ url: string } | null} destination The URL git passes the pre-push hook, or null.
+ * @returns {string[]} Commit ids the pushed history may stop at; `[]` when nothing is proven.
+ * @throws {GitError} when git does not answer, or answers in a form not expected.
+ */
+function heldByDestination(top, destination) {
+  if (destination === null || destination.url === '') return [];
+  const env = { GIT_TERMINAL_PROMPT: '0' };
+  const queried = runGit(top, ['ls-remote', '--get-url', '--', destination.url], undefined, env);
+  if (!queried.ok || queried.stdout.toString('utf8') !== `${destination.url}\n`) return [];
+  const listed = runGit(top, ['ls-remote', '--', destination.url], undefined, env);
+  if (!listed.ok) return [];
+  const advertised = new Set();
+  for (const record of splitLines(listed.stdout)) {
+    const oid = record.split('\t')[0];
+    if (!OBJECT_ID_RE.test(oid)) throw new GitError(`unexpected git ls-remote record: ${record}`);
+    advertised.add(oid.toLowerCase());
+  }
+  if (advertised.size === 0) return [];
+
+  // One lookup for every advertised object: `<id>^{commit}` names the commit
+  // it peels to, and is `missing` for one this clone lacks or that is no commit.
+  const ids = [...advertised];
+  const format = '--batch-check=%(objectname) %(objecttype)';
+  const input = Buffer.from(ids.map((oid) => `${oid}^{commit}\n`).join(''));
+  const answers = splitLines(git(top, ['cat-file', format], input));
+  if (answers.length !== ids.length) {
+    throw new GitError(`git cat-file ${format} answered ${answers.length} of ${ids.length} advertised objects`);
+  }
+  const held = new Set();
+  answers.forEach((answer, i) => {
+    const match = BATCH_CHECK_RE.exec(answer);
+    if (match !== null && match[2] === 'commit') held.add(match[1]);
+    else if (answer !== `${ids[i]}^{commit} missing`) {
+      throw new GitError(`unexpected git cat-file ${format} record for ${ids[i]}: ${answer}`);
+    }
+  });
+  return [...held];
+}
+
+/**
+ * Every commit the push would publish, deduplicated across ref lines, for
+ * the pushed commits (tags already peeled). When this clone has the remote
+ * tip, the range is `<remote sha>..<commit>`. Otherwise (a new branch or
+ * tag, or a remote tip this clone lacks) it is the commit's whole history
+ * less the commits `heldByDestination` proves the destination holds. Those
+ * tips reach `rev-list` as `^<id>` lines on standard input, so their number
+ * is unbounded.
+ *
+ * @param {string} top Working-tree root.
+ * @param {Array<{ oid: string, remoteSha: string }>} pushed Pushed commits from `peelPushed`.
+ * @param {{ remote: string, url: string } | null} destination The hook's `<remote> <url>`, or null.
+ * @returns {string[]} Commit ids, each once.
+ */
+function commitsToPush(top, pushed, destination) {
   const commits = [];
   const seen = new Set();
-  for (const { localSha, remoteSha } of lines) {
-    if (ZERO_ID_RE.test(localSha)) continue; // a branch deletion publishes nothing
+  let held = null;
+  for (const { oid: tip, remoteSha } of pushed) {
     const known = !ZERO_ID_RE.test(remoteSha) && runGit(top, ['cat-file', '-e', `${remoteSha}^{commit}`]).ok;
-    const args = known ? ['rev-list', `${remoteSha}..${localSha}`] : ['rev-list', localSha, '--not', '--remotes'];
-    for (const commit of splitLines(git(top, args))) {
+    let listed;
+    if (known) {
+      listed = git(top, ['rev-list', `${remoteSha}..${tip}`]);
+    } else {
+      held ??= heldByDestination(top, destination);
+      listed = git(top, ['rev-list', tip, '--stdin'], Buffer.from(held.map((oid) => `^${oid}\n`).join('')));
+    }
+    for (const commit of splitLines(listed)) {
       if (seen.has(commit)) continue;
       seen.add(commit);
       commits.push(commit);
@@ -2277,50 +2672,113 @@ function parseTree(buffer) {
   return entries;
 }
 
-function cmdGuardPrePush(root) {
+/**
+ * Problems in one snapshot a push publishes, a commit's tree or a pushed
+ * tree: the mode rule, the draft-folder link rule, the tracked-content rules
+ * and the site-configuration rules over its complete tree, and the article
+ * rules over the articles at `changedPaths`.
+ *
+ * @param {Map<string, { mode: string, type: string, oid: string }>} entries The tree, from `parseTree`.
+ * @param {string[]} changedPaths Paths whose articles are read and checked.
+ * @param {{ readBlob: Function, today: string, analyses: Map<string, unknown>,
+ *   draftLinkProblems: (paths: string[]) => string[] }} context Shared by every snapshot of the
+ *   run, so a blob is read and analysed once and the working tree's draft-folder links once.
+ * @returns {string[]} Problem messages; `[]` when the snapshot may be published.
+ */
+function snapshotProblems(entries, changedPaths, { readBlob, today, analyses, draftLinkProblems }) {
+  const errors = [];
+  for (const [p, { mode }] of entries) {
+    const modeProblem = entryModeProblem(p, mode);
+    if (modeProblem !== null) errors.push(modeProblem);
+  }
+  const paths = [...entries.keys()];
+  for (const message of draftLinkProblems(paths)) errors.push(message);
+  const articles = readArticles(changedPaths, (p) => entries.get(p), readBlob, errors);
+  const content = checkTrackedContent({ paths, articles, todayUtc: today, cache: analyses });
+  for (const message of content) errors.push(message);
+  for (const message of siteConfigProblems(paths, (p) => entries.get(p), readBlob)) errors.push(message);
+  return errors;
+}
+
+/**
+ * Counts for a summary line: the non-zero ones, joined with commas and a
+ * final `and` (`1 commit and 1 tree`), or the first noun with 0 when every
+ * count is zero (`0 commits`).
+ *
+ * @param {Array<[number, string]>} counts `[count, noun]` pairs in the order to print.
+ */
+function objectCounts(counts) {
+  const named = counts.filter(([count]) => count > 0).map(([count, noun]) => plural(count, noun));
+  if (named.length === 0) return plural(0, counts[0][1]);
+  return named.length === 1 ? named[0] : `${named.slice(0, -1).join(', ')} and ${named.at(-1)}`;
+}
+
+/**
+ * `guard --pre-push`: refuses the push (exit 1) when anything it would
+ * publish breaks the content rules. Every pushed ref is peeled first. A
+ * commit is checked with its whole pushed history (`commitsToPush`), each
+ * commit's complete tree and the articles that commit adds or modifies. A
+ * pushed tree is checked as a commit's tree, with every article in it read.
+ * A blob has no path for any rule to judge, so pushing one is refused.
+ *
+ * @param {string} root The `--root` folder; git finds the working-tree root from it.
+ * @param {string[]} args `[]`, or the `<remote> <url>` git passes the pre-push hook.
+ * @returns {number} Exit code.
+ */
+function cmdGuardPrePush(root, args) {
   const lines = parsePushLines(readStdin());
   if (lines.length === 0) return EXIT_OK;
   const top = gitToplevel(root);
-  const today = todayUtc();
-  const commits = commitsToPush(top, lines);
-  const readBlob = makeBlobReader(top);
-  // Text analyses by blob id for this run: path, date and image rules still run per commit.
-  const analyses = new Map();
+  const destination = args.length === 2 ? { remote: args[0], url: args[1] } : null;
+  const pushed = peelPushed(top, lines);
+  const commits = commitsToPush(top, pushed.filter(({ type }) => type === 'commit'), destination);
+  const trees = [...new Set(pushed.filter(({ type }) => type === 'tree').map(({ oid }) => oid))];
+  // Text analyses by blob id for this run: path, date and image rules still run per snapshot.
+  // The working tree's draft-folder links are read once and applied to every pushed snapshot.
+  const context = {
+    readBlob: makeBlobReader(top), today: todayUtc(), analyses: new Map(),
+    draftLinkProblems: makeDraftLinkCheck(top),
+  };
 
   const problems = [];
-  let refusedCommits = 0;
+  // Refused objects by type, in the order the summary names them.
+  const refused = new Map([['commit', new Set()], ['tree', new Set()], ['blob', new Set()]]);
+  const report = (oid, type, errors) => {
+    if (errors.length === 0) return;
+    if (!refused.has(type)) refused.set(type, new Set());
+    refused.get(type).add(oid);
+    for (const message of errors) problems.push(`${oid.slice(0, 7)}: ${message}`);
+  };
   for (const commit of commits) {
     // The complete tree of every pushed commit, not only the tip: a draft
     // added and later deleted, or an image folder whose post was deleted, is
     // published by the commit that holds it.
-    const tree = parseTree(git(top, ['ls-tree', '-r', '-z', '--full-tree', commit]));
+    const entries = parseTree(git(top, ['ls-tree', '-r', '-z', '--full-tree', commit]));
     // --root lists a root commit's files; --diff-merges=first-parent lists a merge's changes.
     const changed = splitNul(git(top, [
       'diff-tree', '-r', '--root', '--no-commit-id', '--name-only', '--diff-filter=AMT',
       '--diff-merges=first-parent', '-z', commit,
     ]));
-    const errors = [];
-    for (const [p, { mode }] of tree) {
-      const modeProblem = articleModeProblem(p, mode);
-      if (modeProblem !== null) errors.push(modeProblem);
-    }
-    const articles = readArticles(changed, (p) => tree.get(p), readBlob, errors);
-    const content = checkTrackedContent({ paths: [...tree.keys()], articles, todayUtc: today, cache: analyses });
-    for (const message of content) errors.push(message);
-    if (errors.length > 0) {
-      refusedCommits += 1;
-      const short = commit.slice(0, 7);
-      for (const message of errors) problems.push(`${short}: ${message}`);
-    }
+    report(commit, 'commit', snapshotProblems(entries, changed, context));
+  }
+  for (const tree of trees) {
+    // A tree has no parent to compare with: every article in it is new to the remote.
+    const entries = parseTree(git(top, ['ls-tree', '-r', '-z', '--full-tree', tree]));
+    report(tree, 'tree', snapshotProblems(entries, [...entries.keys()], context));
+  }
+  for (const { localRef, oid, type } of pushed) {
+    if (type === 'commit' || type === 'tree') continue;
+    report(oid, type, [`${localRef} points at a ${type}, which has no path, so guard cannot check it against `
+      + 'the content rules; push a branch or tag that points at a commit instead']);
   }
 
   if (problems.length > 0) {
     for (const message of problems) fail(message);
-    process.stderr.write(`guard: push refused (${plural(problems.length, 'problem')} in `
-      + `${plural(refusedCommits, 'commit')}).\n`);
+    const objects = objectCounts([...refused].map(([type, ids]) => [ids.size, type]));
+    emit(process.stderr, `guard: push refused (${plural(problems.length, 'problem')} in ${objects}).`);
     return EXIT_INVALID;
   }
-  say(`guard: ok (${plural(commits.length, 'commit')} checked)`);
+  say(`guard: ok (${objectCounts([[commits.length, 'commit'], [trees.length, 'tree']])} checked)`);
   return EXIT_OK;
 }
 
@@ -2379,12 +2837,20 @@ function parseArgs(argv) {
     if (args.length > 1) throw new UsageError(`unexpected arguments for ${command}: ${args.slice(1).join(' ')}`);
   }
   if (command === 'guard') {
-    if (args.length > 0) throw new UsageError(`unexpected arguments for guard: ${args.join(' ')}`);
     if (modes.length !== 1) throw new UsageError('guard needs exactly one of --staged or --pre-push');
+    if (modes[0] === '--staged' && args.length > 0) {
+      throw new UsageError(`unexpected arguments for guard --staged: ${args.join(' ')}`);
+    }
+    // The pre-push hook passes git's <remote> <url> pair; a run by hand may leave both out.
+    if (modes[0] === '--pre-push' && args.length !== 0 && args.length !== 2) {
+      throw new UsageError(`guard --pre-push takes either no arguments or <remote> <url>, not ${plural(args.length, 'argument')}`
+        + `: ${args.join(' ')}`);
+    }
   }
 
   const root = path.resolve(rootArg ?? process.cwd());
-  const rootStat = fs.statSync(root, { throwIfNoEntry: false });
+  // A name too long for the filesystem, or a link loop, cannot be a folder either: also a usage error.
+  const rootStat = statOrUndefined(root, true);
   if (rootStat === undefined || !rootStat.isDirectory()) throw new UsageError(`--root ${root} is not a directory`);
   if (command !== 'guard') assertSiteRoot(root, rootArg !== null);
   return { help, root, command, args, modes };
@@ -2423,7 +2889,7 @@ function assertSiteRoot(root, given) {
 function run(argv) {
   const { help, root, command, args, modes } = parseArgs(argv);
   if (help) {
-    process.stdout.write(USAGE);
+    printUsage(process.stdout);
     return EXIT_OK;
   }
   switch (command) {
@@ -2436,7 +2902,7 @@ function run(argv) {
     case 'unpublish':
       return cmdUnpublish(root, args[0]);
     default:
-      return modes[0] === '--staged' ? cmdGuardStaged(root) : cmdGuardPrePush(root);
+      return modes[0] === '--staged' ? cmdGuardStaged(root) : cmdGuardPrePush(root, args);
   }
 }
 
@@ -2445,7 +2911,9 @@ function run(argv) {
  * failure, git errors included, exits 1, so a guard that cannot complete its
  * checks refuses rather than allows. The exit code is set rather than forced
  * so buffered output to a pipe is flushed first. A closed output pipe leaves
- * it as it is (`watchOutput`).
+ * it as it is (`watchOutput`). A git error, which can carry git's own
+ * multi-line stderr, and an unexpected error's stack are reported with
+ * `failLines`: their further lines are indented.
  */
 function main() {
   watchOutput();
@@ -2454,16 +2922,20 @@ function main() {
   } catch (err) {
     if (err instanceof UsageError) {
       fail(err.message);
-      process.stderr.write(`\n${USAGE}`);
+      emit(process.stderr, '');
+      printUsage(process.stderr);
       process.exitCode = EXIT_USAGE;
     } else if (err instanceof GitError) {
-      fail(err.message);
+      failLines(err.message);
       fail('guard could not complete its checks, so it refuses (fail closed)');
       process.exitCode = EXIT_INVALID;
+    } else if (typeof err?.code === 'string') {
+      // A system error (it carries a code such as EACCES) is reported by its message.
+      fail(err.message);
+      process.exitCode = EXIT_INVALID;
     } else {
-      // A system error (it carries a code such as EACCES) is reported by its
-      // message; anything else is unexpected, so its stack is kept.
-      fail(typeof err?.code === 'string' ? err.message : (err?.stack ?? String(err)));
+      // Anything else is unexpected, so its stack is kept.
+      failLines(err?.stack ?? String(err));
       process.exitCode = EXIT_INVALID;
     }
   }
