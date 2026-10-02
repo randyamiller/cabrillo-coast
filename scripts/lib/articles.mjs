@@ -2326,6 +2326,27 @@ const FM_INTENDED_KEY_RE = /^[ \t]*([A-Za-z_][A-Za-z0-9_]*)[ \t]*:/;
  * @type {WeakMap<object, ReadonlySet<string>>}
  */
 const REFUSED_KEYS = new WeakMap();
+/**
+ * The first character of a front-matter line that Jekyll's YAML parser
+ * (libyaml, through Psych and SafeYAML) does not read as part of that line:
+ * a key of `FM_YAML_LINE_BREAKS`, or any character outside libyaml's
+ * printable set of tab, U+0020 to U+007E, U+0085, U+00A0 to U+D7FF, U+E000
+ * to U+FFFD and U+10000 to U+10FFFF (a line feed never occurs inside a
+ * line). The `u` flag reads a surrogate pair as one character and finds a
+ * lone surrogate. One character class, so a search is linear in the line.
+ */
+const FM_UNREAD_CHAR_RE = /[^\t\x20-\x7E\u00A0-\u2027\u202A-\uD7FF\uE000-\uFFFD\u{10000}-\u{10FFFF}]/u;
+/**
+ * The characters other than a line feed at which YAML ends a line, with the
+ * names the errors give them. A carriage return before a line feed is part
+ * of a CRLF line ending and never reaches a line's text.
+ */
+const FM_YAML_LINE_BREAKS = new Map([
+  ['\r', 'carriage return'],
+  ['\u0085', 'next line'],
+  ['\u2028', 'line separator'],
+  ['\u2029', 'paragraph separator'],
+]);
 /** The characters a front-matter value may not hold: JavaScript's line terminators. */
 const FM_LINE_TERMINATOR_RE = /[\n\r\u2028\u2029]/;
 const FM_TRAILER_RE = /^(?:[ \t]*|[ \t]+#.*)$/;
@@ -2578,6 +2599,29 @@ function withoutPlainComment(raw) {
 }
 
 /**
+ * The error for front-matter line `n`, whose text is `line`, when it holds a
+ * character `FM_UNREAD_CHAR_RE` finds, or null when it holds none. The error
+ * names the first such character as `U+XXXX` and its 1-based column, counted
+ * in characters (code points) of `line`. Linear in the line's length.
+ */
+function unreadCharError(line, n) {
+  const m = FM_UNREAD_CHAR_RE.exec(line);
+  if (m === null) return null;
+  const point = m[0].codePointAt(0);
+  const code = `U+${point.toString(16).toUpperCase().padStart(4, '0')}`;
+  const column = charCount(line.slice(0, m.index)) + 1;
+  const breakName = FM_YAML_LINE_BREAKS.get(m[0]);
+  if (breakName !== undefined) {
+    return `front matter line ${n}: line-break character ${code} (${breakName}) at column ${column} is not allowed; `
+      + 'YAML ends a line there, so Jekyll would read the text after it as a separate line that these checks never see';
+  }
+  // Below U+00A0 the refused characters are C0 and C1 controls and DEL; above it, U+FFFE, U+FFFF and lone surrogates.
+  const kind = point < 0xa0 ? 'control character' : 'non-printable character';
+  return `front matter line ${n}: ${kind} ${code} at column ${column} is not allowed; Jekyll's YAML parser refuses it `
+    + 'and drops the whole front matter, publishing the post without its title, summary and tags';
+}
+
+/**
  * Splits an article into front matter and body, reading front matter with a
  * restricted YAML subset and no library.
  *
@@ -2597,12 +2641,26 @@ function withoutPlainComment(raw) {
  * article schema are kept in `data` so `validateArticle` can reject them by
  * name. A duplicate key is an error and the first value is kept.
  *
+ * Every front-matter line, comments and blank lines included, is first read
+ * for the characters Jekyll's YAML parser treats differently from these
+ * rules (see `FM_UNREAD_CHAR_RE`), and a line holding one gets a single error
+ * naming the first such character and its column, and nothing on it is read:
+ *   - a carriage return that is not part of the line ending, U+0085,
+ *     U+2028 or U+2029: YAML ends a line there although these rules do not,
+ *     so the text after it (`# note\rpublished: false`) would set a key
+ *     Jekyll applies and no check sees;
+ *   - any other character outside YAML's printable set, such as a C0 control
+ *     other than tab, DEL, a C1 control, U+FFFE or a lone surrogate: Jekyll's
+ *     YAML parser refuses it and drops the whole front matter, so the post
+ *     would publish without its title, summary and tags.
+ *
  * A key refused on its own line is left out of `data`, and its line error is
  * the one finding about it: `validateArticle`, given this `data` object, does
  * not also report that key as missing. That covers a value that does not
- * parse (`title: Unquoted`), a line led by `key:` that is not a supported
- * `key: value` form (`title:"x"`, a value holding U+2028), a schema key's
- * line that is indented (`  title: "x"`) or has blanks before its colon
+ * parse (`title: Unquoted`), a line holding such a character
+ * (`title: "a\u2028b"`), a line led by `key:` that is not a supported
+ * `key: value` form (`title:"x"`), a schema key's line that is indented
+ * (`  title: "x"`) or has blanks before its colon
  * (`title : "x"`), and a schema key in
  * another letter case, reported as `key Title must be lowercase (title)`. Any
  * other key in another case (`Published:`) is unsupported syntax. The refused
@@ -2654,9 +2712,23 @@ export function parseArticle(text) {
   const errors = [];
   const seen = new Set();
   const refused = new Set();
+  // A line meant to set a schema key names that key even when the line is refused, so the
+  // line's error is the key's one finding.
+  const refuseIntendedKey = (line) => {
+    const intended = FM_INTENDED_KEY_RE.exec(line)?.[1].toLowerCase();
+    if (intended !== undefined && ALLOWED_KEYS.includes(intended)) refused.add(intended);
+  };
   for (let i = 1; i < close; i += 1) {
     const line = stripCr(lines[i].text);
     const n = i + 1;
+    // Read before comments and blank lines are skipped: a key YAML finds after a line break
+    // inside a comment would otherwise reach Jekyll unchecked.
+    const unread = unreadCharError(line, n);
+    if (unread !== null) {
+      errors.push(unread);
+      refuseIntendedKey(line);
+      continue;
+    }
     if (FM_BLANK_RE.test(line) || FM_COMMENT_RE.test(line)) continue;
     const m = readKeyLine(line);
     if (m) {
@@ -2674,10 +2746,8 @@ export function parseArticle(text) {
         setOwn(data, key, parsed.value);
       }
     } else {
-      // A line meant to set a schema key names that key even when its form is unsupported, so the
-      // line's error is the key's one finding: indented, with blanks before the colon, or in capitals.
-      const intended = FM_INTENDED_KEY_RE.exec(line)?.[1].toLowerCase();
-      if (intended !== undefined && ALLOWED_KEYS.includes(intended)) refused.add(intended);
+      // Also when its form is unsupported: indented, with blanks before the colon, or in capitals.
+      refuseIntendedKey(line);
       if (/^[ \t]/.test(line)) {
         errors.push(`front matter line ${n}: indentation is not supported`);
       } else if (line.startsWith('-')) {
@@ -4633,7 +4703,11 @@ function analyzeArticle(text) {
  *   4. every `assets/blog/<slug>/` folder has a matching
  *      `_posts/…/YYYY-MM-DD-<slug>.md`, and no file sits directly in
  *      `assets/blog/`. Because `paths` is the whole tree, a deletion of a
- *      post whose image folder remains is caught.
+ *      post whose image folder remains is caught. When `files` is given,
+ *      every entry in an `assets/blog/<slug>/` folder must also be one of
+ *      `files`, a regular file: a symbolic link or submodule there is no
+ *      image `check` accepts, and a link that leads nowhere in a fresh clone
+ *      fails the Pages build.
  * Each rule keeps material from being hidden from the site while staying
  * world-readable on GitHub. For the same reason:
  *   - nothing is tracked in a `_posts/` folder below the root, such as
@@ -4659,17 +4733,24 @@ function analyzeArticle(text) {
  * of an `assets/blog/<slug>/` folder.
  *
  * Each given article is then parsed, validated as a post with its images
- * checked against `paths`, and scanned for unsafe markup, with every finding
- * on its file line. What depends on an article's text alone (its parse, code
- * regions, placeholder lines, images and unsafe-markup findings) is stored in
- * `cache` under the article's `id`, so a caller checking the same blob in
- * several trees, as `guard --pre-push` does across commits, parses it once.
- * An entry is reused only for identical text, and the filename, date, folder
- * and image-existence rules run for every article on every call.
+ * checked against `paths` (and, when given, `files`: an image exists only as
+ * a regular file, as `check` judges it), and scanned for unsafe markup, with
+ * every finding on its file line. What depends on an article's text alone
+ * (its parse, code regions, placeholder lines, images and unsafe-markup
+ * findings) is stored in `cache` under the article's `id`, so a caller
+ * checking the same blob in several trees, as `guard --pre-push` does across
+ * commits, parses it once. An entry is reused only for identical text, and
+ * the filename, date, folder and image-existence rules run for every article
+ * on every call.
  *
  * @param {object} args
  * @param {string[]} args.paths The complete tree as repository-relative POSIX paths
  *   (a leading `./` is removed; empty strings are ignored).
+ * @param {Iterable<string> | null} [args.files] The paths of `paths` that are regular files,
+ *   normalized as `paths` are; every other entry is a symbolic link or submodule, such as
+ *   index or tree modes `120000` and `160000`. Omitted, `null` or `undefined`, every path
+ *   counts as a regular file. Any other value that is not an iterable of strings, a string
+ *   included, is a `TypeError`.
  * @param {Array<{ path: string, text: string, id?: string }>} [args.articles] Articles to
  *   validate, typically those added or changed (default `[]`). `id`, such as the git blob id,
  *   names the text in `cache`; it must be a non-empty string when given, and an article
@@ -4682,7 +4763,7 @@ function analyzeArticle(text) {
  * @returns {string[]} Errors, each starting with its path; path rules first, then the
  *   articles in input order. Identical messages are reported once.
  */
-export function checkTrackedContent({ paths, articles, todayUtc, cache } = {}) {
+export function checkTrackedContent({ paths, articles, todayUtc, files, cache } = {}) {
   const today = resolveToday(todayUtc);
   if (cache !== undefined && cache !== null && !(cache instanceof Map)) throw new TypeError('cache must be a Map');
   const analyses = cache ?? new Map();
@@ -4695,6 +4776,19 @@ export function checkTrackedContent({ paths, articles, todayUtc, cache } = {}) {
     pathSet.add(n);
     tree.push(n);
   }
+  // The regular files among `paths`, or null when every path counts as one.
+  let fileSet = null;
+  if (files !== undefined && files !== null) {
+    if (typeof files === 'string' || typeof files[Symbol.iterator] !== 'function') {
+      throw new TypeError('files must be an iterable of strings');
+    }
+    fileSet = new Set();
+    for (const p of files) {
+      if (typeof p !== 'string') throw new TypeError('files must contain strings');
+      fileSet.add(normalizePath(p));
+    }
+  }
+  const isRegularFile = (p) => fileSet === null || fileSet.has(p);
   const errors = [];
 
   // Rule 1 and the folder rules (`folderRefusal`): drafts and draft images,
@@ -4738,7 +4832,7 @@ export function checkTrackedContent({ paths, articles, todayUtc, cache } = {}) {
     if (m && isCalendarDate(m[1]) && m[1] > today) errors.push(futureDateMessage(p, m[1], today));
   }
 
-  // Rule 4: article image folders need their post.
+  // Rule 4: article image folders need their post and hold only regular files.
   const imageSlugs = new Set();
   for (const p of tree) {
     if (!p.startsWith('assets/blog/')) continue;
@@ -4748,6 +4842,10 @@ export function checkTrackedContent({ paths, articles, todayUtc, cache } = {}) {
       errors.push(`${p}: files directly in assets/blog/ are not allowed; images belong in assets/blog/<slug>/`);
       continue;
     }
+    if (!isRegularFile(p)) {
+      errors.push(`${p}: images in assets/blog/ must be regular files; a symbolic link or submodule here counts as `
+        + 'a missing image, as check counts it, and a link that leads nowhere fails the Pages build');
+    }
     const slug = rest.slice(0, slash);
     if (imageSlugs.has(slug)) continue;
     imageSlugs.add(slug);
@@ -4756,8 +4854,11 @@ export function checkTrackedContent({ paths, articles, todayUtc, cache } = {}) {
     }
   }
 
-  // Article rules on the given articles.
-  const imageExists = (publicPath) => pathSet.has(publicPath.replace(/^\//, ''));
+  // Article rules on the given articles; an image exists only as a regular file in the tree.
+  const imageExists = (publicPath) => {
+    const p = publicPath.replace(/^\//, '');
+    return pathSet.has(p) && isRegularFile(p);
+  };
   for (const article of articles ?? []) {
     if (typeof article?.path !== 'string' || article.path === '') {
       throw new TypeError('each article needs a non-empty path');

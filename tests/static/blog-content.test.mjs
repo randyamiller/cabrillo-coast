@@ -41,6 +41,7 @@ import assert from 'node:assert/strict';
 import {
   closeSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   openSync,
@@ -368,6 +369,25 @@ function isFile(rel) {
   }
 }
 
+/** Whether a repository path names an entry on disk of any type, a dangling symbolic link included. */
+function onDisk(rel) {
+  try {
+    lstatSync(abs(rel));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether a repository path is itself a regular file: a symbolic link, even to a file, is not one. */
+function isOwnFile(rel) {
+  try {
+    return lstatSync(abs(rel)).isFile();
+  } catch {
+    return false;
+  }
+}
+
 /** Runs git in `ROOT` and returns its standard output; throws with git's message on failure. */
 function git(args) {
   try {
@@ -406,12 +426,13 @@ function assertRepositoryRoot() {
  * Every path in the working tree that git does not ignore: tracked files plus
  * untracked, non-ignored ones, so a post is checked before its first commit.
  * Conflict stages are de-duplicated, and paths deleted from disk but still in
- * the index are left out. Ignored local drafts never appear.
+ * the index are left out. A symbolic link is kept whether or not its target
+ * exists, as git tracks the link itself. Ignored local drafts never appear.
  */
 function workingTreePaths() {
   const listed = git(['ls-files', '-z', '--cached', '--others', '--exclude-standard']).split('\0');
   const unique = [...new Set(listed.filter((p) => p !== ''))];
-  return unique.filter((p) => exists(p));
+  return unique.filter((p) => onDisk(p));
 }
 
 /** Repository-relative POSIX paths of the `.md` files below `dir` (none when `dir` is absent). */
@@ -1362,7 +1383,9 @@ test('[AC-01][F-017] the working tree passes the tracked-content rules guard app
   }
   t.diagnostic(`checked ${paths.length} paths and ${articlePaths.length} articles against ${TODAY_UTC} (UTC)`);
 
-  const findings = [...undecodable, ...checkTrackedContent({ paths, articles, todayUtc: TODAY_UTC })];
+  // Regular files by their own type, as guard reads them from index modes: a linked image counts as missing.
+  const files = paths.filter((p) => isOwnFile(p));
+  const findings = [...undecodable, ...checkTrackedContent({ paths, files, articles, todayUtc: TODAY_UTC })];
   assert.deepEqual(findings, [], `tracked content breaks the publishing rules:\n${findings.join('\n')}`);
 });
 
@@ -1430,6 +1453,15 @@ function skippedFolderRefusal(rel, folder) {
   return new RegExp(`^${regExpLiteral(rel)}: folder ${regExpLiteral(folder)}/ is not allowed in _posts/; Jekyll can skip folders `
     + 'whose names start with _, \\., # or ~, so a post in one could stay off the site while public on GitHub$');
 }
+
+/** The refusal of `rel`, an entry in an `assets/blog/<slug>/` folder that `files` does not list as a regular file. */
+function nonFileImageRefusal(rel) {
+  return new RegExp(`^${regExpLiteral(rel)}: images in assets/blog/ must be regular files; a symbolic link or submodule here `
+    + 'counts as a missing image, as check counts it, and a link that leads nowhere fails the Pages build$');
+}
+
+/** `ALPHA_PATH`'s refusal for its figure, `assets/blog/alpha/fig.png`, missing from the tree or not a regular file. */
+const ALPHA_IMAGE_MISSING = /^_posts\/2026-03-01-alpha\.md:8: image \/assets\/blog\/alpha\/fig\.png does not exist$/;
 
 /**
  * Tree cases for `checkTrackedContent` against `FIXED_TODAY`: each changes a
@@ -1621,7 +1653,74 @@ const TREE_CASES = Object.freeze([
   {
     name: 'an image the tree does not hold is refused',
     change: (tree) => removePath(tree, 'assets/blog/alpha/fig.png'),
-    expect: [/^_posts\/2026-03-01-alpha\.md:8: image \/assets\/blog\/alpha\/fig\.png does not exist$/],
+    expect: [ALPHA_IMAGE_MISSING],
+  },
+  {
+    name: 'an image files leaves out (a symbolic link or submodule) is refused and counts as missing',
+    change: (tree) => {
+      tree.files = tree.paths.filter((p) => p !== 'assets/blog/alpha/fig.png');
+    },
+    expect: [nonFileImageRefusal('assets/blog/alpha/fig.png'), ALPHA_IMAGE_MISSING],
+  },
+  {
+    name: 'an empty files list refuses only the image-folder entry, never the post or the configuration',
+    change: (tree) => {
+      tree.files = [];
+    },
+    expect: [nonFileImageRefusal('assets/blog/alpha/fig.png'), ALPHA_IMAGE_MISSING],
+  },
+  {
+    name: 'an unreferenced entry that is not a regular file beside a valid image is refused',
+    change: (tree) => {
+      tree.paths.push('assets/blog/alpha/extra.png');
+      tree.files = tree.paths.filter((p) => p !== 'assets/blog/alpha/extra.png');
+    },
+    expect: [nonFileImageRefusal('assets/blog/alpha/extra.png')],
+  },
+  {
+    name: 'an entry that is not a regular file in a folder without a post is refused for both',
+    change: (tree) => {
+      tree.paths.push('assets/blog/ghost/fig.png');
+      tree.files = tree.paths.filter((p) => p !== 'assets/blog/ghost/fig.png');
+    },
+    expect: [nonFileImageRefusal('assets/blog/ghost/fig.png'), /^assets\/blog\/ghost\/: image folder has no matching _posts\/\*-ghost\.md$/],
+  },
+  {
+    name: 'a regular file listed in files but absent from paths does not make the image exist',
+    change: (tree) => {
+      removePath(tree, 'assets/blog/alpha/fig.png');
+      tree.files = [...tree.paths, 'assets/blog/alpha/fig.png'];
+    },
+    expect: [ALPHA_IMAGE_MISSING],
+  },
+  {
+    name: 'files listing every path accepts the tree',
+    change: (tree) => {
+      tree.files = [...tree.paths];
+    },
+    expect: [],
+  },
+  {
+    name: 'files given as a Set of ./-led paths is normalized as paths are and accepts the tree',
+    change: (tree) => {
+      tree.files = new Set(tree.paths.map((p) => `./${p}`));
+    },
+    expect: [],
+  },
+  {
+    name: 'files given as null counts every path as a regular file, as when it is omitted',
+    change: (tree) => {
+      tree.files = null;
+    },
+    expect: [],
+  },
+  {
+    name: 'files given as undefined counts every path as a regular file, as when it is omitted',
+    change: (tree) => {
+      tree.files = undefined;
+      tree.paths.push('assets/blog/alpha/extra.png');
+    },
+    expect: [],
   },
 ]);
 
@@ -1632,6 +1731,19 @@ test('[AC-01][F-017] checkTrackedContent accepts a valid synthetic tree and refu
       change(tree);
       assertFindings(checkTrackedContent({ ...tree, todayUtc: FIXED_TODAY }), expect, name);
     });
+  }
+});
+
+test('[AC-01][F-017] checkTrackedContent refuses a files argument that is not an iterable of strings', () => {
+  const notIterable = { 'a string': 'assets/blog/alpha/fig.png', 'a number': 42, 'a boolean': true, 'an object': {}, 'a function': () => [] };
+  for (const [label, files] of Object.entries(notIterable)) {
+    assert.throws(() => checkTrackedContent({ ...baseTree(), files, todayUtc: FIXED_TODAY }),
+      { name: 'TypeError', message: 'files must be an iterable of strings' }, `files as ${label}`);
+  }
+  const notStrings = { 'a number': [1], 'a null among paths': ['assets/blog/alpha/fig.png', null], 'a symbol in a Set': new Set([Symbol('x')]) };
+  for (const [label, files] of Object.entries(notStrings)) {
+    assert.throws(() => checkTrackedContent({ ...baseTree(), files, todayUtc: FIXED_TODAY }),
+      { name: 'TypeError', message: 'files must contain strings' }, `files holding ${label}`);
   }
 });
 
@@ -2180,6 +2292,9 @@ const refusedDefault = (key) => new RegExp(`^_config\\.yml: line \\d+: defaults 
 const refusedExclude = (entry, post = HELD_POST) => new RegExp(`^_config\\.yml: line \\d+: exclude entry `
   + `${regExpLiteral(JSON.stringify(entry))} keeps ${regExpLiteral(post)} off the site while GitHub still shows it; `);
 
+/** The refusal of a configuration line holding a character YAML reads differently, `what` written as a pattern. */
+const unreadConfigChar = (what) => new RegExp(`^_config\\.yml: unsupported YAML at line \\d+: ${what} is not supported; `);
+
 /** The refusal of `future`, `show_drafts` or `unpublished` holding the value described as `got`. */
 const refusedSwitch = (key, got) => new RegExp(`^_config\\.yml: line \\d+: ${key} must be boolean false or null `
   + `\\(got ${regExpLiteral(got)}\\); Jekyll then builds `);
@@ -2286,7 +2401,36 @@ const SITE_CONFIG_CONTROLS = Object.freeze([
       refusedSwitch('future', 'a value this reader cannot read'),
     ],
   },
+  // A line break YAML ends a line at, other than LF, hides the key after it inside a comment from a
+  // reader that splits at LF only: SafeYAML applied each hidden `limit_posts: 1` below. A character
+  // outside YAML's printable set makes SafeYAML refuse the whole file. Either is refused on its line.
+  ...[['\r', 'U+000D', 'carriage return'], ['\u0085', 'U+0085', 'next line'], ['\u2028', 'U+2028', 'line separator'],
+    ['\u2029', 'U+2029', 'paragraph separator']].map(([char, code, label]) => ({
+    name: `a ${label} in a comment, hiding limit_posts: 1`,
+    change: (text) => `${text}# x${char}limit_posts: 1\n`,
+    expect: [unreadConfigChar(`line-break character ${regExpLiteral(code)} \\(${label}\\) at column 4`)],
+  })),
+  {
+    name: 'a next line in the comment after a plain value, hiding limit_posts: 1',
+    change: (text) => replaceOnce(text, '\nfuture: false\n', '\nfuture: false #\u0085limit_posts: 1\n'),
+    expect: [unreadConfigChar('line-break character U\\+0085 \\(next line\\) at column 16')],
+  },
+  {
+    name: 'an escape character in a quoted value',
+    change: (text) => replaceOnce(text, '\ntitle: Cabrillo Coast\n', '\ntitle: "Cabrillo\u001bCoast"\n'),
+    expect: [unreadConfigChar('control character U\\+001B at column 17')],
+  },
+  ...[['\u0000', 'U+0000', 'control'], ['\u000c', 'U+000C', 'control'], ['\u007f', 'U+007F', 'control'],
+    ['\u0090', 'U+0090', 'control'], ['\ufffe', 'U+FFFE', 'non-printable'], ['\ud800', 'U+D800', 'non-printable']]
+    .map(([char, code, kind]) => ({
+      name: `${kind} character ${code} in a comment`,
+      change: (text) => `${text}# a${char}b\n`,
+      expect: [unreadConfigChar(`${kind} character ${regExpLiteral(code)} at column 4`)],
+    })),
   // Accepted: each leaves both posts on the site.
+  ...[['a tab', '\t'], ['a no-break space', '\u00a0'], ['a byte-order mark', '\ufeff'], ['an emoji', '\u{1f600}']]
+    .map(([label, char]) => ({ name: `${label} inside a comment`, change: (text) => `${text}# a${char}b\n`, expect: [] })),
+  { name: 'CRLF line endings', change: (text) => text.replace(/\n/g, '\r\n'), expect: [] },
   { name: 'an author default', change: heldDefault('author: "Someone Else"'), expect: [] },
   ...['./_posts', '//_posts', '_postsx', '_post[s]', '2026-01-01-held.md', '_posts/2027*'].map((entry) => ({
     name: `exclude entry ${JSON.stringify(entry)}, which matches no tracked post`,
@@ -2740,6 +2884,22 @@ const replaceLine = (index, text) => VALID_FRONT_MATTER.map((line, i) => (i === 
 /** A pattern matching exactly the finding `${SCHEMA_POST}: ${message}`. */
 const schemaFinding = (message) => new RegExp(`^${regExpLiteral(`${SCHEMA_POST}: ${message}`)}$`);
 
+/** parseArticle's error for front-matter file line `line` holding the YAML line break `code`, called `name`, at `column`. */
+function lineBreakError(line, code, name, column) {
+  return `front matter line ${line}: line-break character ${code} (${name}) at column ${column} is not allowed; `
+    + 'YAML ends a line there, so Jekyll would read the text after it as a separate line that these checks never see';
+}
+
+/**
+ * parseArticle's error for front-matter file line `line` holding `code`, a
+ * character outside YAML's printable set, at `column`: a `control character`
+ * below U+00A0, otherwise a `non-printable character`.
+ */
+function unprintableError(line, code, column, kind = 'control character') {
+  return `front matter line ${line}: ${kind} ${code} at column ${column} is not allowed; Jekyll's YAML parser refuses it `
+    + 'and drops the whole front matter, publishing the post without its title, summary and tags';
+}
+
 /**
  * Front matter in which `parseArticle` refuses a title, summary or tags line,
  * or lacks the line, with every finding `check` reports for it: the parse
@@ -2771,7 +2931,11 @@ const REFUSED_KEY_CASES = Object.freeze([
     expect: ['front matter line 2: title: unsupported escape \\n in a double-quoted string; only \\" and \\\\ are allowed'],
   },
   { name: 'an empty title', lines: replaceLine(0, 'title:'), expect: ['front matter line 2: title has no value'] },
-  { name: 'a title holding U+2028', lines: replaceLine(0, 'title: "a\u2028b"'), expect: ['front matter line 2: unsupported syntax'] },
+  {
+    name: 'a title holding U+2028',
+    lines: replaceLine(0, 'title: "a\u2028b"'),
+    expect: [lineBreakError(2, 'U+2028', 'line separator', 10)],
+  },
   { name: 'a title with no space after its colon', lines: replaceLine(0, 'title:"No space"'), expect: ['front matter line 2: unsupported syntax'] },
   { name: 'an indented title', lines: replaceLine(0, '  title: "Present title"'), expect: ['front matter line 2: indentation is not supported'] },
   { name: 'a tab-indented title', lines: replaceLine(0, '\ttitle: "Present title"'), expect: ['front matter line 2: indentation is not supported'] },
@@ -2827,6 +2991,146 @@ test('[AC-04][F-017] a front-matter line parseArticle refuses is its key\'s one 
     assert.deepEqual(validateArticle({ ...args, data }), []);
     assertFindings(validateArticle({ ...args, data: { ...data } }), [schemaFinding('title is required')], 'a copy of data');
   });
+});
+
+/**
+ * Front matter holding a character Jekyll's YAML parser reads otherwise than
+ * `parseArticle`'s lines: a line break YAML ends a line at, so the key after
+ * it (`published: false`, a future `date:`) is applied by Jekyll yet unseen
+ * by a reading that splits only at line feeds, or a character outside YAML's
+ * printable set, which makes Jekyll drop the whole front matter. Each case
+ * lists the one error of its line and the keys that still reach `data`
+ * (`keys`, by default the three of `VALID_FRONT_MATTER`): nothing on the line
+ * is read, and a refused schema key is never also reported missing.
+ */
+const UNREAD_CHAR_CASES = Object.freeze([
+  {
+    name: 'a lone carriage return in a comment, hiding published: false',
+    lines: [...VALID_FRONT_MATTER, '# note\rpublished: false'],
+    expect: [lineBreakError(5, 'U+000D', 'carriage return', 7)],
+  },
+  {
+    name: 'U+0085 (next line) in a comment, hiding published: false',
+    lines: [...VALID_FRONT_MATTER, '# note\u0085published: false'],
+    expect: [lineBreakError(5, 'U+0085', 'next line', 7)],
+  },
+  {
+    name: 'U+2028 (line separator) in a comment, hiding published: false',
+    lines: [...VALID_FRONT_MATTER, '# note\u2028published: false'],
+    expect: [lineBreakError(5, 'U+2028', 'line separator', 7)],
+  },
+  {
+    name: 'U+2029 (paragraph separator) in a comment, hiding published: false',
+    lines: [...VALID_FRONT_MATTER, '# note\u2029published: false'],
+    expect: [lineBreakError(5, 'U+2029', 'paragraph separator', 7)],
+  },
+  {
+    name: 'U+2028 in a comment, hiding date: 2099-01-01',
+    lines: [...VALID_FRONT_MATTER, '# note\u2028date: 2099-01-01'],
+    expect: [lineBreakError(5, 'U+2028', 'line separator', 7)],
+  },
+  {
+    name: 'a lone carriage return in a comment, hiding date: 2099-01-01',
+    lines: [...VALID_FRONT_MATTER, '# note\rdate: 2099-01-01'],
+    expect: [lineBreakError(5, 'U+000D', 'carriage return', 7)],
+  },
+  {
+    name: 'U+0085 in the comment after a quoted value, hiding published: false',
+    lines: [...VALID_FRONT_MATTER, 'author: "A" #\u0085published: false'],
+    expect: [lineBreakError(5, 'U+0085', 'next line', 14)],
+  },
+  {
+    name: 'U+0085 in the comment after a plain value, hiding published: false',
+    lines: [...VALID_FRONT_MATTER, 'updated: 2026-03-01 #\u0085published: false'],
+    expect: [lineBreakError(5, 'U+0085', 'next line', 22)],
+  },
+  {
+    name: 'U+2028 in the comment after the tags list, hiding published: false',
+    lines: replaceLine(2, 'tags: [testing] #\u2028published: false'),
+    expect: [lineBreakError(4, 'U+2028', 'line separator', 18)],
+    keys: ['title', 'summary'],
+  },
+  {
+    name: 'a lone carriage return after an emoji, whose column counts the emoji once',
+    lines: [...VALID_FRONT_MATTER, '# 😀\rpublished: false'],
+    expect: [lineBreakError(5, 'U+000D', 'carriage return', 4)],
+  },
+  {
+    name: 'one line holding U+2028 and then ESC, with one error for the first',
+    lines: [...VALID_FRONT_MATTER, '# a\u2028b\u001bc'],
+    expect: [lineBreakError(5, 'U+2028', 'line separator', 4)],
+  },
+  {
+    name: 'ESC (U+001B) in a quoted title',
+    lines: replaceLine(0, 'title: "Ctl \u001b title"'),
+    expect: [unprintableError(2, 'U+001B', 13)],
+    keys: ['summary', 'tags'],
+  },
+  ...[
+    ['FF', '\u000c', 'U+000C'],
+    ['NUL', '\u0000', 'U+0000'],
+    ['VT', '\u000b', 'U+000B'],
+    ['DEL', '\u007f', 'U+007F'],
+    ['the C1 control', '\u0080', 'U+0080'],
+    ['the C1 control', '\u009f', 'U+009F'],
+  ].map(([what, character, code]) => ({
+    name: `${what} (${code}) in a comment`,
+    lines: [...VALID_FRONT_MATTER, `# ${character}`],
+    expect: [unprintableError(5, code, 3)],
+  })),
+  ...[
+    ['U+FFFE', '\ufffe'],
+    ['U+FFFF', '\uffff'],
+    ['the lone surrogate U+D800', '\ud800'],
+  ].map(([what, character]) => ({
+    name: `${what} in a comment`,
+    lines: [...VALID_FRONT_MATTER, `# ${character}`],
+    expect: [unprintableError(5, `U+${character.charCodeAt(0).toString(16).toUpperCase()}`, 3, 'non-printable character')],
+  })),
+]);
+
+/**
+ * Articles whose front matter holds only characters Jekyll's YAML parser
+ * reads as `parseArticle` does, at the edges of what the cases above refuse.
+ */
+const READ_CHAR_CASES = Object.freeze([
+  { name: 'a tab inside a quoted title', text: articleSource(replaceLine(0, 'title: "A\ttabbed title"'), 'Body.\n') },
+  { name: 'a no-break space in a comment', text: articleSource([...VALID_FRONT_MATTER, '# a\u00a0note'], 'Body.\n') },
+  {
+    name: 'the edges of the printable set in a comment: ~, U+00A0, U+D7FF, U+E000, U+FEFF, U+FFFD, U+10000 and U+10FFFF',
+    text: articleSource([...VALID_FRONT_MATTER, '# ~\u00a0\ud7ff\ue000\ufeff\ufffd\u{10000}\u{10FFFF}'], 'Body.\n'),
+  },
+  { name: 'CRLF line endings', text: articleSource(VALID_FRONT_MATTER, 'Body.\n').replace(/\n/g, '\r\n') },
+  { name: 'CR CR LF line endings', text: articleSource(VALID_FRONT_MATTER, 'Body.\n').replace(/\n/g, '\r\r\n') },
+  { name: 'a byte-order mark before the opening ---', text: `\uFEFF${articleSource(VALID_FRONT_MATTER, 'Body.\n')}` },
+]);
+
+test('[AC-04][F-017] a front-matter line holding a line break YAML reads, or a character it refuses, is refused alone', async (t) => {
+  for (const { name, lines, expect, keys = ['title', 'summary', 'tags'] } of UNREAD_CHAR_CASES) {
+    await t.test(`[AC-04][F-017] front-matter character: ${name} is refused`, () => {
+      const text = articleSource(lines, 'Body.\n');
+      const { data, body, errors } = parseArticle(text);
+      assert.deepEqual(errors, expect, `${name}: the line's one error`);
+      assert.deepEqual(Object.keys(data), keys, `${name}: nothing on the refused line reaches data`);
+      const args = { path: SCHEMA_POST, data, body, kind: 'post', todayUtc: FIXED_TODAY, bodyStartLine: bodyStartLine(text, body) };
+      assert.deepEqual(validateArticle(args), [], `${name}: no hidden key and no "is required" follows the line's error`);
+      assert.deepEqual(
+        checkTrackedContent({ paths: [SCHEMA_POST], articles: [{ path: SCHEMA_POST, text }], todayUtc: FIXED_TODAY }),
+        expect.map((error) => `${SCHEMA_POST}: ${error}`),
+        `${name}: the tracked-content rules guard and AC-01 apply refuse it with the same error`,
+      );
+    });
+  }
+  for (const { name, text } of READ_CHAR_CASES) {
+    await t.test(`[AC-04][F-017] front-matter character: ${name} is accepted`, () => {
+      const { data, body, errors } = parseArticle(text);
+      assert.deepEqual(errors, [], `${name}: the front matter parses`);
+      assert.deepEqual(Object.keys(data), ['title', 'summary', 'tags'], `${name}: every key is read`);
+      const args = { path: SCHEMA_POST, data, body, kind: 'post', todayUtc: FIXED_TODAY, bodyStartLine: bodyStartLine(text, body) };
+      assert.deepEqual(validateArticle(args), [], `${name}: the article passes the schema`);
+      assert.deepEqual(checkTrackedContent({ paths: [SCHEMA_POST], articles: [{ path: SCHEMA_POST, text }], todayUtc: FIXED_TODAY }), []);
+    });
+  }
 });
 
 
@@ -3750,7 +4054,8 @@ function bodyFindings(body) {
  * re-reads shared input for each item, costs time quadratic or worse in
  * their length: long fence runs, open or closed, at the top level and in
  * list items; closing-fence-shaped lines that never close each other; key
- * lines whose whitespace ends in a line terminator; long whitespace runs in
+ * lines whose whitespace ends in a line terminator; a comment whose long run
+ * of emoji ends in a control character; long whitespace runs in
  * table rows, plain values, flow lists, raw tags, list items and autolinks;
  * many images sharing a label with many definitions; many autolinks on one
  * line; and many tags or attribute lists that all end at the same `>` or `}`.
@@ -3808,19 +4113,24 @@ const FAST_CASES = Object.freeze([
     expect: [true],
   },
   {
-    name: 'a key line with whitespace before U+2028 is unsupported syntax',
+    name: 'a key line with whitespace before U+2028 is refused at that line break',
     run: () => parseArticle(`---\ntitle:${' '.repeat(FAST_KEY_N)}\u2028X\n---\nBody\n`).errors,
-    expect: ['front matter line 2: unsupported syntax'],
+    expect: [lineBreakError(2, 'U+2028', 'line separator', FAST_KEY_N + 7)],
   },
   {
-    name: 'a key line with whitespace before a lone carriage return is unsupported syntax',
+    name: 'a key line with whitespace before a lone carriage return is refused at that line break',
     run: () => parseArticle(`---\ntitle:${' '.repeat(FAST_KEY_N)}\rX\n---\nBody\n`).errors,
-    expect: ['front matter line 2: unsupported syntax'],
+    expect: [lineBreakError(2, 'U+000D', 'carriage return', FAST_KEY_N + 7)],
   },
   {
-    name: 'a key line with tabs before U+2029 is unsupported syntax',
+    name: 'a key line with tabs before U+2029 is refused at that line break',
     run: () => parseArticle(`---\ntitle:${'\t'.repeat(FAST_KEY_N)}\u2029X\n---\nBody\n`).errors,
-    expect: ['front matter line 2: unsupported syntax'],
+    expect: [lineBreakError(2, 'U+2029', 'paragraph separator', FAST_KEY_N + 7)],
+  },
+  {
+    name: 'a comment line with a long run of emoji before a control character is refused at its code-point column',
+    run: () => parseArticle(`---\n# ${'😀'.repeat(FAST_KEY_N)}\u001b\n---\nBody\n`).errors,
+    expect: [unprintableError(2, 'U+001B', FAST_KEY_N + 3)],
   },
   {
     name: 'a table row with a long whitespace run before text gives no finding',

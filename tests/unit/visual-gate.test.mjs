@@ -27,9 +27,13 @@
  * that no `blog-visual-*` workspace is left in its TMPDIR. Together they prove
  * that the baseline comes from the archived base commit while the comparison
  * uses the working tree, on two different servers, that both hold the
- * working tree's fixture articles, and that undeclared, mixed, incomplete,
- * interrupted and unreadable runs, broken baselines and broken builds fail
- * whatever was declared, while the pre-blog base is skipped with a notice.
+ * working tree's fixture articles, that a `Visual-Change: intended` trailer
+ * declares a change from any commit in `<base>..HEAD`, a `--no-ff` merge
+ * commit included, and that undeclared, mixed, incomplete, interrupted and
+ * unreadable runs, broken baselines and broken builds fail whatever was
+ * declared, while the pre-blog base is skipped with a notice.
+ * `--help` and `-h` print the full help and start nothing; beside an unknown
+ * argument they are a usage error.
  *
  * Runs with `node --test tests/unit/visual-gate.test.mjs` or as part of
  * `node --test "tests/**\/*.test.mjs"` (Node 22 or later, git, tar and a
@@ -45,6 +49,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { DEADLINES, formatDuration } from '../../scripts/lib/subprocess.mjs';
 import { strictMismatchMessage } from '../visual/lib/pixels.mjs';
 import { classifyComparison } from '../visual/run-visual.mjs';
 import {
@@ -714,6 +719,35 @@ describe('[AC-16][F-018] run-visual.mjs gate outcomes in temporary git repositor
     expectNoWorkspace(result);
   });
 
+  test('[AC-16][F-018] a Visual-Change: intended trailer carried only by a --no-ff merge commit in base..HEAD is accepted', GATE_CASE, async () => {
+    const site = siteCase('declared-merge-trailer');
+    // The change is committed on a feature branch without a trailer; only the merge commit declares it.
+    const start = git(sandbox.env, site.repo, 'rev-parse', '--abbrev-ref', 'HEAD');
+    git(sandbox.env, site.repo, 'checkout', '-q', '-b', 'restyle');
+    const feature = commitAll(sandbox.env, site.repo, 'Restyle the blog');
+    git(sandbox.env, site.repo, 'checkout', '-q', start);
+    // --no-ff records a merge commit although a fast-forward is possible; hooks never run.
+    git(sandbox.env, site.repo, 'merge', '--no-ff', '--no-verify', '--no-edit', '-q', '-m', 'Merge the restyle', '-m', 'Visual-Change: intended', 'restyle');
+    assert.deepEqual(
+      git(sandbox.env, site.repo, 'rev-list', '--parents', '-n', '1', 'HEAD').split(' ').slice(1),
+      [site.base, feature],
+      'HEAD is a merge commit of the base and the feature commit',
+    );
+    assert.doesNotMatch(git(sandbox.env, site.repo, 'log', '-1', '--format=%B', feature), /visual-change/i, 'the feature commit carries no trailer');
+    assert.match(git(sandbox.env, site.repo, 'log', '-1', '--format=%B', 'HEAD'), /^Visual-Change: intended$/m, 'the merge commit carries the trailer');
+
+    const result = await runGate(site, ['--base', site.base]);
+    expectExit(result, 0);
+    expectLine(result.stdout, `run-visual: intended visual change declared by ${trailerIntent(site.short)}`);
+    expectLine(
+      result.stdout,
+      `Visual comparison: 12 of 12 screenshots differ from base ${site.short}; ` +
+        `the differences are reported and accepted as intended (${trailerIntent(site.short)})`,
+    );
+    assert.deepEqual(modes(result), ['all', 'none']);
+    expectNoWorkspace(result);
+  });
+
   test('[AC-16][F-018] a trailer on the base commit itself lies outside base..HEAD and declares nothing', GATE_CASE, async () => {
     const site = siteCase('trailer-on-base', { message: 'Base commit\n\nVisual-Change: intended\n' });
     commitAll(sandbox.env, site.repo, 'Restyle the blog without a trailer');
@@ -926,6 +960,78 @@ describe('[AC-16][F-018] run-visual.mjs gate outcomes in temporary git repositor
     expectExit(result, 2);
     expectLine(result.stderr, 'run-visual: unknown argument --bogus');
     expectLine(result.stderr, USAGE);
+    assert.deepEqual(result.builds, []);
+    assert.deepEqual(result.runs, []);
+    expectNoWorkspace(result);
+  });
+
+  test('[AC-16][F-018] --help and -h print the full help on stdout, build and run nothing, and exit 0', GATE_CASE, async () => {
+    const site = siteCase('help', { changed: false });
+    const phrases = [
+      // What the run does.
+      'tests/fixtures/build-fixture-site.mjs',
+      'served on 127.0.0.1 under /cabrillo-coast/',
+      "compares the working tree's 12",
+      // Options and the base default.
+      '--base <ref>',
+      'also --base=<ref>',
+      'Default: @{upstream}',
+      'or HEAD when the branch has no upstream',
+      "names no commit or starts with '-' is refused (exit 2)",
+      '-h, --help',
+      // The skip rule.
+      'Skip rule: a base without _layouts/post.html predates the blog',
+      'with a notice and nothing is built (exit 0)',
+      // Declaring intent.
+      'set VISUAL_CHANGE_INTENDED=1',
+      '"Visual-Change: intended"',
+      'trailer in any commit message in <base>..HEAD, merge commits included',
+      'Operational failures are never accepted',
+      // Environment.
+      'JEKYLL_ENV is removed from every git and Playwright child',
+      // Outputs.
+      'tests/visual/report/',
+      'npx playwright show-report tests/visual/report',
+      'tests/visual/test-results/',
+      'blog-visual-*',
+      'removed every run',
+      // Deadlines the runner applies.
+      `each Playwright run ${formatDuration(DEADLINES.playwrightRun)}`,
+      `the trailer scan (git log) ${formatDuration(DEADLINES.gitLog)}`,
+      `each git query ${formatDuration(DEADLINES.gitQuery)}`,
+      `each page request ${formatDuration(DEADLINES.httpRequest)}`,
+      // Exit status and an example.
+      'Exit status: 0 when the 12 screenshots are identical',
+      '1 for an undeclared difference or an operational failure',
+      '2 for a usage',
+      'error or a base that names no commit',
+      '130 when interrupted by SIGINT, 143 by SIGTERM',
+      'node tests/visual/run-visual.mjs --base origin/main',
+    ];
+    const printed = {};
+    for (const flag of ['--help', '-h']) {
+      const result = await runGate(site, [flag]);
+      expectExit(result, 0);
+      assert.equal(result.stderr, '', `${flag} writes nothing on stderr`);
+      assert.equal(result.stdout.split('\n')[0], USAGE, `${flag} prints the usage line first`);
+      for (const phrase of phrases) {
+        assert.ok(result.stdout.includes(phrase), `${flag} mentions ${JSON.stringify(phrase)}:\n${result.stdout}`);
+      }
+      assert.deepEqual(result.builds, [], `${flag} builds nothing`);
+      assert.deepEqual(result.runs, [], `${flag} starts no Playwright run`);
+      expectNoWorkspace(result);
+      printed[flag] = result.stdout;
+    }
+    assert.equal(printed['-h'], printed['--help'], '-h prints exactly what --help prints');
+  });
+
+  test('[AC-16][F-018] --help beside an unknown argument is still a usage error (exit 2)', GATE_CASE, async () => {
+    const site = siteCase('help-unknown-argument', { changed: false });
+    const result = await runGate(site, ['--help', '--bogus']);
+    expectExit(result, 2);
+    expectLine(result.stderr, 'run-visual: unknown argument --bogus');
+    expectLine(result.stderr, USAGE);
+    assert.equal(result.stdout, '', 'no help is printed');
     assert.deepEqual(result.builds, []);
     assert.deepEqual(result.runs, []);
     expectNoWorkspace(result);

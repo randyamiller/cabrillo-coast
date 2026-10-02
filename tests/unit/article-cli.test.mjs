@@ -987,6 +987,68 @@ test('[AC-03][F-017] check refuses bare tags YAML reads as null, a boolean, a nu
   }
 });
 
+/**
+ * Articles whose front matter holds a character Jekyll's YAML parser reads
+ * otherwise than a reading split at line feeds: a lone carriage return
+ * hiding `published: false` (the bytes QA reproduced it with), U+2028 hiding
+ * a future `date:`, and ESC in the title, at which Jekyll drops the whole
+ * front matter. `error` is each one's only refusal, after its path.
+ */
+const UNREAD_CHAR_ARTICLES = [
+  {
+    what: 'a lone carriage return in a comment hiding published: false',
+    slug: 'qa-hidden-cr',
+    text: '---\ntitle: "Hidden CR"\nsummary: "S."\ntags: [a]\n# note\rpublished: false\n---\n\nHIDDEN-CR-MARKER\n',
+    error: 'front matter line 5: line-break character U+000D (carriage return) at column 7 is not allowed; YAML ends a line '
+      + 'there, so Jekyll would read the text after it as a separate line that these checks never see',
+  },
+  {
+    what: 'U+2028 in a comment hiding date: 2099-01-01',
+    slug: 'qa-hidden-ls',
+    text: '---\ntitle: "Hidden LS"\nsummary: "S."\ntags: [a]\n# note\u2028date: 2099-01-01\n---\n\nHIDDEN-LS-MARKER\n',
+    error: 'front matter line 5: line-break character U+2028 (line separator) at column 7 is not allowed; YAML ends a line '
+      + 'there, so Jekyll would read the text after it as a separate line that these checks never see',
+  },
+  {
+    what: 'ESC in the title',
+    slug: 'qa-ctl-title',
+    text: '---\ntitle: "Ctl \u001b title"\nsummary: "S."\ntags: [a]\n---\n\nCTL-TITLE-MARKER\n',
+    error: 'front matter line 2: control character U+001B at column 13 is not allowed; Jekyll\'s YAML parser refuses it '
+      + 'and drops the whole front matter, publishing the post without its title, summary and tags',
+  },
+];
+
+/** The `error: ` lines of a command's standard error, in order. */
+function errorLines(result) {
+  return result.stderr.split('\n').filter((line) => line.startsWith('error: '));
+}
+
+test('[AC-03][F-017] check and publish refuse front matter holding a line break YAML reads or a character it refuses, and move nothing', async (t) => {
+  for (const { what, slug, text, error } of UNREAD_CHAR_ARTICLES) {
+    await t.test(`[AC-03][F-017] check refuses a post with ${what}`, () => {
+      const root = makeRoot();
+      const rel = `_posts/${PAST}-${slug}.md`;
+      write(root, rel, text);
+      const checked = checkRoot(root, rel);
+      expectExit(checked, 1);
+      assert.deepEqual(errorLines(checked), [`error: ${rel}: ${error}`], checked.out);
+      assert.doesNotMatch(checked.stdout, /^ok /m, 'the post is not reported ok');
+    });
+
+    await t.test(`[AC-03][F-017] publish refuses a draft with ${what} and moves nothing`, () => {
+      const root = makeRoot();
+      const rel = `_drafts/${slug}.md`;
+      write(root, rel, text);
+      write(root, `assets/drafts/${slug}/figure.png`, PNG);
+      const published = unchangedBy(() => treeSnapshot(root), () => cli(root, 'publish', slug), `the root ${root}`);
+      expectExit(published, 1);
+      assert.deepEqual(errorLines(published), [`error: ${rel}: ${error}`, 'error: publish refused (1 problem); nothing was moved'],
+        published.out);
+      assert.deepEqual(postsFor(root, slug), [], 'nothing is published');
+    });
+  }
+});
+
 test('[AC-03][F-017] check warns about unwrapped Liquid inside code without failing, and not when it is wrapped in raw', () => {
   const root = makeRoot();
   const fence = ['```yaml', 'image: {{ x }}', '```'].join('\n');
@@ -3911,6 +3973,126 @@ test('[AC-03][F-017] guard checks an article path that changes type and refuses 
   });
 });
 
+/** guard's refusal of `rel`, an entry in an `assets/blog/<slug>/` folder that is a symbolic link or submodule, not a regular file. */
+function nonFileImageError(rel) {
+  return `${rel}: images in assets/blog/ must be regular files; a symbolic link or submodule here counts as a missing image, `
+    + 'as check counts it, and a link that leads nowhere fails the Pages build';
+}
+
+/** The post `_posts/<PAST>-lnk.md` whose body, on file line 7, shows `assets/blog/lnk/fig.png`. */
+const LINKED_POST = `_posts/${PAST}-lnk.md`;
+const LINKED_IMAGE = 'assets/blog/lnk/fig.png';
+const LINKED_TEXT = validArticle({ body: `![Figure](/${LINKED_IMAGE})` });
+const LINKED_IMAGE_MISSING = `${LINKED_POST}:7: image /${LINKED_IMAGE} does not exist`;
+
+test('[AC-03][F-017] guard counts an image entry that is a symbolic link or submodule as missing, as check does, and refuses any in an image folder', GIT_CASE, async (t) => {
+  const extraRel = 'assets/blog/lnk/extra.png';
+  const ghostRel = 'assets/blog/ghost/fig.png';
+  const stagePost = (repo) => {
+    write(repo, LINKED_POST, LINKED_TEXT);
+    git(repo, 'add', LINKED_POST);
+  };
+  const stageImage = (repo) => {
+    write(repo, LINKED_IMAGE, PNG);
+    git(repo, 'add', LINKED_IMAGE);
+  };
+
+  await assertGuardRefusesInBothModes(t, [
+    {
+      name: 'a post whose image is a symbolic link to its draft image',
+      stage: (repo) => {
+        stagePost(repo);
+        stageSymlink(repo, LINKED_IMAGE, '../../drafts/lnk/fig.png');
+      },
+      expect: [nonFileImageError(LINKED_IMAGE), LINKED_IMAGE_MISSING],
+    },
+    {
+      name: 'a post whose image is a symbolic link that leads nowhere',
+      stage: (repo) => {
+        stagePost(repo);
+        stageSymlink(repo, LINKED_IMAGE, 'no-such-image.png');
+      },
+      expect: [nonFileImageError(LINKED_IMAGE), LINKED_IMAGE_MISSING],
+    },
+    {
+      name: 'a post whose image is a submodule',
+      stage: (repo) => {
+        stagePost(repo);
+        stageGitlink(repo, LINKED_IMAGE);
+      },
+      expect: [submoduleError(LINKED_IMAGE), nonFileImageError(LINKED_IMAGE), LINKED_IMAGE_MISSING],
+    },
+    {
+      name: 'a valid post and image with a symbolic link beside the image',
+      stage: (repo) => {
+        stagePost(repo);
+        stageImage(repo);
+        stageSymlink(repo, extraRel, 'fig.png');
+      },
+      expect: [nonFileImageError(extraRel)],
+    },
+    {
+      name: 'a symbolic link alone in an image folder without its post',
+      stage: (repo) => stageSymlink(repo, ghostRel, '../../drafts/ghost/fig.png'),
+      expect: [nonFileImageError(ghostRel), 'assets/blog/ghost/: image folder has no matching _posts/*-ghost.md'],
+    },
+  ]);
+
+  await t.test('[AC-03][F-017] guard --staged and --pre-push accept the same post with its image as a regular file', GIT_CASE, () => {
+    const { repo, remote } = makeRemoteRepo();
+    const remoteSha = git(repo, 'rev-parse', 'HEAD');
+    stagePost(repo);
+    stageImage(repo);
+    const staged = guardStagedUnchanged(repo);
+    expectExit(staged, 0);
+    assert.equal(staged.stdout, 'guard: staged tree ok (1 changed article checked)\n');
+    commit(repo, 'Publish: lnk');
+    const pushed = prePushUnchanged({ repo, remote }, 'refs/heads/main', 'refs/heads/main', remoteSha);
+    expectExit(pushed, 0);
+    assert.equal(pushed.stdout, 'guard: ok (1 commit checked)\n');
+  });
+});
+
+test('[AC-03][F-017] guard refuses an image link git add -A stages from the working tree, whatever its target, and check refuses the post too', { ...GIT_CASE, ...LINK_CASE }, async (t) => {
+  const draftImage = 'assets/drafts/lnk/fig.png';
+  /**
+   * Writes the post and its draft image, makes the post's image a link to
+   * `target`, and stages everything with `git add -A`, as an author would;
+   * `afterAdd(repo)` then runs, such as deleting the link's target.
+   */
+  const linkedImage = (target, afterAdd = () => {}) => (repo) => {
+    write(repo, LINKED_POST, LINKED_TEXT);
+    write(repo, draftImage, PNG);
+    link(repo, LINKED_IMAGE, target);
+    git(repo, 'add', '-A');
+    assert.equal(indexMode(repo, LINKED_IMAGE), '120000', 'git add -A stages the link itself');
+    assert.equal(indexMode(repo, draftImage), '', 'the draft image stays ignored');
+    afterAdd(repo);
+  };
+  const expect = [nonFileImageError(LINKED_IMAGE), LINKED_IMAGE_MISSING];
+
+  await assertGuardRefusesInBothModes(t, [
+    { name: 'a staged image link to the draft image', stage: linkedImage('../../drafts/lnk/fig.png'), expect },
+    {
+      name: 'a staged image link whose target is deleted after git add',
+      stage: linkedImage('../../drafts/lnk/fig.png', (repo) => fs.rmSync(abs(repo, draftImage))),
+      expect,
+    },
+    { name: 'a staged image link that never had a target', stage: linkedImage('../../drafts/lnk/never.png'), expect },
+  ]);
+
+  await t.test('[AC-03][F-017] check refuses the post whose image is that link, counting the image as missing', LINK_CASE, () => {
+    const repo = makeRepo();
+    write(repo, '_config.yml', SITE_CONFIG);
+    linkedImage('../../drafts/lnk/fig.png')(repo);
+    const checked = checkRoot(repo, LINKED_POST);
+    expectExit(checked, 1);
+    assert.match(checked.stderr, new RegExp(`^error: ${escapeRegExp(LINKED_IMAGE_MISSING)}$`, 'm'));
+    assert.match(checked.stderr, new RegExp(`${escapeRegExp(LINKED_IMAGE)} is a symbolic link, so the images through it `
+      + 'count as missing'), 'check says why the image on disk counts as missing');
+  });
+});
+
 /** guard's refusal of `rel` as a tracked draft or draft image. */
 function draftError(rel) {
   return `${rel}: drafts and draft images must never be tracked (git rm --cached; they belong only in your working copy)`;
@@ -4038,6 +4220,20 @@ test('[AC-03][F-017] guard refuses a submodule anywhere, also by the folder rule
     },
     { name: 'a submodule at notes, outside every content folder', stage: (repo) => stageGitlink(repo, 'notes'), expect: [submoduleError('notes')] },
   ]);
+});
+
+test('[AC-03][F-017] guard refuses a post whose front matter holds a line break YAML reads or a character it refuses', GIT_CASE, async (t) => {
+  await assertGuardRefusesInBothModes(t, UNREAD_CHAR_ARTICLES.map(({ what, slug, text, error }) => {
+    const rel = `_posts/${PAST}-${slug}.md`;
+    return {
+      name: `a post with ${what}`,
+      stage: (repo) => {
+        write(repo, rel, text);
+        git(repo, 'add', rel);
+      },
+      expect: [`${rel}: ${error}`],
+    };
+  }));
 });
 
 /** The repository's own `.gitignore`, which ignores a `_drafts` or `assets/drafts` link rather than staging it. */

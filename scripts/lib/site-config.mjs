@@ -65,6 +65,52 @@ const YAML_TRAILER_RE = /^(?: *| +#.*)$/;
 const YAML_UNREADABLE = Object.freeze({ kind: 'other', value: null, quoted: false });
 
 /**
+ * The first character of a configuration line that SafeYAML's parser
+ * (libyaml, through Psych) does not read as part of that line: a key of
+ * `YAML_LINE_BREAK_NAMES`, or any character outside libyaml's printable set
+ * of tab, U+0020 to U+007E, U+0085, U+00A0 to U+D7FF, U+E000 to U+FFFD and
+ * U+10000 to U+10FFFF (a line feed never occurs inside a line). The
+ * front-matter reader in `./articles.mjs` refuses the same characters. One
+ * character class with the `u` flag, so a search is linear in the line and
+ * finds a lone surrogate.
+ */
+const YAML_UNREAD_CHAR_RE = /[^\t\x20-\x7E\u00A0-\u2027\u202A-\uD7FF\uE000-\uFFFD\u{10000}-\u{10FFFF}]/u;
+
+/**
+ * The characters other than a line feed at which YAML ends a line, with the
+ * names refusals give them. A carriage return before a line feed is part of
+ * a CRLF line ending and is removed before a line is read.
+ */
+const YAML_LINE_BREAK_NAMES = new Map([
+  ['\r', 'carriage return'],
+  ['\u0085', 'next line'],
+  ['\u2028', 'line separator'],
+  ['\u2029', 'paragraph separator'],
+]);
+
+/**
+ * Why configuration line `line` cannot be read here because it holds a
+ * character `YAML_UNREAD_CHAR_RE` finds, or `null` when it holds none. The
+ * reason names the first such character as `U+XXXX` and its 1-based column,
+ * counted in characters (code points).
+ */
+function unreadCharProblem(line) {
+  const m = YAML_UNREAD_CHAR_RE.exec(line);
+  if (m === null) return null;
+  const point = m[0].codePointAt(0);
+  const code = `U+${point.toString(16).toUpperCase().padStart(4, '0')}`;
+  const column = [...line.slice(0, m.index)].length + 1;
+  const breakName = YAML_LINE_BREAK_NAMES.get(m[0]);
+  if (breakName !== undefined) {
+    return `line-break character ${code} (${breakName}) at column ${column} is not supported; YAML ends a line `
+      + 'there, so Jekyll reads the text after it, even inside a comment, as a separate line';
+  }
+  // Below U+00A0 the refused characters are C0 and C1 controls and DEL; above it, U+FFFE, U+FFFF and lone surrogates.
+  const kind = point < 0xa0 ? 'control character' : 'non-printable character';
+  return `${kind} ${code} at column ${column} is not supported; Jekyll's YAML parser refuses it`;
+}
+
+/**
  * Reads the quoted scalar that starts at `text[start]` and closes on the same
  * line: double-quoted with the escapes `\"` and `\\` only, or single-quoted
  * with `''` for a quote. Returns `{ value, end }` (the index after the
@@ -224,7 +270,10 @@ function isYamlItem(body) {
  * quoted (always strings) or plain (typed by `plainYamlValue`), with an
  * optional ` # comment`; and one-line flow lists.
  *
- * Refused, with the line number: any other column-0 construct (`? `, `<<`,
+ * Refused, with the line number: on any line, blank and comment lines
+ * included, a line break other than LF or CRLF (a lone carriage return,
+ * U+0085, U+2028, U+2029) or a character outside YAML's printable set, such
+ * as a control character (`unreadCharProblem`); any other column-0 construct (`? `, `<<`,
  * `---` or `...` after content, `%` directives); tabs; anchors and aliases;
  * tags; block scalars; flow mappings; plain values containing `: ` or ending
  * in `:`; unclosed quotes or lists; anything but a ` # comment` after a
@@ -257,6 +306,13 @@ export function readJekyllConfig(text) {
   text.replace(/^\uFEFF/, '').split('\n').forEach((raw, index) => {
     const n = index + 1;
     const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw;
+    // Read before blank and comment lines are skipped: a key YAML finds after a line break inside a
+    // comment (`# x\u0085limit_posts: 1`) would otherwise reach Jekyll unchecked.
+    const unread = unreadCharProblem(line);
+    if (unread !== null) {
+      fail(n, unread);
+      return;
+    }
     if (/^[ \t]*(?:#.*)?$/.test(line)) return;
     if (line.includes('\t')) {
       fail(n, 'tabs are not supported');

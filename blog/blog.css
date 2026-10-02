@@ -1,7 +1,7 @@
 /* Cabrillo Coast blog. Colours: tokens. */
 
-/* Page */
-:root:has(.blog-page) { color-scheme: light dark; }
+/* Page. Focus and jumps clear header, rings, scrollbars. */
+:root:has(.blog-page) { color-scheme: light dark; scroll-padding-block: 88px 24px; }
 .blog-page { min-height: 100vh; min-height: 100dvh; display: flex; flex-direction: column; }
 .blog-page > main { flex: 1 0 auto; }
 
@@ -66,8 +66,6 @@
 .prose h2 { font-size: 1.7rem; margin-block: 1.8em .6em; }
 .prose h3 { font-size: 1.3rem; margin-block: 1.6em .5em; }
 .prose h4 { font-family: var(--font-body); font-weight: 600; font-size: 1.05rem; margin-block: 1.4em .4em; }
-/* Clears the 72px sticky header. */
-.prose h2, .prose h3, .prose h4 { scroll-margin-block-start: 88px; }
 .prose ul, .prose ol { padding-inline-start: 1.4em; }
 .prose li + li { margin-block-start: .35em; }
 .prose a { color: var(--sea-ink); text-decoration: underline; text-underline-offset: 2px; }
@@ -90,19 +88,19 @@
 /* Rounds native scrollbar corners; the clipped ring moves here. */
 .prose div.highlight { border-radius: var(--radius-sm); overflow: hidden; }
 .prose div.highlight:has(pre:focus-visible) { outline: 2.5px solid var(--sea); outline-offset: 2px; }
-.prose .highlight .c, .prose .highlight .c1, .prose .highlight .cm, .prose .highlight .cs { color: var(--muted); font-style: italic; }
-.prose .highlight .k, .prose .highlight .kd, .prose .highlight .kn, .prose .highlight .kr, .prose .highlight .kt { color: var(--deep); }
-.prose .highlight .s, .prose .highlight .s1, .prose .highlight .s2, .prose .highlight .sb,
-.prose .highlight .m, .prose .highlight .mi, .prose .highlight .mf { color: var(--sea-ink); }
+.prose .highlight :is(.c, .c1, .cm, .cs) { color: var(--muted); font-style: italic; }
+.prose .highlight :is(.k, .kd, .kn, .kr, .kt) { color: var(--deep); }
+.prose .highlight :is(.s, .s1, .s2, .sb, .m, .mi, .mf) { color: var(--sea-ink); }
 
 /* Current section: --ink only; forced colours underline. */
 .nav-links > a[aria-current], .mobile-menu a[aria-current] { color: var(--ink); }
 @media (forced-colors: active) {
   .nav-links > a[aria-current], .mobile-menu a[aria-current] { text-decoration: underline; }
 }
-/* Open header = 72 nav + 28 pad + 8 rules + 7(24 + 1.65rem); +8 ring. */
+/* Open header = 72 nav + 28 pad + 8 rules + 7(24 + 1.65rem), menu scrolls past 100dvh - 80; +8 ring. */
 @media (max-width: 900px) {
-  :root:has(#mobile-menu[data-open="true"]) { scroll-padding-top: calc(284px + 11.55rem); }
+  :root:has(#mobile-menu[data-open="true"]) { scroll-padding-top: min(calc(284px + 11.55rem), 100dvh - 72px); }
+  .blog-page .mobile-menu { max-height: calc(100vh - 153px); max-height: calc(100dvh - 153px); overflow-y: auto; overscroll-behavior: contain; scroll-padding-block: 8px; }
 }
 
 /* Hover and press */
@@ -121,9 +119,8 @@
 /* Dark: --sea-ink, --deep stay light */
 @media (prefers-color-scheme: dark) {
   .prose a, .post-back a, .tag-link { color: var(--sea); }
-  .prose .highlight .k, .prose .highlight .kd, .prose .highlight .kn, .prose .highlight .kr, .prose .highlight .kt { color: var(--sea); }
-  .prose .highlight .s, .prose .highlight .s1, .prose .highlight .s2, .prose .highlight .sb,
-  .prose .highlight .m, .prose .highlight .mi, .prose .highlight .mf { color: var(--sand); }
+  .prose .highlight :is(.k, .kd, .kn, .kr, .kt) { color: var(--sea); }
+  .prose .highlight :is(.s, .s1, .s2, .sb, .m, .mi, .mf) { color: var(--sand); }
   @media (hover: hover) {
     .post-card h2 a:hover { color: var(--sea); }
   }
@@ -131,8 +128,9 @@
 
 /* [hidden] beats the rules above */
 .blog-search[hidden], .post-list[hidden], .post-card[hidden] { display: none; }
-/* JS: form box kept, footer below the fold, no shift. */
+/* JS: form box kept, footer below fold, no shift; freed at 4s if search.js fails (0s; !important beats reduced motion). */
 @media (scripting: enabled) {
-  .blog-search[hidden] { display: grid; visibility: hidden; }
+  .blog-search[hidden] { display: grid; visibility: hidden; animation: blog-search-release 0s 4s forwards !important; }
   .blog-index:has(.post-list) { min-height: calc(100vh - 72px); }
 }
+@keyframes blog-search-release { to { height: 0; margin: 0; } }

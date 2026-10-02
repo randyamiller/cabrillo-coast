@@ -5,6 +5,9 @@
  *
  *   node tests/visual/run-visual.mjs [--base <ref>]
  *
+ *   --base <ref>  Base revision, `--base=<ref>` too; the default is under Base.
+ *   -h, --help    Print the full help and exit 0.
+ *
  * Builds the project fixture site twice with
  * `tests/fixtures/build-fixture-site.mjs`, from the base revision
  * (`git archive <base>`) and from the working tree, both with the working
@@ -131,6 +134,9 @@ const GIT_LOG_STDERR_LIMIT = 4096;
 
 /** A full commit id: SHA-1 (40) or SHA-256 (64) hexadecimal digits. */
 const COMMIT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
+/** Prefix of the temporary workspace created under `os.tmpdir()` for each run. */
+const WORKSPACE_PREFIX = "blog-visual-";
 
 /** Exit codes after a signal, by shell convention (128 + signal number). */
 const SIGNAL_EXIT = Object.freeze({ SIGINT: 130, SIGTERM: 143 });
@@ -299,6 +305,78 @@ export function parseCliArgs(argv) {
     parsed.base = value;
   }
   return parsed;
+}
+
+/**
+ * Help text; the paths, mount, screenshot count, skip rule, exit codes and
+ * deadlines come from the constants the run uses, so they cannot drift.
+ */
+function helpText() {
+  const results = `${path.relative(REPO, TEST_RESULTS).split(path.sep).join("/")}/`;
+  // Output entries: the name in a 28-column field after two spaces, continuation lines under the text.
+  const indent = " ".repeat(30);
+  const entry = (name, text) => `  ${name.padEnd(indent.length - 2)}${text}`;
+  return [
+    USAGE,
+    "",
+    "Compares how the working tree renders the blog with a base revision, pixel for pixel. The",
+    "fixture site is built twice with tests/fixtures/build-fixture-site.mjs, from the base (git",
+    "archive) and from the working tree, both with the working tree's fixture articles only, and",
+    `each project build is served on 127.0.0.1 under ${MOUNT}/. Playwright Test records the`,
+    `baseline from the base in a temporary folder, then compares the working tree's ${EXPECTED_SCREENSHOTS}`,
+    "screenshots (the listing and one article at 3 widths in light and dark) with it.",
+    "",
+    "Options:",
+    "  --base <ref>  Base revision, also --base=<ref>, given at most once. Default: @{upstream} (what",
+    "                is already pushed), or HEAD when the branch has no upstream. A revision that",
+    "                names no commit or starts with '-' is refused (exit 2).",
+    "  -h, --help    Show this help.",
+    "",
+    `Skip rule: a base without ${BASE_LAYOUT} predates the blog, so the comparison is skipped`,
+    "with a notice and nothing is built (exit 0).",
+    "",
+    'Declaring an intended change: set VISUAL_CHANGE_INTENDED=1, or put a "Visual-Change: intended"',
+    "trailer in any commit message in <base>..HEAD, merge commits included. Declared screenshot",
+    "differences are reported and the run passes (exit 0). Operational failures are never accepted",
+    "as intended: a failed build, a Playwright run that was interrupted, timed out or failed for any",
+    "other reason, and results that cannot be read fail whatever was declared.",
+    "",
+    "Environment:",
+    "  VISUAL_CHANGE_INTENDED=1  Declares an intended visual change (see above).",
+    "  JEKYLL_ENV is removed from every git and Playwright child; the fixture builder removes it",
+    "  from its own. Inherited Playwright variables that would redirect, open or add to its reports",
+    "  are removed or overridden.",
+    "",
+    "Output:",
+    entry(`${REPORT_DIR}/`, "HTML report of the last Playwright run, kept for inspection and"),
+    `${indent}git-ignored; CI uploads it when verification fails. Open it with:`,
+    `${indent}npx playwright show-report ${REPORT_DIR}`,
+    entry(results, "Per-case output of the last run (actual and diff images of a"),
+    `${indent}differing screenshot), kept and git-ignored.`,
+    entry(`${WORKSPACE_PREFIX}*`, "Workspace under os.tmpdir() (TMPDIR when set): both builds, the"),
+    `${indent}baseline and the comparison results; removed every run.`,
+    "",
+    `Deadlines: each Playwright run ${formatDuration(DEADLINES.playwrightRun)}, the trailer scan (git log) ` +
+      `${formatDuration(DEADLINES.gitLog)}, each git query ${formatDuration(DEADLINES.gitQuery)},`,
+    `each page request ${formatDuration(DEADLINES.httpRequest)}. ` +
+      "The fixture builder gives its children their own: each Jekyll build",
+    `${formatDuration(DEADLINES.jekyllBuild)}, git archive ${formatDuration(DEADLINES.gitArchive)}, ` +
+      `tar extraction ${formatDuration(DEADLINES.tarExtract)}. A child or request past its deadline is`,
+    "stopped and the run exits 1.",
+    "",
+    `Exit status: 0 when the ${EXPECTED_SCREENSHOTS} screenshots are identical, ` +
+      "when the comparison is skipped because",
+    `git confirms the base has no ${BASE_LAYOUT}, or when the differences were declared intended;`,
+    "1 for an undeclared difference or an operational failure (a build, a Playwright run, git giving",
+    "no answer, @playwright/test not installed, a workspace that cannot be removed); 2 for a usage",
+    `error or a base that names no commit; ${SIGNAL_EXIT.SIGINT} when interrupted by SIGINT, ` +
+      `${SIGNAL_EXIT.SIGTERM} by SIGTERM.`,
+    "",
+    "Examples:",
+    "  node tests/visual/run-visual.mjs",
+    "  node tests/visual/run-visual.mjs --base origin/main",
+    "  VISUAL_CHANGE_INTENDED=1 node tests/visual/run-visual.mjs --base origin/main",
+  ].join("\n");
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1107,7 +1185,7 @@ async function main(argv) {
     return 2;
   }
   if (args.help) {
-    console.log(USAGE);
+    console.log(helpText());
     return 0;
   }
 
@@ -1151,7 +1229,7 @@ async function main(argv) {
     return 1;
   }
 
-  session.tmp = fs.mkdtempSync(path.join(os.tmpdir(), "blog-visual-"));
+  session.tmp = fs.mkdtempSync(path.join(os.tmpdir(), WORKSPACE_PREFIX));
   try {
     installSignalHandlers();
     const tmp = session.tmp;

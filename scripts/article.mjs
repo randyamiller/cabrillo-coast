@@ -2460,7 +2460,9 @@ function cmdGuardStaged(root) {
 
   const readBlob = makeBlobReader(top);
   const articles = readArticles(stagedChanges(top), (p) => entries.get(p), readBlob, errors);
-  for (const message of checkTrackedContent({ paths, articles, todayUtc: today })) errors.push(message);
+  // The regular files of the tree, so a symbolic link or submodule image counts as missing, as in check.
+  const files = paths.filter((p) => REGULAR_FILE_MODES.has(entries.get(p).mode));
+  for (const message of checkTrackedContent({ paths, files, articles, todayUtc: today })) errors.push(message);
   for (const message of siteConfigProblems(paths, (p) => entries.get(p), readBlob)) errors.push(message);
 
   if (errors.length > 0) {
@@ -2676,7 +2678,9 @@ function parseTree(buffer) {
  * Problems in one snapshot a push publishes, a commit's tree or a pushed
  * tree: the mode rule, the draft-folder link rule, the tracked-content rules
  * and the site-configuration rules over its complete tree, and the article
- * rules over the articles at `changedPaths`.
+ * rules over the articles at `changedPaths`. The tracked-content rules learn
+ * which entries are regular files, so a symbolic link or submodule image
+ * counts as missing, as `check` counts it.
  *
  * @param {Map<string, { mode: string, type: string, oid: string }>} entries The tree, from `parseTree`.
  * @param {string[]} changedPaths Paths whose articles are read and checked.
@@ -2694,7 +2698,8 @@ function snapshotProblems(entries, changedPaths, { readBlob, today, analyses, dr
   const paths = [...entries.keys()];
   for (const message of draftLinkProblems(paths)) errors.push(message);
   const articles = readArticles(changedPaths, (p) => entries.get(p), readBlob, errors);
-  const content = checkTrackedContent({ paths, articles, todayUtc: today, cache: analyses });
+  const files = paths.filter((p) => REGULAR_FILE_MODES.has(entries.get(p).mode));
+  const content = checkTrackedContent({ paths, files, articles, todayUtc: today, cache: analyses });
   for (const message of content) errors.push(message);
   for (const message of siteConfigProblems(paths, (p) => entries.get(p), readBlob)) errors.push(message);
   return errors;
